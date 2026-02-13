@@ -139,14 +139,18 @@ def compute_rf_pseudopotential(
 def eval_function_at_points(
     f: fem.Function,
     points: np.ndarray,
+    *,
+    comm: MPI.Comm | None = None,
 ) -> np.ndarray:
     """
-    Evaluate fem.Function at physical points.
+    Evaluate fem.Function at physical points in a way that is correct under MPI.
+
+    Each rank attempts to evaluate points that fall within its local mesh partition.
+    Values are then combined so that, for each point, the (unique) owning rank supplies
+    the result. Points outside the global mesh return np.nan.
 
     points: shape (N, gdim)
-    Returns: values shape (N,) for scalar f, or (N, gdim) for vector f.
-
-    Points outside the mesh return np.nan.
+    Returns: values shape (N,) for scalar f, or (N, bs) for vector/tensor fields.
     """
     domain = f.function_space.mesh
     gdim = domain.geometry.dim
@@ -154,35 +158,62 @@ def eval_function_at_points(
     if pts.ndim != 2 or pts.shape[1] != gdim:
         raise ValueError(f"points must have shape (N, {gdim})")
 
-    # Build bounding box tree and locate points
+    if comm is None:
+        comm = domain.comm
+
+    # Build bounding box tree and locate points (local candidates)
     tree = geometry.bb_tree(domain, domain.topology.dim)
     candidates = geometry.compute_collisions_points(tree, pts)
     colliding = geometry.compute_colliding_cells(domain, candidates, pts)
 
-    # For each point, pick first colliding cell (if any)
+    # For each point, pick first colliding cell (if any) on this rank
     cell_indices = np.full((pts.shape[0],), -1, dtype=np.int32)
     for i in range(pts.shape[0]):
         cells = colliding.links(i)
         if len(cells) > 0:
             cell_indices[i] = cells[0]
 
-    # Prepare output buffer
-    bs = f.function_space.dofmap.index_map_bs  # block size (1 for scalar, gdim for vector CG)
+    bs = f.function_space.dofmap.index_map_bs  # 1 for scalar; gdim for vector CG
+
     if bs == 1:
-        out = np.full((pts.shape[0],), np.nan, dtype=np.float64)
+        local = np.full((pts.shape[0],), np.nan, dtype=np.float64)
         tmp = np.zeros((1,), dtype=np.float64)
         for i, c in enumerate(cell_indices):
             if c >= 0:
                 f.eval(tmp, pts[i:i+1], np.array([c], dtype=np.int32))
-                out[i] = float(tmp[0])
+                local[i] = float(tmp[0])
+
+        # Combine across ranks: sum(valid values) / sum(mask)
+        mask = np.isfinite(local).astype(np.float64)
+        vals = np.where(np.isfinite(local), local, 0.0)
+        vals_g = np.empty_like(vals)
+        mask_g = np.empty_like(mask)
+        comm.Allreduce(vals, vals_g, op=MPI.SUM)
+        comm.Allreduce(mask, mask_g, op=MPI.SUM)
+        out = np.full_like(vals_g, np.nan)
+        ok = mask_g > 0.5
+        out[ok] = vals_g[ok] / mask_g[ok]
         return out
+
     else:
-        out = np.full((pts.shape[0], bs), np.nan, dtype=np.float64)
+        local = np.full((pts.shape[0], bs), np.nan, dtype=np.float64)
         tmp = np.zeros((1, bs), dtype=np.float64)
         for i, c in enumerate(cell_indices):
             if c >= 0:
                 f.eval(tmp, pts[i:i+1], np.array([c], dtype=np.int32))
-                out[i, :] = tmp[0, :]
+                local[i, :] = tmp[0, :]
+
+        mask = np.isfinite(local).all(axis=1).astype(np.float64)  # one mask per point
+        vals = np.where(np.isfinite(local), local, 0.0)
+
+        vals_g = np.empty_like(vals)
+        mask_g = np.empty_like(mask)
+        comm.Allreduce(vals, vals_g, op=MPI.SUM)
+        comm.Allreduce(mask, mask_g, op=MPI.SUM)
+
+        out = np.full_like(vals_g, np.nan)
+        ok = mask_g > 0.5
+        out[ok, :] = vals_g[ok, :] / mask_g[ok, None]
         return out
 
 
@@ -192,51 +223,84 @@ def eval_function_at_points(
 
 @dataclass
 class TrapMinimum:
+    """Global trap minimum information."""
     r_min: np.ndarray
     psi_min: float
-    local_index: int
+    dof_index: int
+    rank: int
 
-def find_minimum_cg1(Psi, comm=None):
-    # --- pick comm safely ---
+    @property
+    def local_index(self) -> int:  # backward-compat alias
+        return self.dof_index
+
+def dof_coordinate_from_index(f: fem.Function, local_dof: int) -> np.ndarray:
+    """Return physical coordinate of a (scalar) CG1 dof given its *local* dof index.
+
+    Notes (dolfinx 0.10):
+    - For CG1 Lagrange, dofs coincide with mesh vertices.
+    - `tabulate_dof_coordinates()` returns coordinates for local dofs (including ghosts) in
+      the same ordering as the dofmap.
+    """
+    V = f.function_space
+    gdim = V.mesh.geometry.dim
+    coords = V.tabulate_dof_coordinates().reshape((-1, gdim))
+    if local_dof < 0 or local_dof >= coords.shape[0]:
+        raise IndexError(f"local_dof {local_dof} out of range [0, {coords.shape[0]})")
+    return np.array(coords[local_dof], dtype=np.float64)
+
+
+def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMinimum:
+    """Find the global minimum of a scalar CG1 field Psi.
+
+    - Uses owned dofs only (avoids ghost dofs in parallel).
+    - Avoids MPI.MINLOC datatype pitfalls by using allgather + deterministic tie-break.
+    """
     if comm is None:
-        if MPI is None:
-            comm = None
-        else:
-            comm = MPI.COMM_WORLD
+        comm = Psi.function_space.mesh.comm
 
-    # --- pull local values from your CG1 function ---
-    V = Psi.x.array  # dolfinx vector (local chunk)
-    local_idx = int(np.argmin(V))
-    local_min = float(V[local_idx])
+    # Owned dofs only (avoid ghosts)
+    bs = Psi.function_space.dofmap.index_map_bs
+    if bs != 1:
+        raise ValueError("find_minimum_cg1 expects a scalar (bs=1) function.")
+    imap = Psi.function_space.dofmap.index_map
+    n_owned = imap.size_local * bs
+    local_vals = Psi.x.array[:n_owned]
 
-    # Get coordinate for that local dof (you likely already have this part)
-    # r_local = ... (shape (gdim,)) corresponding to local_idx
-    # I'll assume you already compute `r_local` below.
+    if local_vals.size == 0:
+        # Degenerate partition; treat as +inf
+        local_min = float("inf")
+        local_idx = -1
+    else:
+        local_idx = int(np.argmin(local_vals))
+        local_min = float(local_vals[local_idx])
 
-    # --- SERIAL EARLY RETURN (fixes your crash) ---
-    if (comm is None) or (getattr(comm, "size", 1) == 1):
-        r_local = dof_coordinate_from_index(Psi, local_idx)  # your existing helper
-        return MinInfo(r_min=r_local, psi_min=local_min, dof_index=local_idx, rank=0)
-
-    # --- PARALLEL: avoid MINLOC entirely; do an allgather of scalars ---
     rank = comm.rank
     candidates = comm.allgather((local_min, rank, local_idx))
 
-    # pick smallest by value, then rank as tie-breaker (deterministic)
+    # Pick smallest value, then smaller rank as deterministic tie-break
     best_min, best_rank, best_lidx = min(candidates, key=lambda t: (t[0], t[1]))
 
-    # now best_rank computes the coordinate and broadcasts it
+    if best_lidx < 0 or not np.isfinite(best_min):
+        raise RuntimeError("Could not determine a finite minimum (check Psi field / partitions).")
+
     if rank == best_rank:
-        r_best = dof_coordinate_from_index(Psi, best_lidx)  # your existing helper
+        r_best = dof_coordinate_from_index(Psi, best_lidx)
     else:
         r_best = None
 
     r_best = comm.bcast(r_best, root=best_rank)
 
-    return MinInfo(r_min=np.array(r_best), psi_min=float(best_min), dof_index=int(best_lidx), rank=int(best_rank))
+    return TrapMinimum(
+        r_min=np.array(r_best, dtype=np.float64),
+        psi_min=float(best_min),
+        dof_index=int(best_lidx),
+        rank=int(best_rank),
+    )
+
 
 # -----------------------------
 # Hessian + secular frequencies
+ + secular frequencies
 # -----------------------------
 
 @dataclass
@@ -254,58 +318,65 @@ def numerical_hessian(
     Psi: fem.Function,
     r0: np.ndarray,
     h: float,
+    *,
+    max_tries: int = 6,
 ) -> np.ndarray:
-    """
-    Compute numeric Hessian of scalar field Psi at r0 using central differences.
+    """Compute numeric Hessian of scalar field Psi at r0 using central differences.
 
-    Mixed derivative:
-      d2f/dx_i dx_j ≈ (f(x+h_i+h_j) - f(x+h_i-h_j) - f(x-h_i+h_j) + f(x-h_i-h_j)) / (4h^2)
-    Diagonal:
-      d2f/dx_i^2 ≈ (f(x+h_i) - 2f(x) + f(x-h_i)) / h^2
-
-    Returns Hessian (gdim, gdim). Points outside mesh become nan → may break.
+    This routine is mesh-aware in the sense that it will automatically shrink `h` if
+    any of the probe points land outside the mesh (leading to NaNs).
     """
     r0 = np.asarray(r0, dtype=np.float64)
-    gdim = r0.shape[0]
+    gdim = int(r0.shape[0])
 
-    def f_at(pt):
-        val = eval_function_at_points(Psi, np.array([pt]))[0]
-        return val
+    def f_at(pt: np.ndarray) -> float:
+        return float(eval_function_at_points(Psi, np.array([pt], dtype=np.float64))[0])
 
     f0 = f_at(r0)
     if not np.isfinite(f0):
         raise ValueError("r0 is outside mesh or Psi could not be evaluated at r0.")
 
-    H = np.zeros((gdim, gdim), dtype=np.float64)
+    for k in range(max_tries):
+        hk = float(h) * (0.5 ** k)
 
-    # Diagonal
-    for i in range(gdim):
-        e = np.zeros(gdim)
-        e[i] = 1.0
-        fp = f_at(r0 + h * e)
-        fm = f_at(r0 - h * e)
-        if not (np.isfinite(fp) and np.isfinite(fm)):
-            H[i, i] = np.nan
-        else:
-            H[i, i] = (fp - 2.0 * f0 + fm) / (h ** 2)
+        H = np.zeros((gdim, gdim), dtype=np.float64)
 
-    # Mixed
-    for i in range(gdim):
-        for j in range(i + 1, gdim):
-            ei = np.zeros(gdim); ei[i] = 1.0
-            ej = np.zeros(gdim); ej[j] = 1.0
-            fpp = f_at(r0 + h*ei + h*ej)
-            fpm = f_at(r0 + h*ei - h*ej)
-            fmp = f_at(r0 - h*ei + h*ej)
-            fmm = f_at(r0 - h*ei - h*ej)
-            if not all(np.isfinite(x) for x in [fpp, fpm, fmp, fmm]):
-                val = np.nan
-            else:
-                val = (fpp - fpm - fmp + fmm) / (4.0 * h * h)
-            H[i, j] = val
-            H[j, i] = val
+        # Diagonal
+        ok = True
+        for i in range(gdim):
+            e = np.zeros(gdim); e[i] = 1.0
+            fp = f_at(r0 + hk * e)
+            fm = f_at(r0 - hk * e)
+            if not (np.isfinite(fp) and np.isfinite(fm)):
+                ok = False
+                break
+            H[i, i] = (fp - 2.0 * f0 + fm) / (hk ** 2)
 
-    return H
+        if not ok:
+            continue
+
+        # Mixed
+        for i in range(gdim):
+            for j in range(i + 1, gdim):
+                ei = np.zeros(gdim); ei[i] = 1.0
+                ej = np.zeros(gdim); ej[j] = 1.0
+                fpp = f_at(r0 + hk*ei + hk*ej)
+                fpm = f_at(r0 + hk*ei - hk*ej)
+                fmp = f_at(r0 - hk*ei + hk*ej)
+                fmm = f_at(r0 - hk*ei - hk*ej)
+                if not all(np.isfinite(x) for x in (fpp, fpm, fmp, fmm)):
+                    ok = False
+                    break
+                val = (fpp - fpm - fmp + fmm) / (4.0 * hk * hk)
+                H[i, j] = val
+                H[j, i] = val
+            if not ok:
+                break
+
+        if ok and np.all(np.isfinite(H)):
+            return H
+
+    raise ValueError("Hessian contains non-finite entries after shrinking h. r0 may be too close to the boundary, or the mesh may be too small.")
 
 
 def secular_frequencies_from_pseudopotential(
