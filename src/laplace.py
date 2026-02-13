@@ -1,4 +1,3 @@
-# src/laplace.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,6 +12,7 @@ from dolfinx import fem, mesh as dmesh
 
 @dataclass
 class LaplaceResult:
+    """Return object for Laplace solves."""
     phi: fem.Function
     V: fem.FunctionSpace
     bcs_applied: Dict[int, float]
@@ -20,7 +20,7 @@ class LaplaceResult:
 
 def solve_laplace_tagged(
     domain: dmesh.Mesh,
-    facet_tags: fem.MeshTags,
+    facet_tags: dmesh.MeshTags,
     boundary_values: Dict[int, float],
     *,
     degree: int = 1,
@@ -33,18 +33,18 @@ def solve_laplace_tagged(
 
     Parameters
     ----------
-    domain : dolfinx.mesh.Mesh
+    domain
         The computational mesh.
-    facet_tags : dolfinx.mesh.MeshTags
+    facet_tags
         Facet (boundary) tags. Must tag the boundary facets you want to constrain.
-    boundary_values : dict[int, float]
-        Mapping {tag_id: value} where value is the Dirichlet potential on facets with that tag.
+    boundary_values
+        Mapping {tag_id: value} where value is the Dirichlet potential (volts) on facets with that tag.
         Example: {RF_TAG: 1.0, GND_TAG: 0.0}
-    degree : int
+    degree
         CG polynomial degree (default 1).
-    petsc_options_prefix : str
-        Required by some dolfinx builds (your install). Use a unique-ish prefix per problem.
-    petsc_options : dict[str, str] | None
+    petsc_options_prefix
+        PETSc options prefix (use a unique-ish prefix per problem).
+    petsc_options
         PETSc linear solver options. If None, uses a safe default.
 
     Returns
@@ -53,17 +53,16 @@ def solve_laplace_tagged(
         Contains phi (solution), V (function space), and the applied BC map.
     """
     if petsc_options is None:
-        # Safe baseline that works on most installs
         petsc_options = {"ksp_type": "cg", "pc_type": "jacobi"}
 
-    # Function space (scalar potential)
+    if facet_tags is None:
+        raise ValueError("facet_tags is None. Cannot apply boundary conditions by tag.")
+
     V = fem.functionspace(domain, ("CG", degree))
 
-    # Build Dirichlet BCs from facet tags
     tdim = domain.topology.dim
     fdim = tdim - 1
 
-    # Basic validation: ensure requested tags exist
     existing = set(np.unique(facet_tags.values))
     missing = [tag for tag in boundary_values.keys() if tag not in existing]
     if missing:
@@ -79,13 +78,11 @@ def solve_laplace_tagged(
         bc = fem.dirichletbc(PETSc.ScalarType(val), dofs, V)
         bcs.append(bc)
 
-    # Variational problem for Laplace: ∫ grad(u)·grad(v) dx = 0
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
     a = ufl.dot(ufl.grad(u), ufl.grad(v)) * ufl.dx
     L = fem.Constant(domain, PETSc.ScalarType(0.0)) * v * ufl.dx
 
-    # Import LinearProblem from the correct place for your build
     from dolfinx.fem.petsc import LinearProblem
 
     problem = LinearProblem(
@@ -109,9 +106,7 @@ def export_xdmf(
     *,
     comm: MPI.Comm = MPI.COMM_WORLD,
 ) -> None:
-    """
-    Export mesh + one or more Functions to XDMF for ParaView/PyVista inspection.
-    """
+    """Export mesh + one or more Functions to XDMF for ParaView/PyVista."""
     from dolfinx import io
 
     with io.XDMFFile(comm, xdmf_path, "w") as xdmf:

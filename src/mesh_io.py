@@ -1,8 +1,7 @@
-# src/mesh_io.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict
 
 import numpy as np
 from mpi4py import MPI
@@ -17,26 +16,25 @@ class MeshData:
 
 
 def summarize_tags(tags: Optional[dmesh.MeshTags]) -> Dict[int, int]:
-    """
-    Return {tag_value: count} for a MeshTags object.
-    """
+    """Return {tag_value: count} for a MeshTags object."""
     if tags is None:
         return {}
-    vals = tags.values
-    uniq, cnt = np.unique(vals, return_counts=True)
+    uniq, cnt = np.unique(tags.values, return_counts=True)
     return {int(u): int(c) for u, c in zip(uniq, cnt)}
 
 
-def load_msh(msh_path: str, *, comm=MPI.COMM_WORLD, gdim: int = 3) -> MeshData:
+def load_msh(msh_path: str, *, comm=MPI.COMM_WORLD) -> MeshData:
     """
-    Load a Gmsh .msh by converting with meshio (works even when dolfinx has no gmshio).
-    Returns domain + cell_tags + facet_tags.
+    Load a Gmsh .msh via meshio -> XDMF (works even when dolfinx has no gmshio).
 
-    For 2D meshes: volume=triangle, facets=line
-    For 3D meshes: volume=tetra, facets=triangle
+    Requirements:
+    - In Gmsh you must define Physical Groups for BOTH:
+        * the volume (cells)
+        * the boundary facets
     """
     import meshio
     from dolfinx import io
+    from pathlib import Path
 
     msh = meshio.read(msh_path)
     cell_types = [c.type for c in msh.cells]
@@ -66,8 +64,6 @@ def load_msh(msh_path: str, *, comm=MPI.COMM_WORLD, gdim: int = 3) -> MeshData:
             "for both the domain and the boundaries."
         )
 
-    # Write temporary XDMF next to the msh (deterministic filenames)
-    from pathlib import Path
     msh_path = Path(msh_path)
     out_dir = msh_path.parent / (msh_path.stem + "_xdmf")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -75,29 +71,36 @@ def load_msh(msh_path: str, *, comm=MPI.COMM_WORLD, gdim: int = 3) -> MeshData:
     mesh_xdmf = out_dir / "mesh.xdmf"
     facet_xdmf = out_dir / "facets.xdmf"
 
-    meshio.write(mesh_xdmf, meshio.Mesh(
-        points=msh.points, cells=[(vol_type, vol_cells)],
-        cell_data={"name_to_read": [vol_tags]}
-    ))
-    meshio.write(facet_xdmf, meshio.Mesh(
-        points=msh.points, cells=[(facet_type, facet_cells)],
-        cell_data={"name_to_read": [facet_tags_arr]}
-    ))
+    tag_name = "name_to_read"
+    meshio.write(
+        mesh_xdmf,
+        meshio.Mesh(
+            points=msh.points,
+            cells=[(vol_type, vol_cells)],
+            cell_data={tag_name: [vol_tags]},
+        ),
+    )
+    meshio.write(
+        facet_xdmf,
+        meshio.Mesh(
+            points=msh.points,
+            cells=[(facet_type, facet_cells)],
+            cell_data={tag_name: [facet_tags_arr]},
+        ),
+    )
 
-    # Read into dolfinx
     with io.XDMFFile(comm, str(mesh_xdmf), "r") as xdmf:
         domain = xdmf.read_mesh(name="Grid")
 
     with io.XDMFFile(comm, str(mesh_xdmf), "r") as xdmf:
-        cell_tags = xdmf.read_meshtags(domain, name="Grid")
+        cell_tags = xdmf.read_meshtags(domain, name=tag_name)
 
     with io.XDMFFile(comm, str(facet_xdmf), "r") as xdmf:
-        facet_tags = xdmf.read_meshtags(domain, name="Grid")
+        facet_tags = xdmf.read_meshtags(domain, name=tag_name)
 
     domain.topology.create_connectivity(domain.topology.dim - 1, domain.topology.dim)
 
     return MeshData(domain=domain, cell_tags=cell_tags, facet_tags=facet_tags)
-
 
 
 def load_xdmf(
@@ -108,24 +111,7 @@ def load_xdmf(
     facet_tags_name: Optional[str] = None,
     comm: MPI.Comm = MPI.COMM_WORLD,
 ) -> MeshData:
-    """
-    Load mesh (and optionally cell/facet tags) from an XDMF file.
-
-    Parameters
-    ----------
-    xdmf_path : str
-        Path to .xdmf.
-    mesh_name : str
-        Name of the mesh object in XDMF (often "Grid").
-    cell_tags_name : str | None
-        Name of cell tags in XDMF if present.
-    facet_tags_name : str | None
-        Name of facet tags in XDMF if present.
-
-    Returns
-    -------
-    MeshData
-    """
+    """Load mesh (and optionally cell/facet tags) from an XDMF file."""
     from dolfinx import io
 
     with io.XDMFFile(comm, xdmf_path, "r") as xdmf:
@@ -145,21 +131,25 @@ def load_xdmf(
     return MeshData(domain=domain, cell_tags=cell_tags, facet_tags=facet_tags)
 
 
+def load_mesh(path: str, *, comm: MPI.Comm = MPI.COMM_WORLD) -> MeshData:
+    """Convenience loader: chooses based on extension (.msh or .xdmf)."""
+    if path.lower().endswith(".msh"):
+        return load_msh(path, comm=comm)
+    if path.lower().endswith(".xdmf"):
+        return load_xdmf(path, comm=comm)
+    raise ValueError(f"Unsupported mesh file extension for: {path}")
+
+
 def print_mesh_report(md: MeshData) -> None:
-    """
-    Print a quick report of mesh size and available tag IDs.
-    """
+    """Print a quick report of mesh size and available tag IDs."""
     comm = md.domain.comm
     rank = comm.rank
 
-    # local counts (parallel-safe)
     local_num_cells = md.domain.topology.index_map(md.domain.topology.dim).size_local
     local_num_verts = md.domain.topology.index_map(0).size_local
 
     if rank == 0:
         print("=== Mesh report ===")
-    # Print from all ranks if you want; usually rank 0 is enough for laptop workflows.
-    if rank == 0:
         print(f"gdim: {md.domain.geometry.dim}, tdim: {md.domain.topology.dim}")
         print(f"local vertices: {local_num_verts}, local cells: {local_num_cells}")
 
