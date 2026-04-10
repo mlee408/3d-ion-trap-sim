@@ -1,0 +1,16 @@
+name: fenicsx
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - fenics-dolfinx=0.10.*
+  - mpich
+  - petsc4py
+  - numpy
+  - meshio
+  - matplotlib
+  - pyvista
+  - gmsh
+  - h5py
+  - jupyterlab
+  - ipykernel
