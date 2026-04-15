@@ -185,13 +185,31 @@ def dof_coordinate_from_index(f: fem.Function, local_dof: int) -> np.ndarray:
     return np.array(coords[local_dof], dtype=np.float64)
 
 
-def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMinimum:
-    """Find the DOF with the smallest Ψ value among interior (non-boundary) DOFs.
+def find_minimum_cg1(
+    Psi: fem.Function,
+    comm: MPI.Comm | None = None,
+    bbox_margin: float = 0.08,
+) -> TrapMinimum:
+    """Find the DOF with the smallest Ψ value in the physical trap interior.
 
-    Boundary DOFs sit on electrode surfaces where Ψ may be near zero due to
-    the boundary condition on φ.  Using them as the starting point for the
-    Hessian would place r0 on the mesh boundary, causing all finite-difference
-    stencil points to fall outside the domain.
+    Two exclusion layers are applied:
+
+    1. **Facet boundary** — DOFs touching any exterior facet (electrode surfaces
+       and outer box) are removed.  These can have Ψ ≈ 0 from the Dirichlet BC
+       on φ or from the L2-projection clip in compute_rf_pseudopotential.
+
+    2. **Spatial margin** — DOFs within ``bbox_margin`` × (bbox span per axis)
+       of any axis-aligned boundary face are also removed.  This catches DOFs
+       one element inside the outer box that inherit clipped-to-zero Ψ values
+       from the L2-projection overshoot, which would otherwise be picked as a
+       false global minimum.
+
+    Parameters
+    ----------
+    bbox_margin : float
+        Fraction of the per-axis bounding-box span to exclude near each face.
+        Default 0.08 (8 %).  Increase if the trap minimum is still landing on
+        a boundary; decrease if the physical trap sits very close to an edge.
     """
     if comm is None:
         comm = Psi.function_space.mesh.comm
@@ -203,10 +221,11 @@ def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMin
     V = Psi.function_space
     tdim = domain.topology.dim
     fdim = tdim - 1
+    gdim = domain.geometry.dim
     imap = V.dofmap.index_map
     n_owned = imap.size_local          # number of locally owned DOFs
 
-    # Build a boolean mask that is False for any DOF touching a boundary facet.
+    # --- Layer 1: exclude DOFs on any exterior (boundary) facet --------------
     domain.topology.create_connectivity(fdim, tdim)
     bnd_facets = dmesh.exterior_facet_indices(domain.topology)
     bnd_dofs = fem.locate_dofs_topological(V, fdim, bnd_facets)
@@ -214,6 +233,21 @@ def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMin
     owned_bnd = bnd_dofs[bnd_dofs < n_owned]
     if owned_bnd.size > 0:
         interior_mask[owned_bnd] = False
+
+    # --- Layer 2: spatial margin around the bounding box --------------------
+    # tabulate_dof_coordinates always returns shape (ndofs, 3); trim to gdim.
+    all_coords = V.tabulate_dof_coordinates().reshape(-1, 3)[:n_owned, :gdim]
+    # Use the global bbox (reduce across ranks so the margin is consistent).
+    local_lo = all_coords.min(axis=0) if all_coords.shape[0] > 0 else np.full(gdim, np.inf)
+    local_hi = all_coords.max(axis=0) if all_coords.shape[0] > 0 else np.full(gdim, -np.inf)
+    bbox_lo = np.empty(gdim); comm.Allreduce(local_lo, bbox_lo, op=MPI.MIN)
+    bbox_hi = np.empty(gdim); comm.Allreduce(local_hi, bbox_hi, op=MPI.MAX)
+    margin = bbox_margin * (bbox_hi - bbox_lo)
+
+    for dim in range(gdim):
+        near_lo = all_coords[:, dim] < bbox_lo[dim] + margin[dim]
+        near_hi = all_coords[:, dim] > bbox_hi[dim] - margin[dim]
+        interior_mask[near_lo | near_hi] = False
 
     local_vals = Psi.x.array[:n_owned]
     interior_idx = np.where(interior_mask)[0]

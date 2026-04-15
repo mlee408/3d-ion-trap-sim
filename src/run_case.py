@@ -184,14 +184,16 @@ def main():
         print(f"[mesh] bbox min={bbox_min.tolist()}, max={bbox_max.tolist()}")
         print(f"[mesh] estimated cell size h_mesh={h_mesh:.4e}")
 
-    # Auto-scale h and ray_length when the user left the defaults (2e-6 m / 200e-6 m)
-    # but the mesh is clearly not in SI metres.
+    # Auto-scale h and ray_length when the mesh coordinates are clearly not SI
+    # metres (h_mesh > 0.01 implies the mesh is in µm, mm, or larger units).
+    # We apply the scale whenever a flag still looks like it was expressed in
+    # SI metres (< 1e-3), so explicit overrides in mesh units are passed through.
     h = args.h
     ray_length = args.depth_ray_length
-    if h_mesh > 1e-2:          # mesh appears to be in mm, cm, or larger units
-        if args.h == 2e-6:
-            h = h_mesh * 2.0   # must span multiple CG1 cells to get non-zero Hessian
-        if args.depth_ray_length == 200e-6:
+    if h_mesh > 1e-2:          # mesh is in µm / mm / larger — not SI metres
+        if h < 1e-3:           # user gave an SI-metres value (default or explicit)
+            h = h_mesh * 2.0   # must span multiple CG1 cells for a valid Hessian
+        if ray_length < 1e-3:  # user gave an SI-metres value (default or explicit)
             ray_length = h_mesh * 20.0
         if rank == 0:
             print(f"[auto-scale] h={h:.4e}, ray_length={ray_length:.4e} "
@@ -200,10 +202,15 @@ def main():
     # Detect or use the specified coordinate unit (metres per mesh unit).
     coord_unit = args.coord_unit
     if coord_unit is None:
-        # Heuristic: if the bounding-box span is > 1 mm, assume µm; if > 1 m, warn.
-        if bbox_span > 1.0:          # likely µm
+        # Heuristic based on bounding-box diagonal span in raw mesh units:
+        #   > 100  → almost certainly µm  (typical trap domain: 100s–1000s µm)
+        #   > 0.5  → almost certainly mm  (typical trap domain: 0.5–20 mm)
+        #   ≤ 0.5  → assume SI metres
+        # The old threshold of 1.0 incorrectly classified mm meshes (span ~1–2)
+        # as µm, producing 1000× errors in physical positions and frequencies.
+        if bbox_span > 100.0:        # likely µm
             coord_unit = 1e-6
-        elif bbox_span > 1e-3:       # likely mm
+        elif bbox_span > 0.5:        # likely mm
             coord_unit = 1e-3
         else:                        # assume metres
             coord_unit = 1.0
@@ -219,6 +226,14 @@ def main():
         domain, facet_tags, bc_map_rf, degree=args.degree, petsc_prefix=f"{args.prefix}_rf_"
     )
     phi_rf.name = "phi_rf"
+
+    # Diagnostic: sanity-check the Laplace solution before computing Psi.
+    # If phi_max ~ 0, the BCs were never applied (tag mismatch / degenerate mesh).
+    # If phi_max ~ 1 but Psi = 0, the mesh is too coarse for the CG1 gradient projection.
+    if rank == 0:
+        phi_arr = phi_rf.x.array
+        print(f"[phi_rf] min={phi_arr.min():.4f}  max={phi_arr.max():.4f}  "
+              f"mean={phi_arr.mean():.4f}  n_nonzero={int((phi_arr != 0).sum())}")
 
     basis_fields: List[fem.Function] = []
     for tag in args.basis_tags:
