@@ -184,16 +184,14 @@ def main():
         print(f"[mesh] bbox min={bbox_min.tolist()}, max={bbox_max.tolist()}")
         print(f"[mesh] estimated cell size h_mesh={h_mesh:.4e}")
 
-    # Auto-scale h and ray_length when the mesh coordinates are clearly not SI
-    # metres (h_mesh > 0.01 implies the mesh is in µm, mm, or larger units).
-    # We apply the scale whenever a flag still looks like it was expressed in
-    # SI metres (< 1e-3), so explicit overrides in mesh units are passed through.
+    # Auto-scale h and ray_length when the user left the defaults (2e-6 m / 200e-6 m)
+    # but the mesh is clearly not in SI metres.
     h = args.h
     ray_length = args.depth_ray_length
-    if h_mesh > 1e-2:          # mesh is in µm / mm / larger — not SI metres
-        if h < 1e-3:           # user gave an SI-metres value (default or explicit)
-            h = h_mesh * 2.0   # must span multiple CG1 cells for a valid Hessian
-        if ray_length < 1e-3:  # user gave an SI-metres value (default or explicit)
+    if h_mesh > 1e-2:          # mesh appears to be in mm, cm, or larger units
+        if args.h == 2e-6:
+            h = h_mesh * 2.0   # must span multiple CG1 cells to get non-zero Hessian
+        if args.depth_ray_length == 200e-6:
             ray_length = h_mesh * 20.0
         if rank == 0:
             print(f"[auto-scale] h={h:.4e}, ray_length={ray_length:.4e} "
@@ -202,15 +200,10 @@ def main():
     # Detect or use the specified coordinate unit (metres per mesh unit).
     coord_unit = args.coord_unit
     if coord_unit is None:
-        # Heuristic based on bounding-box diagonal span in raw mesh units:
-        #   > 100  → almost certainly µm  (typical trap domain: 100s–1000s µm)
-        #   > 0.5  → almost certainly mm  (typical trap domain: 0.5–20 mm)
-        #   ≤ 0.5  → assume SI metres
-        # The old threshold of 1.0 incorrectly classified mm meshes (span ~1–2)
-        # as µm, producing 1000× errors in physical positions and frequencies.
-        if bbox_span > 100.0:        # likely µm
+        # Heuristic: if the bounding-box span is > 1 mm, assume µm; if > 1 m, warn.
+        if bbox_span > 1.0:          # likely µm
             coord_unit = 1e-6
-        elif bbox_span > 0.5:        # likely mm
+        elif bbox_span > 1e-3:       # likely mm
             coord_unit = 1e-3
         else:                        # assume metres
             coord_unit = 1.0
@@ -226,14 +219,6 @@ def main():
         domain, facet_tags, bc_map_rf, degree=args.degree, petsc_prefix=f"{args.prefix}_rf_"
     )
     phi_rf.name = "phi_rf"
-
-    # Diagnostic: sanity-check the Laplace solution before computing Psi.
-    # If phi_max ~ 0, the BCs were never applied (tag mismatch / degenerate mesh).
-    # If phi_max ~ 1 but Psi = 0, the mesh is too coarse for the CG1 gradient projection.
-    if rank == 0:
-        phi_arr = phi_rf.x.array
-        print(f"[phi_rf] min={phi_arr.min():.4f}  max={phi_arr.max():.4f}  "
-              f"mean={phi_arr.mean():.4f}  n_nonzero={int((phi_arr != 0).sum())}")
 
     basis_fields: List[fem.Function] = []
     for tag in args.basis_tags:
@@ -251,28 +236,47 @@ def main():
     q = args.charge_e * e
     m = args.mass_amu * amu
 
+    # Compute pseudopotential WITHOUT clipping — preserves curvature near the
+    # RF null so the Hessian / secular-frequency calculation sees real signal
+    # instead of a flat plateau.
     Psi = metrics.compute_rf_pseudopotential(phi_rf, omega_rf=2.0 * np.pi * args.rf_freq, q_C=q, m_kg=m)
     Psi.name = "Psi_rf"
 
+    if rank == 0:
+        psi_arr = Psi.x.array
+        print(f"[phi_rf] min={phi_rf.x.array.min():.4f}  max={phi_rf.x.array.max():.4f}")
+        n_neg = int(np.sum(psi_arr < 0))
+        print(f"[psi_raw] min={psi_arr.min():.4e}  max={psi_arr.max():.4e}  "
+              f"n_negative={n_neg}/{psi_arr.size}")
+
+    # Find the RF null (DOF closest to Ψ = 0) using unclipped field.
     mininfo = metrics.find_minimum_cg1(Psi, comm=comm)
     if rank == 0:
         print(f"[trap min] r0={mininfo.r_min.tolist()}, Psi_min={mininfo.psi_min:.4e} J")
 
+    # Secular frequencies from Hessian of the UNCLIPPED Ψ at the RF null.
     sec = metrics.secular_frequencies_from_pseudopotential(
         Psi, m_kg=m, r0=mininfo.r_min, h=h, comm=comm,
         coord_scale=coord_unit, v_rf=args.vrf,
     )
 
+    # Clipped copy for depth estimation (negative artefacts would deflate the
+    # barrier height) and for visualisation / XDMF export.
+    Psi_clipped = fem.Function(Psi.function_space)
+    Psi_clipped.x.array[:] = np.maximum(Psi.x.array, 0.0)
+    Psi_clipped.name = "Psi_rf"
+
     depth = None
     if not args.no_depth:
         depth = metrics.estimate_trap_depth_by_rays(
-            Psi, r0=mininfo.r_min, ray_length=ray_length, nrays=args.depth_nrays, comm=comm
+            Psi_clipped, r0=mininfo.r_min, ray_length=ray_length, nrays=args.depth_nrays, comm=comm,
+            coord_scale=coord_unit, v_rf=args.vrf,
         )
 
     outdir = args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
     xdmf_path = outdir / f"{args.prefix}_fields.xdmf"
-    write_xdmf(xdmf_path, domain, [phi_rf, Psi, *basis_fields])
+    write_xdmf(xdmf_path, domain, [phi_rf, Psi_clipped, *basis_fields])
 
     report = {
         "mesh": str(args.mesh),

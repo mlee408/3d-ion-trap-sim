@@ -55,8 +55,11 @@ def compute_rf_pseudopotential(
       from this Ψ must be scaled by V_RF / coord_scale (see
       `secular_frequencies_from_pseudopotential`).
     * The CG1 L2-projection of |∇φ|² can produce small negative nodal values
-      (Gibbs-like undershoot near discontinuities).  These are clipped to zero
-      here; they are non-physical artefacts of the projection.
+      (Gibbs-like undershoot near discontinuities).  The raw (unclipped) field
+      is returned so that curvature information near the RF null is preserved
+      for Hessian / secular-frequency computation.  Callers that need a
+      non-negative field (e.g. depth estimation, visualisation) should clip
+      explicitly with ``np.maximum(Psi.x.array, 0)``.
     """
     domain = phi_rf.function_space.mesh
     V = fem.functionspace(domain, ("CG", degree))
@@ -64,8 +67,6 @@ def compute_rf_pseudopotential(
     Emag2_expr = ufl.dot(E_expr, E_expr)
     coeff = (q_C ** 2) / (4.0 * m_kg * (omega_rf ** 2))
     Psi = project(coeff * Emag2_expr, V, prefix=prefix, petsc_options=petsc_options)
-    # Clip non-physical negative values produced by the L2-projection overshoot.
-    Psi.x.array[:] = np.maximum(Psi.x.array, 0.0)
     Psi.name = "Psi_RF_J"
     return Psi
 
@@ -185,31 +186,21 @@ def dof_coordinate_from_index(f: fem.Function, local_dof: int) -> np.ndarray:
     return np.array(coords[local_dof], dtype=np.float64)
 
 
-def find_minimum_cg1(
-    Psi: fem.Function,
-    comm: MPI.Comm | None = None,
-    bbox_margin: float = 0.08,
-) -> TrapMinimum:
-    """Find the DOF with the smallest Ψ value in the physical trap interior.
+def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMinimum:
+    """Find the interior DOF closest to the RF null (Ψ ≈ 0).
 
-    Two exclusion layers are applied:
+    For a pseudopotential field, the trap centre is where Ψ is analytically
+    zero.  The CG1 L2-projection may produce small negative values near this
+    point, so we locate the DOF with the smallest ``|Ψ|`` rather than the
+    smallest ``Ψ``.  This avoids two pitfalls:
 
-    1. **Facet boundary** — DOFs touching any exterior facet (electrode surfaces
-       and outer box) are removed.  These can have Ψ ≈ 0 from the Dirichlet BC
-       on φ or from the L2-projection clip in compute_rf_pseudopotential.
+    * With unclipped Ψ, ``argmin(Ψ)`` could land on a Gibbs-ringing artefact
+      far from the true RF null.
+    * With clipped Ψ, many DOFs share the value ``Ψ = 0``, and ``argmin``
+      returns an arbitrary one (possibly at the edge of the clipped plateau).
 
-    2. **Spatial margin** — DOFs within ``bbox_margin`` × (bbox span per axis)
-       of any axis-aligned boundary face are also removed.  This catches DOFs
-       one element inside the outer box that inherit clipped-to-zero Ψ values
-       from the L2-projection overshoot, which would otherwise be picked as a
-       false global minimum.
-
-    Parameters
-    ----------
-    bbox_margin : float
-        Fraction of the per-axis bounding-box span to exclude near each face.
-        Default 0.08 (8 %).  Increase if the trap minimum is still landing on
-        a boundary; decrease if the physical trap sits very close to an edge.
+    Boundary DOFs are excluded because they sit on electrode surfaces where Ψ
+    may be near zero due to the boundary condition on φ.
     """
     if comm is None:
         comm = Psi.function_space.mesh.comm
@@ -221,11 +212,10 @@ def find_minimum_cg1(
     V = Psi.function_space
     tdim = domain.topology.dim
     fdim = tdim - 1
-    gdim = domain.geometry.dim
     imap = V.dofmap.index_map
     n_owned = imap.size_local          # number of locally owned DOFs
 
-    # --- Layer 1: exclude DOFs on any exterior (boundary) facet --------------
+    # Build a boolean mask that is False for any DOF touching a boundary facet.
     domain.topology.create_connectivity(fdim, tdim)
     bnd_facets = dmesh.exterior_facet_indices(domain.topology)
     bnd_dofs = fem.locate_dofs_topological(V, fdim, bnd_facets)
@@ -234,40 +224,26 @@ def find_minimum_cg1(
     if owned_bnd.size > 0:
         interior_mask[owned_bnd] = False
 
-    # --- Layer 2: spatial margin around the bounding box --------------------
-    # tabulate_dof_coordinates always returns shape (ndofs, 3); trim to gdim.
-    all_coords = V.tabulate_dof_coordinates().reshape(-1, 3)[:n_owned, :gdim]
-    # Use the global bbox (reduce across ranks so the margin is consistent).
-    local_lo = all_coords.min(axis=0) if all_coords.shape[0] > 0 else np.full(gdim, np.inf)
-    local_hi = all_coords.max(axis=0) if all_coords.shape[0] > 0 else np.full(gdim, -np.inf)
-    bbox_lo = np.empty(gdim); comm.Allreduce(local_lo, bbox_lo, op=MPI.MIN)
-    bbox_hi = np.empty(gdim); comm.Allreduce(local_hi, bbox_hi, op=MPI.MAX)
-    margin = bbox_margin * (bbox_hi - bbox_lo)
-
-    for dim in range(gdim):
-        near_lo = all_coords[:, dim] < bbox_lo[dim] + margin[dim]
-        near_hi = all_coords[:, dim] > bbox_hi[dim] - margin[dim]
-        interior_mask[near_lo | near_hi] = False
-
     local_vals = Psi.x.array[:n_owned]
     interior_idx = np.where(interior_mask)[0]
 
     if interior_idx.size > 0:
-        best = int(np.argmin(local_vals[interior_idx]))
+        # Use |Ψ| to find DOF closest to the analytical zero (RF null).
+        best = int(np.argmin(np.abs(local_vals[interior_idx])))
         local_idx = int(interior_idx[best])
-        local_min = float(local_vals[local_idx])
+        local_absmin = float(np.abs(local_vals[local_idx]))
     elif local_vals.size > 0:
         # Degenerate mesh partition — fall back to all DOFs
-        local_idx = int(np.argmin(local_vals))
-        local_min = float(local_vals[local_idx])
+        local_idx = int(np.argmin(np.abs(local_vals)))
+        local_absmin = float(np.abs(local_vals[local_idx]))
     else:
         local_idx = -1
-        local_min = float("inf")
+        local_absmin = float("inf")
 
     rank = comm.rank
-    candidates = comm.allgather((local_min, rank, local_idx))
-    best_min, best_rank, best_lidx = min(candidates, key=lambda t: (t[0], t[1]))
-    if best_lidx < 0 or not np.isfinite(best_min):
+    candidates = comm.allgather((local_absmin, rank, local_idx))
+    best_absmin, best_rank, best_lidx = min(candidates, key=lambda t: (t[0], t[1]))
+    if best_lidx < 0 or not np.isfinite(best_absmin):
         raise RuntimeError(
             "Could not find a finite interior minimum. "
             "Check that the Psi field is non-trivial and the mesh is valid."
@@ -275,12 +251,15 @@ def find_minimum_cg1(
 
     if rank == best_rank:
         r_best = dof_coordinate_from_index(Psi, best_lidx)
+        psi_val = float(local_vals[best_lidx])
     else:
         r_best = None
+        psi_val = None
     r_best = comm.bcast(r_best, root=best_rank)
+    psi_val = comm.bcast(psi_val, root=best_rank)
     return TrapMinimum(
         r_min=np.array(r_best, dtype=np.float64),
-        psi_min=float(best_min),
+        psi_min=float(psi_val),
         dof_index=int(best_lidx),
         rank=int(best_rank),
     )
@@ -462,6 +441,8 @@ def estimate_trap_depth_by_rays(
     nrays: int = 48,
     nsamples: int = 200,
     comm: MPI.Comm | None = None,
+    coord_scale: float = 1.0,
+    v_rf: float = 1.0,
 ) -> Dict:
     domain = Psi.function_space.mesh
     gdim = domain.geometry.dim
@@ -504,13 +485,20 @@ def estimate_trap_depth_by_rays(
     if best_dir is None:
         raise RuntimeError("Could not sample any valid rays inside the mesh. Check r0 and ray_length.")
 
+    # Convert normalised depth to physical units.
+    # Ψ_physical = (V_RF / coord_scale)² × Ψ_normalised
+    phys_scale = (v_rf / coord_scale) ** 2
+    depth_phys_J = best_depth * phys_scale
+    psi0_phys_J = psi0 * phys_scale
+    max_phys_J = best_max * phys_scale
+
     return {
         "r0_m": r0.tolist(),
-        "Psi0_J": float(psi0),
-        "depth_J": float(best_depth),
-        "depth_eV": float(best_depth / _E_CHARGE),
+        "Psi0_J": float(psi0_phys_J),
+        "depth_J": float(depth_phys_J),
+        "depth_eV": float(depth_phys_J / _E_CHARGE),
         "worst_direction": best_dir.tolist(),
-        "ray_max_Psi_J": float(best_max),
+        "ray_max_Psi_J": float(max_phys_J),
         "ray_samples_used": int(best_used),
         "ray_length_m": float(ray_length),
         "nrays": int(nrays),
