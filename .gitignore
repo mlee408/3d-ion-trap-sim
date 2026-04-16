@@ -5,6 +5,7 @@ __pycache__/
 *.pvd
 *.vtu
 *.vtk
+*.msh
 outputs/
+results/
 .ipynb_checkpoints/
-
