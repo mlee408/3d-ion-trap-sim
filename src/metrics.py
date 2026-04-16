@@ -187,20 +187,16 @@ def dof_coordinate_from_index(f: fem.Function, local_dof: int) -> np.ndarray:
 
 
 def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMinimum:
-    """Find the interior DOF closest to the RF null (Ψ ≈ 0).
+    """Find the RF null — the trap centre where Ψ ≈ 0.
 
-    For a pseudopotential field, the trap centre is where Ψ is analytically
-    zero.  The CG1 L2-projection may produce small negative values near this
-    point, so we locate the DOF with the smallest ``|Ψ|`` rather than the
-    smallest ``Ψ``.  This avoids two pitfalls:
+    The CG1 L2-projection of |∇φ|² can make thousands of DOFs
+    indistinguishable from zero (Gibbs ringing + floating-point limits).
+    A naïve ``argmin(|Ψ|)`` picks an arbitrary near-zero DOF, often at a
+    mesh boundary.
 
-    * With unclipped Ψ, ``argmin(Ψ)`` could land on a Gibbs-ringing artefact
-      far from the true RF null.
-    * With clipped Ψ, many DOFs share the value ``Ψ = 0``, and ``argmin``
-      returns an arbitrary one (possibly at the edge of the clipped plateau).
-
-    Boundary DOFs are excluded because they sit on electrode surfaces where Ψ
-    may be near zero due to the boundary condition on φ.
+    Strategy: collect all interior DOFs in the bottom 5 % by ``|Ψ|``,
+    compute their spatial centroid (which clusters around the true RF null),
+    then select the interior DOF nearest that centroid.
     """
     if comm is None:
         comm = Psi.function_space.mesh.comm
@@ -212,10 +208,11 @@ def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMin
     V = Psi.function_space
     tdim = domain.topology.dim
     fdim = tdim - 1
+    gdim = domain.geometry.dim
     imap = V.dofmap.index_map
-    n_owned = imap.size_local          # number of locally owned DOFs
+    n_owned = imap.size_local
 
-    # Build a boolean mask that is False for any DOF touching a boundary facet.
+    # Exclude DOFs on boundary facets (electrode surfaces).
     domain.topology.create_connectivity(fdim, tdim)
     bnd_facets = dmesh.exterior_facet_indices(domain.topology)
     bnd_dofs = fem.locate_dofs_topological(V, fdim, bnd_facets)
@@ -227,27 +224,49 @@ def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMin
     local_vals = Psi.x.array[:n_owned]
     interior_idx = np.where(interior_mask)[0]
 
-    if interior_idx.size > 0:
-        # Use |Ψ| to find DOF closest to the analytical zero (RF null).
-        best = int(np.argmin(np.abs(local_vals[interior_idx])))
-        local_idx = int(interior_idx[best])
-        local_absmin = float(np.abs(local_vals[local_idx]))
-    elif local_vals.size > 0:
-        # Degenerate mesh partition — fall back to all DOFs
-        local_idx = int(np.argmin(np.abs(local_vals)))
-        local_absmin = float(np.abs(local_vals[local_idx]))
-    else:
-        local_idx = -1
-        local_absmin = float("inf")
+    if interior_idx.size == 0:
+        raise RuntimeError(
+            "No interior DOFs found. Check mesh and boundary markers."
+        )
+
+    interior_abs = np.abs(local_vals[interior_idx])
+    raw_coords = V.tabulate_dof_coordinates().reshape(-1, 3)[:, :gdim]
+
+    # ── Centroid of the low-|Ψ| cluster ──────────────────────────────────
+    # Gather the global 5th-percentile threshold across all MPI ranks.
+    local_sorted = np.sort(interior_abs)
+    all_sorted = comm.allgather(local_sorted)
+    global_abs = np.concatenate(all_sorted)
+    threshold = float(np.percentile(global_abs, 5))
+    # Guard against a degenerate threshold of exactly zero.
+    threshold = max(threshold, float(global_abs.max()) * 1e-10,
+                    float(np.finfo(np.float64).tiny))
+
+    low_mask = interior_abs <= threshold
+    low_dofs = interior_idx[low_mask]
+    low_coords = raw_coords[low_dofs]
+
+    local_sum = low_coords.sum(axis=0).astype(np.float64)
+    local_count = np.array(float(low_coords.shape[0]), dtype=np.float64)
+    global_sum = np.empty(gdim, dtype=np.float64)
+    global_count = np.array(0.0, dtype=np.float64)
+    comm.Allreduce(local_sum, global_sum, op=MPI.SUM)
+    comm.Allreduce(local_count, global_count, op=MPI.SUM)
+
+    if global_count < 1.0:
+        raise RuntimeError("No DOFs below threshold — Psi field may be trivial.")
+    centroid = global_sum / global_count
+
+    # ── Nearest interior DOF to centroid ─────────────────────────────────
+    interior_coords = raw_coords[interior_idx]
+    dists = np.linalg.norm(interior_coords - centroid, axis=1)
+    local_best = int(np.argmin(dists))
+    local_min_dist = float(dists[local_best])
+    local_idx = int(interior_idx[local_best])
 
     rank = comm.rank
-    candidates = comm.allgather((local_absmin, rank, local_idx))
-    best_absmin, best_rank, best_lidx = min(candidates, key=lambda t: (t[0], t[1]))
-    if best_lidx < 0 or not np.isfinite(best_absmin):
-        raise RuntimeError(
-            "Could not find a finite interior minimum. "
-            "Check that the Psi field is non-trivial and the mesh is valid."
-        )
+    candidates = comm.allgather((local_min_dist, rank, local_idx))
+    _, best_rank, best_lidx = min(candidates, key=lambda t: (t[0], t[1]))
 
     if rank == best_rank:
         r_best = dof_coordinate_from_index(Psi, best_lidx)
@@ -401,11 +420,13 @@ def secular_frequencies_from_pseudopotential(
     H = numerical_hessian(Psi, r0=r0, h=h, comm=comm)
     eigvals, eigvecs = np.linalg.eigh(H)
 
-    # Convert Hessian from J/[mesh_unit]² → J/m², then scale for actual V_RF.
-    # Ψ_physical = v_rf² × Ψ_normalised
-    # H_physical [J/m²] = v_rf² × H_mesh [J/mesh_unit²] / coord_scale²
-    # ω² = H_physical / m  →  ω = v_rf / coord_scale × sqrt(H_mesh / m)
-    scale = v_rf / coord_scale
+    # Derivation:
+    #   Ψ_phys(x_SI) = (v_rf/coord_scale)² × Ψ_norm(x_mesh)
+    #   ∂/∂x_SI = (1/coord_scale) ∂/∂x_mesh
+    #   H_phys [J/m²] = (v_rf/coord_scale)² × (1/coord_scale²) × H_mesh
+    #                 = v_rf² × H_mesh / coord_scale⁴
+    #   ω² = H_phys / m  →  ω = (v_rf / coord_scale²) × sqrt(H_mesh / m)
+    scale = v_rf / coord_scale ** 2
     omega = scale * np.sqrt(np.clip(eigvals, 0.0, None) / m_kg)
     freq = omega / (2.0 * np.pi)
     return SecularFrequencies(

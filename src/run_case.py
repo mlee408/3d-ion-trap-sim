@@ -192,7 +192,9 @@ def main():
         if args.h == 2e-6:
             h = h_mesh * 2.0   # must span multiple CG1 cells to get non-zero Hessian
         if args.depth_ray_length == 200e-6:
-            ray_length = h_mesh * 20.0
+            # Use the full bbox diagonal so rays always reach the outer boundary.
+            # Points outside the mesh return NaN and are skipped automatically.
+            ray_length = bbox_span
         if rank == 0:
             print(f"[auto-scale] h={h:.4e}, ray_length={ray_length:.4e} "
                   f"(mesh unit ~{h_mesh:.4e})")
@@ -200,12 +202,15 @@ def main():
     # Detect or use the specified coordinate unit (metres per mesh unit).
     coord_unit = args.coord_unit
     if coord_unit is None:
-        # Heuristic: if the bounding-box span is > 1 mm, assume µm; if > 1 m, warn.
-        if bbox_span > 1.0:          # likely µm
+        # Heuristic based on bounding-box span in mesh units:
+        #   span > 100  → coordinates are in µm  (coord_unit = 1e-6 m/mu)
+        #   span > 0.1  → coordinates are in mm  (coord_unit = 1e-3 m/mu)
+        #   else        → coordinates are in m   (coord_unit = 1.0 m/mu)
+        if bbox_span > 100.0:
             coord_unit = 1e-6
-        elif bbox_span > 1e-3:       # likely mm
+        elif bbox_span > 0.1:
             coord_unit = 1e-3
-        else:                        # assume metres
+        else:
             coord_unit = 1.0
         if rank == 0:
             print(f"[auto-detect] coord_unit={coord_unit:.0e} m/mesh_unit "
@@ -249,10 +254,12 @@ def main():
         print(f"[psi_raw] min={psi_arr.min():.4e}  max={psi_arr.max():.4e}  "
               f"n_negative={n_neg}/{psi_arr.size}")
 
-    # Find the RF null (DOF closest to Ψ = 0) using unclipped field.
+    # Find the RF null (centroid of low-|Ψ| cluster) using unclipped field.
     mininfo = metrics.find_minimum_cg1(Psi, comm=comm)
     if rank == 0:
         print(f"[trap min] r0={mininfo.r_min.tolist()}, Psi_min={mininfo.psi_min:.4e} J")
+        bbox_center = ((bbox_min + bbox_max) / 2).tolist()
+        print(f"[trap min] bbox center={bbox_center}")
 
     # Secular frequencies from Hessian of the UNCLIPPED Ψ at the RF null.
     sec = metrics.secular_frequencies_from_pseudopotential(
