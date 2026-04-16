@@ -202,13 +202,16 @@ def main():
         help="Lower z bound for the RF-null search (mesh units, default: no bound)."
     )
     ap.add_argument(
-        "--r0-search-margin", type=float, default=2.0e-4,
+        "--r0-search-margin", type=float, default=5.0e-5,
         help="Physical margin (metres) added above the RF electrode top when "
-             "auto-setting --r0-z-max (default 2.0e-4 m = 0.20 mm). "
-             "Must exceed the expected trap height: ~82 µm for linear arms, "
-             "~45 µm for the inter-junction arm.  0.20 mm gives ~2.5× clearance "
-             "for the linear arm while still excluding the Neumann far-field "
-             "(which starts decaying above ~0.5 mm from the electrode)."
+             "auto-setting --r0-z-max (default 5.0e-5 m = 50 µm). "
+             "For 3D pillar traps the ion sits BELOW the RF pillar tops, so "
+             "this margin is intentionally small to exclude the Neumann far-field "
+             "vacuum region above the pillars, which contains many near-zero Ψ "
+             "DOFs that would otherwise drag the cluster centroid away from the "
+             "true RF null.  If the auto-detected minimum looks wrong, override "
+             "with --r0-z-max directly (e.g. --r0-z-max 0.12 for a mm-unit mesh "
+             "with ~82 µm trap height)."
     )
     # ── Lateral (x/y) search bounds ─────────────────────────────────────────
     # For multi-junction meshes the RF null is diffuse across the entire array.
@@ -446,6 +449,16 @@ def main():
             if rank == 0:
                 print(f"[r0 search] z_max auto-detect failed ({_e}); no z bound applied.")
 
+    # z_min: if not user-specified, default to 0.0 (DC surface).
+    # The mesh extends to z_min_bbox ≈ -0.22 mm (vacuum below the chip) which
+    # has many near-zero Ψ DOFs.  Without a lower z bound the centroid finder
+    # can drift below the electrode surface.
+    if r0_z_min is None and domain.topology.dim == 3:
+        r0_z_min = 0.0
+        if rank == 0:
+            print("[r0 search] z_min auto-set to 0.0 (DC surface). "
+                  "Override with --r0-z-min if your trap sits below z=0.")
+
     # x/y bounds — explicit flags take priority; --r0-x-auto fills in x if
     # neither --r0-x-min nor --r0-x-max was supplied.
     r0_x_min = args.r0_x_min
@@ -501,21 +514,83 @@ def main():
     )
     if rank == 0:
         print(f"[trap min] r0={mininfo.r_min.tolist()}, Psi_min={mininfo.psi_min:.4e} J")
+        r0_SI = np.array(mininfo.r_min) * coord_unit
+        print(f"[trap min] r0_SI={r0_SI.tolist()} m")
         bbox_center = ((bbox_min + bbox_max) / 2).tolist()
         print(f"[trap min] bbox center={bbox_center}")
+
+    # ── Validate minimum location ─────────────────────────────────────────
+    # Hard-reject any minimum below the DC surface (z < 0).  This is always
+    # non-physical for a trap fabricated on a flat chip.
+    if mininfo.r_min.shape[0] >= 3 and float(mininfo.r_min[2]) < 0.0:
+        raise RuntimeError(
+            f"[trap min] r0.z = {float(mininfo.r_min[2]):.4g} mesh units — "
+            "the minimum finder landed below the DC surface (z < 0). "
+            "Ensure --r0-z-min >= 0 (auto-set to 0.0 by default) and that "
+            "--r0-z-max is tight enough to exclude the vacuum below the chip. "
+            f"Current bounds: z=[{r0_z_min}, {r0_z_max}]"
+        )
+
+    if rank == 0:
+        # Warn if the minimum z is suspiciously close to z_max — a sign the
+        # search window is too wide and the centroid drifted into the far-field.
+        if r0_z_max is not None and mininfo.r_min.shape[0] >= 3:
+            z_r0 = float(mininfo.r_min[2])
+            if z_r0 > 0.85 * r0_z_max:
+                import warnings as _w
+                _w.warn(
+                    f"[trap min] r0.z={z_r0:.4g} is within 15% of the search ceiling "
+                    f"z_max={r0_z_max:.4g} (mesh units).  This strongly suggests the "
+                    "5th-percentile cluster centroid drifted into the Neumann far-field "
+                    "vacuum instead of the true RF null.  Re-run with a tighter "
+                    f"--r0-z-max, e.g.  --r0-z-max {z_r0 * 0.25:.3g}  "
+                    "(aim for ~1.5× the expected trap height).",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+    # ── Debug: scan Ψ(z) along the z-axis through r0 (x,y fixed) ───────────
+    # Prints Psi values from z=0 to z=0.25 mm so you can verify a real
+    # minimum exists near the expected trap height and confirm r0 is correct.
+    if rank == 0:
+        _scan_x = float(mininfo.r_min[0])
+        _scan_y = float(mininfo.r_min[1]) if mininfo.r_min.shape[0] >= 2 else 0.0
+        _z_scan = np.linspace(0.0, 0.25, 26)  # 0 to 0.25 mesh units (mm)
+        _pts = np.column_stack([
+            np.full_like(_z_scan, _scan_x),
+            np.full_like(_z_scan, _scan_y),
+            _z_scan,
+        ])
+        _psi_scan = metrics.eval_function_at_points(Psi, _pts, comm=comm)
+        print("[debug Ψ scan] z (mm) → Ψ_FEM:")
+        for _zv, _pv in zip(_z_scan, _psi_scan):
+            print(f"  z={_zv:.3f}  Psi={_pv:.4e}")
 
     # Secular frequencies from Hessian of the UNCLIPPED Ψ at the RF null.
     sec = metrics.secular_frequencies_from_pseudopotential(
         Psi, m_kg=m, r0=mininfo.r_min, h=h, comm=comm,
         coord_scale=coord_unit, v_rf=args.vrf,
     )
-    if rank == 0 and any(ev < 0 for ev in sec["eigvals"]):
-        import warnings
-        warnings.warn(
-            f"[trap min] Hessian has negative eigenvalues {sec['eigvals']} — "
-            "r0 is not a true pseudopotential minimum. The minimum finder may have "
-            "landed on an electrode-adjacent artifact. Check r0 and the Psi field.",
+    _eigvals = sec["eigvals"]
+    _n_neg = sum(1 for ev in _eigvals if ev < 0)
+    if _n_neg > 0 and rank == 0:
+        import warnings as _w
+        _w.warn(
+            f"[secular] Hessian has {_n_neg} negative eigenvalue(s): {_eigvals}. "
+            "r0 is not a true local Ψ minimum (it may be a saddle point or an "
+            "electrode-adjacent artifact). "
+            "Tighten --r0-z-min / --r0-z-max / --r0-x-min / --r0-x-max so the "
+            "search stays inside the physical trapping corridor.  "
+            f"Current r0={mininfo.r_min.tolist()} (mesh units).",
             RuntimeWarning,
+        )
+    # Treat all-negative Hessian as a hard failure — frequencies are meaningless.
+    if all(ev < 0 for ev in _eigvals):
+        raise RuntimeError(
+            "[secular] All Hessian eigenvalues are negative — r0 is not a local "
+            "minimum at all.  Re-run with tighter search bounds, e.g.: "
+            f"--r0-z-min 0.02 --r0-z-max 0.12  (current r0.z = "
+            f"{float(mininfo.r_min[2]) if mininfo.r_min.shape[0] >= 3 else 'N/A':.4g})"
         )
 
     # Clipped copy for depth estimation (negative artefacts would deflate the
@@ -523,6 +598,14 @@ def main():
     Psi_clipped = fem.Function(Psi.function_space)
     Psi_clipped.x.array[:] = np.maximum(Psi.x.array, 0.0)
     Psi_clipped.name = "Psi_rf"
+
+    # Canonical Ψ₀ at r0 from the CLIPPED field.  Using the clipped field here
+    # ensures trap_min.Psi_min_J and depth.Psi0_J are consistent (both come
+    # from the same Psi_clipped evaluated at the same r0, without ambiguity
+    # from Gibbs-ringing negative values in the raw field).
+    psi_min_clipped = float(metrics.eval_function_at_points(
+        Psi_clipped, np.array([mininfo.r_min], dtype=np.float64), comm=comm
+    )[0])
 
     depth = None
     if not args.no_depth:
@@ -556,7 +639,8 @@ def main():
         "r0_SI_m": (np.array(mininfo.r_min) * coord_unit).tolist(),
         "trap_min": {
             "r0_m": mininfo.r_min.tolist(),
-            "Psi_min_J": float(mininfo.psi_min),
+            "Psi_min_J": psi_min_clipped,       # clipped; matches depth.Psi0_J
+            "Psi_min_raw_J": float(mininfo.psi_min),  # unclipped (may be slightly < 0)
             "rank_found": int(mininfo.rank),
             "dof_index": int(mininfo.dof_index),
         },

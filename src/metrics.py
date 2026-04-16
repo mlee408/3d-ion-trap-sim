@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import warnings
 
 import numpy as np
@@ -186,6 +186,60 @@ def dof_coordinate_from_index(f: fem.Function, local_dof: int) -> np.ndarray:
     return np.array(coords[local_dof], dtype=np.float64)
 
 
+def refine_minimum(
+    Psi: fem.Function,
+    r0_init: np.ndarray,
+    *,
+    bounds_lo: Optional[np.ndarray] = None,
+    bounds_hi: Optional[np.ndarray] = None,
+    comm: MPI.Comm | None = None,
+    h: Optional[float] = None,
+    n_rounds: int = 5,
+) -> Tuple[np.ndarray, float]:
+    """Coordinate-descent polishing of an initial Ψ minimum estimate.
+
+    Performs n_rounds of coordinate descent, halving h each round.
+    Bounds are enforced by hard clamping. Requires ~2*gdim*n_rounds Ψ evals.
+
+    Parameters
+    ----------
+    r0_init   : initial guess in mesh units (from centroid finder)
+    bounds_lo : lower bound per axis (mesh units); None means no bound
+    bounds_hi : upper bound per axis (mesh units); None means no bound
+    h         : initial step size in mesh units; defaults to 0.4×h_mesh
+    n_rounds  : number of halving rounds (each halves h)
+    """
+    r = np.asarray(r0_init, dtype=np.float64).copy()
+    gdim = len(r)
+
+    if h is None:
+        h = _estimate_cell_h(Psi.function_space.mesh) * 0.4
+
+    lo = bounds_lo if bounds_lo is not None else np.full(gdim, -np.inf)
+    hi = bounds_hi if bounds_hi is not None else np.full(gdim, +np.inf)
+
+    def psi_at(pt: np.ndarray) -> float:
+        v = eval_function_at_points(Psi, np.array([pt], dtype=np.float64), comm=comm)[0]
+        return float(v) if np.isfinite(v) else np.inf
+
+    f_cur = psi_at(r)
+
+    for _round in range(n_rounds):
+        for i in range(gdim):
+            e = np.zeros(gdim); e[i] = 1.0
+            r_p = np.clip(r + h * e, lo, hi)
+            r_m = np.clip(r - h * e, lo, hi)
+            f_p = psi_at(r_p)
+            f_m = psi_at(r_m)
+            if f_p < f_cur and f_p <= f_m:
+                r = r_p; f_cur = f_p
+            elif f_m < f_cur:
+                r = r_m; f_cur = f_m
+        h *= 0.5
+
+    return r, f_cur
+
+
 def find_minimum_cg1(
     Psi: fem.Function,
     comm: MPI.Comm | None = None,
@@ -196,6 +250,7 @@ def find_minimum_cg1(
     y_max: Optional[float] = None,
     z_min: Optional[float] = None,
     z_max: Optional[float] = None,
+    refine: bool = True,
 ) -> TrapMinimum:
     """Find the RF null — the trap centre where Ψ ≈ 0.
 
@@ -331,9 +386,70 @@ def find_minimum_cg1(
         raise RuntimeError("No DOFs below threshold — Psi field may be trivial.")
     centroid = global_sum / global_count
 
-    # ── Nearest interior DOF to centroid ─────────────────────────────────
+    # ── Evaluate Ψ at the centroid ────────────────────────────────────────
+    psi_at_centroid = eval_function_at_points(
+        Psi, np.array([centroid], dtype=np.float64), comm=comm
+    )[0]
+
+    # ── Optional coordinate-descent refinement ────────────────────────────
+    # The cluster centroid is a robust initial guess but is not in general the
+    # exact Ψ minimum.  Polishing it with a few rounds of coordinate descent
+    # (with the same spatial bounds) ensures r0 sits at the true local Ψ dip,
+    # which makes the Hessian finite-difference accurate.
+    r0 = centroid.copy()
+    psi_r0 = float(psi_at_centroid)
+
+    if refine:
+        _lo_list = [x_min, y_min, z_min][:gdim]
+        _hi_list = [x_max, y_max, z_max][:gdim]
+        _lo = np.array([v if v is not None else -np.inf for v in _lo_list])
+        _hi = np.array([v if v is not None else +np.inf for v in _hi_list])
+        r0_ref, psi_ref = refine_minimum(
+            Psi, centroid, bounds_lo=_lo, bounds_hi=_hi, comm=comm
+        )
+        # Accept refined result only if it genuinely reduces Ψ.
+        if np.isfinite(psi_ref) and psi_ref <= psi_r0:
+            r0 = r0_ref
+            psi_r0 = psi_ref
+
+    # ── Bounds validation ─────────────────────────────────────────────────
+    # Reject the minimum if it lies outside the requested search box.  This
+    # catches edge cases where the refinement stepped slightly outside a bound
+    # (shouldn't happen with hard clamping, but guard anyway).
+    _bounds_check = [
+        (0, x_min, x_max, "x"),
+        (1, y_min, y_max, "y"),
+        (2, z_min, z_max, "z"),
+    ]
+    for _ax, _lo_v, _hi_v, _name in _bounds_check:
+        if _ax >= gdim:
+            continue
+        _coord = float(r0[_ax])
+        if _lo_v is not None and _coord < _lo_v - 1e-10:
+            warnings.warn(
+                f"find_minimum_cg1: refined r0.{_name}={_coord:.4g} is below "
+                f"{_name}_min={_lo_v:.4g} (mesh units).  "
+                "Clamping to bound — consider tightening the search window.",
+                RuntimeWarning, stacklevel=2,
+            )
+            r0[_ax] = _lo_v
+        if _hi_v is not None and _coord > _hi_v + 1e-10:
+            warnings.warn(
+                f"find_minimum_cg1: refined r0.{_name}={_coord:.4g} is above "
+                f"{_name}_max={_hi_v:.4g} (mesh units).  "
+                "Clamping to bound — consider tightening the search window.",
+                RuntimeWarning, stacklevel=2,
+            )
+            r0[_ax] = _hi_v
+
+    # Re-evaluate Ψ after any clamping.
+    psi_r0 = float(eval_function_at_points(
+        Psi, np.array([r0], dtype=np.float64), comm=comm
+    )[0])
+
+    # ── Nearest-DOF bookkeeping (diagnostics only) ────────────────────────
     interior_coords = raw_coords[interior_idx]
-    dists = np.linalg.norm(interior_coords - centroid, axis=1)
+    dists = np.linalg.norm(interior_coords - r0, axis=1)
     local_best = int(np.argmin(dists))
     local_min_dist = float(dists[local_best])
     local_idx = int(interior_idx[local_best])
@@ -342,17 +458,9 @@ def find_minimum_cg1(
     candidates = comm.allgather((local_min_dist, rank, local_idx))
     _, best_rank, best_lidx = min(candidates, key=lambda t: (t[0], t[1]))
 
-    if rank == best_rank:
-        r_best = dof_coordinate_from_index(Psi, best_lidx)
-        psi_val = float(local_vals[best_lidx])
-    else:
-        r_best = None
-        psi_val = None
-    r_best = comm.bcast(r_best, root=best_rank)
-    psi_val = comm.bcast(psi_val, root=best_rank)
     return TrapMinimum(
-        r_min=np.array(r_best, dtype=np.float64),
-        psi_min=float(psi_val),
+        r_min=np.array(r0, dtype=np.float64),
+        psi_min=float(psi_r0),
         dof_index=int(best_lidx),
         rank=int(best_rank),
     )
@@ -397,7 +505,12 @@ def numerical_hessian(
     # Auto-scale h to mesh geometry if the supplied value is wildly off.
     h_mesh = _estimate_cell_h(domain)
     h = float(h)
-    if h <= 0.0 or not np.isfinite(h) or h < h_mesh * 0.5 or h > h_mesh * 100.0:
+    # Allow steps as small as 0.05 × h_mesh (was 0.5 × h_mesh).
+    # For sub-cell trap heights (e.g. 82 µm ion with 50 µm cells) a step of
+    # ~0.1 × h_mesh is the right order of magnitude; the old 0.5× lower bound
+    # would silently inflate h to 2 × h_mesh, spanning well outside the
+    # quadratic regime of Ψ.
+    if h <= 0.0 or not np.isfinite(h) or h < h_mesh * 0.05 or h > h_mesh * 100.0:
         h_new = h_mesh * 2.0
         if comm is None or comm.rank == 0:
             warnings.warn(
