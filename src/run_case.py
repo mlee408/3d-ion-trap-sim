@@ -129,12 +129,34 @@ def solve_laplace_tagged(
 
 
 def write_xdmf(out_path: Path, domain, fields: Sequence[fem.Function]):
+    """Write fields to XDMF, interpolating higher-degree functions to CG1.
+
+    DOLFINx XDMFFile requires functions to be in the same polynomial space as
+    the mesh geometry (CG1 for a standard linear mesh).  When --degree 2 is
+    used the Laplace solution and pseudopotential are in CG2; we interpolate
+    them down to CG1 purely for visualisation — the computation (Hessian,
+    depth) has already been performed on the full-degree fields.
+    """
     comm = domain.comm
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    V1 = fem.functionspace(domain, ("CG", 1))
     with XDMFFile(comm, str(out_path), "w") as xdmf:
         xdmf.write_mesh(domain)
         for f in fields:
-            xdmf.write_function(f)
+            # Check if the function is already CG1 (degree 1).
+            # Attribute path differs across DOLFINx versions; fall back to
+            # always interpolating if introspection is unavailable.
+            try:
+                deg = f.function_space.element.basix_element.degree
+            except AttributeError:
+                deg = None   # unknown — interpolate to be safe
+            if deg == 1:
+                xdmf.write_function(f)
+            else:
+                f_out = fem.Function(V1)
+                f_out.interpolate(f)
+                f_out.name = f.name
+                xdmf.write_function(f_out)
 
 
 def main():
@@ -144,7 +166,19 @@ def main():
     ap.add_argument("--rf-tags", type=int, nargs="+", required=True)
     ap.add_argument("--ground-tags", type=int, nargs="+", required=True)
     ap.add_argument("--basis-tags", type=int, nargs="*", default=[])
-    ap.add_argument("--degree", type=int, default=1)
+    ap.add_argument(
+        "--degree", type=int, default=1,
+        help="FEM polynomial degree for the Laplace solve (default 1 = CG1). "
+             "IMPORTANT: CG1 gives piecewise-*constant* gradients, so the "
+             "pseudopotential Ψ = |∇φ|² is piecewise-constant per element.  "
+             "Its Hessian (needed for secular frequencies) can only be resolved "
+             "if the mesh is extremely fine near the RF null — in practice the "
+             "computed frequencies are 10–300× too low with CG1 on typical meshes.  "
+             "Use --degree 2 (CG2, piecewise-*linear* gradients) for accurate "
+             "secular frequencies: the Laplace solve is ~4–8× more expensive but "
+             "the Hessian is accurate on the same mesh.  Always use --degree 2 "
+             "for production runs."
+    )
     ap.add_argument("--rf-freq", type=float, default=40e6)
     ap.add_argument("--mass-amu", type=float, default=40.0)
     ap.add_argument("--charge-e", type=float, default=1.0)
@@ -153,6 +187,76 @@ def main():
     ap.add_argument("--depth-nrays", type=int, default=48)
     ap.add_argument("--no-depth", action="store_true")
     ap.add_argument("--prefix", type=str, default="case")
+    # Minimum-finder spatial bounds (mesh units).
+    # With Neumann outer BC the pseudopotential decays smoothly to zero far
+    # from the electrodes, creating a large near-zero region that confuses
+    # the cluster-centroid finder.  Restricting the search to a thin slab
+    # above the electrode surface fixes this.
+    ap.add_argument(
+        "--r0-z-max", type=float, default=None,
+        help="Upper z bound for the RF-null search (mesh units). "
+             "Default: auto-detected as z_electrode_top + --r0-search-margin."
+    )
+    ap.add_argument(
+        "--r0-z-min", type=float, default=None,
+        help="Lower z bound for the RF-null search (mesh units, default: no bound)."
+    )
+    ap.add_argument(
+        "--r0-search-margin", type=float, default=2.0e-4,
+        help="Physical margin (metres) added above the RF electrode top when "
+             "auto-setting --r0-z-max (default 2.0e-4 m = 0.20 mm). "
+             "Must exceed the expected trap height: ~82 µm for linear arms, "
+             "~45 µm for the inter-junction arm.  0.20 mm gives ~2.5× clearance "
+             "for the linear arm while still excluding the Neumann far-field "
+             "(which starts decaying above ~0.5 mm from the electrode)."
+    )
+    # ── Lateral (x/y) search bounds ─────────────────────────────────────────
+    # For multi-junction meshes the RF null is diffuse across the entire array.
+    # Restricting x (and optionally y) to a single arm keeps the 5%-low-Ψ
+    # cluster centroid inside the intended linear region or junction pocket.
+    #
+    # Example for a 2-junction 0.6 mm-pitch mesh (junctions near x=0 & x=0.6):
+    #   Right outer arm:   --r0-x-min 0.65 --r0-x-max 1.05
+    #   Left outer arm:    --r0-x-max -0.05
+    #   Inter-junction:    --r0-x-min 0.05 --r0-x-max 0.55
+    #
+    # Auto-detect (--r0-x-auto): computes x_electrode_centre ± 0.25 × pitch
+    # for the linear-region midpoint between junctions, and prints the bounds
+    # so you can override them with explicit flags on the next run.
+    ap.add_argument(
+        "--r0-x-min", type=float, default=None,
+        help="Lower x bound for the RF-null search (mesh units). "
+             "Default: no bound (all x)."
+    )
+    ap.add_argument(
+        "--r0-x-max", type=float, default=None,
+        help="Upper x bound for the RF-null search (mesh units). "
+             "Default: no bound."
+    )
+    ap.add_argument(
+        "--r0-y-min", type=float, default=None,
+        help="Lower y bound for the RF-null search (mesh units). "
+             "Default: no bound."
+    )
+    ap.add_argument(
+        "--r0-y-max", type=float, default=None,
+        help="Upper y bound for the RF-null search (mesh units). "
+             "Default: no bound."
+    )
+    ap.add_argument(
+        "--r0-x-auto", action="store_true",
+        help="Auto-detect x bounds for the RF-null search from the RF electrode "
+             "geometry.  Computes the RF surface x-extent, then restricts the "
+             "search to the central half of that extent (electrode_x_mid ± 0.25 × span). "
+             "Useful for 2-junction runs without explicit --r0-x-min/max.  "
+             "Printed bounds can be copied as explicit flags for subsequent runs."
+    )
+    ap.add_argument(
+        "--outer-tags", type=int, nargs="*", default=[4],
+        help="Facet tag IDs that are the outer (far-field) boundary. "
+             "These receive Neumann BC (∂φ/∂n = 0) — do NOT include them in "
+             "--ground-tags. Default: [4]."
+    )
     # Physical unit parameters
     ap.add_argument(
         "--vrf", type=float, default=1.0,
@@ -184,20 +288,48 @@ def main():
         print(f"[mesh] bbox min={bbox_min.tolist()}, max={bbox_max.tolist()}")
         print(f"[mesh] estimated cell size h_mesh={h_mesh:.4e}")
 
+    # ── Degree warning ──────────────────────────────────────────────────────
+    # CG1 (degree=1) gives piecewise-constant gradients → pseudopotential Ψ is
+    # piecewise-constant per element.  Its Hessian (secular frequencies) is then
+    # dominated by discretisation noise — frequencies come out 10–300× too low
+    # on production-quality meshes.  CG2 (degree=2) gives piecewise-linear
+    # gradients → Ψ ∝ |∇φ|² is piecewise-quadratic → Hessian is accurate.
+    if args.degree == 1 and rank == 0:
+        import warnings as _w
+        _w.warn(
+            "[degree=1] Using CG1 elements.  Secular frequencies computed from "
+            "the Hessian of Ψ = |∇φ|² will be 10–300× too low on typical meshes "
+            "because CG1 cannot accurately represent the quadratic RF null. "
+            "Re-run with --degree 2 (CG2) for accurate secular frequencies.  "
+            "The Laplace solve is ~4–8× more expensive but the Hessian is "
+            "accurate on the same mesh.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     # Auto-scale h and ray_length when the user left the defaults (2e-6 m / 200e-6 m)
     # but the mesh is clearly not in SI metres.
+    #
+    # Hessian step scaling depends on element degree:
+    #   CG1 (degree=1): Ψ is piecewise-constant per element; the finite-difference
+    #     step must span several elements to see a signal above rounding noise.
+    #     Use h = 4 × h_mesh (was 2×, but 2× is often at the noise floor).
+    #   CG2 (degree=2): Ψ is piecewise-quadratic; curvature is resolved within
+    #     a single element.  Use h = 3 × h_mesh for a good balance of accuracy
+    #     and truncation error.
+    _h_multiplier = 4.0 if args.degree == 1 else 3.0
     h = args.h
     ray_length = args.depth_ray_length
     if h_mesh > 1e-2:          # mesh appears to be in mm, cm, or larger units
         if args.h == 2e-6:
-            h = h_mesh * 2.0   # must span multiple CG1 cells to get non-zero Hessian
+            h = h_mesh * _h_multiplier
         if args.depth_ray_length == 200e-6:
             # Use the full bbox diagonal so rays always reach the outer boundary.
             # Points outside the mesh return NaN and are skipped automatically.
             ray_length = bbox_span
         if rank == 0:
-            print(f"[auto-scale] h={h:.4e}, ray_length={ray_length:.4e} "
-                  f"(mesh unit ~{h_mesh:.4e})")
+            print(f"[auto-scale] h={h:.4e} ({_h_multiplier}×h_mesh, degree={args.degree}), "
+                  f"ray_length={ray_length:.4e} (mesh unit ~{h_mesh:.4e})")
 
     # Detect or use the specified coordinate unit (metres per mesh unit).
     coord_unit = args.coord_unit
@@ -217,8 +349,31 @@ def main():
                   f"(bbox span={bbox_span:.3g} mesh units)")
     # ────────────────────────────────────────────────────────────────────────
 
+    outer_tags = set(args.outer_tags) if args.outer_tags else set()
+
+    # Warn if the user accidentally put outer-boundary tags in --ground-tags.
+    # Those should be Neumann (no Dirichlet), not grounded.
+    bad_gnd = set(args.ground_tags) & outer_tags
+    if bad_gnd and rank == 0:
+        import warnings
+        warnings.warn(
+            f"[BC] Tag(s) {sorted(bad_gnd)} appear in both --ground-tags and "
+            "--outer-tags. Outer-boundary tags are Neumann (∂φ/∂n=0) — "
+            "remove them from --ground-tags to avoid imposing φ=0 at the "
+            "far-field boundary (which artificially truncates the escape barrier).",
+            UserWarning,
+        )
+
+    # Electrode ground tags minus any outer-boundary tags
+    gnd_electrode_tags = [t for t in args.ground_tags if t not in outer_tags]
+
+    if rank == 0:
+        print(f"[BC] RF Dirichlet tags : {args.rf_tags}")
+        print(f"[BC] GND Dirichlet tags: {gnd_electrode_tags}")
+        print(f"[BC] Neumann (outer)   : {sorted(outer_tags)}")
+
     bc_map_rf: Dict[int, float] = {tag: 1.0 for tag in args.rf_tags}
-    bc_map_rf.update({tag: 0.0 for tag in args.ground_tags})
+    bc_map_rf.update({tag: 0.0 for tag in gnd_electrode_tags})
 
     phi_rf = solve_laplace_tagged(
         domain, facet_tags, bc_map_rf, degree=args.degree, petsc_prefix=f"{args.prefix}_rf_"
@@ -228,7 +383,7 @@ def main():
     basis_fields: List[fem.Function] = []
     for tag in args.basis_tags:
         bc_map_b: Dict[int, float] = {tag: 1.0}
-        for gt in args.ground_tags:
+        for gt in gnd_electrode_tags:
             bc_map_b[gt] = 0.0
         phi_b = solve_laplace_tagged(
             domain, facet_tags, bc_map_b, degree=args.degree, petsc_prefix=f"{args.prefix}_b{tag}_"
@@ -244,7 +399,10 @@ def main():
     # Compute pseudopotential WITHOUT clipping — preserves curvature near the
     # RF null so the Hessian / secular-frequency calculation sees real signal
     # instead of a flat plateau.
-    Psi = metrics.compute_rf_pseudopotential(phi_rf, omega_rf=2.0 * np.pi * args.rf_freq, q_C=q, m_kg=m)
+    Psi = metrics.compute_rf_pseudopotential(
+        phi_rf, omega_rf=2.0 * np.pi * args.rf_freq, q_C=q, m_kg=m,
+        degree=args.degree,
+    )
     Psi.name = "Psi_rf"
 
     if rank == 0:
@@ -254,8 +412,93 @@ def main():
         print(f"[psi_raw] min={psi_arr.min():.4e}  max={psi_arr.max():.4e}  "
               f"n_negative={n_neg}/{psi_arr.size}")
 
+    # ── RF-null search bounds ────────────────────────────────────────────────
+    # The search box restricts the 5%-low-Ψ cluster centroid so the minimum
+    # finder cannot drift into:
+    #   z: the Neumann far-field (Ψ → 0 smoothly far from electrodes)
+    #   x: a remote junction's RF null in multi-junction meshes
+    #   y: the outer vacuum padding on the transverse axis
+    #
+    # z bound (auto-detect from RF facet top + margin) — always active.
+    r0_z_max = args.r0_z_max
+    r0_z_min = args.r0_z_min
+    rf_nodes = None   # will be re-used for x/y auto-detect below
+
+    if r0_z_max is None and domain.topology.dim == 3:
+        try:
+            tdim_local = domain.topology.dim
+            fdim_local = tdim_local - 1
+            domain.topology.create_connectivity(fdim_local, 0)
+            f2v = domain.topology.connectivity(fdim_local, 0)
+            rf_facet_indices = np.concatenate(
+                [facet_tags.find(t) for t in args.rf_tags]
+            )
+            rf_nodes = np.unique(
+                np.concatenate([f2v.links(int(fi)) for fi in rf_facet_indices])
+            )
+            z_electrode_top = float(domain.geometry.x[rf_nodes, 2].max())
+            margin_mesh = args.r0_search_margin / coord_unit   # metres → mesh units
+            r0_z_max = z_electrode_top + margin_mesh
+            if rank == 0:
+                print(f"[r0 search] z_electrode_top={z_electrode_top:.4g} mesh units, "
+                      f"margin={margin_mesh:.4g} → z_max={r0_z_max:.4g}")
+        except Exception as _e:
+            if rank == 0:
+                print(f"[r0 search] z_max auto-detect failed ({_e}); no z bound applied.")
+
+    # x/y bounds — explicit flags take priority; --r0-x-auto fills in x if
+    # neither --r0-x-min nor --r0-x-max was supplied.
+    r0_x_min = args.r0_x_min
+    r0_x_max = args.r0_x_max
+    r0_y_min = args.r0_y_min
+    r0_y_max = args.r0_y_max
+
+    if args.r0_x_auto and r0_x_min is None and r0_x_max is None:
+        try:
+            # Reuse rf_nodes gathered during z auto-detect; fall back to
+            # computing them now if z auto-detect was skipped or failed.
+            if rf_nodes is None:
+                fdim_local = domain.topology.dim - 1
+                domain.topology.create_connectivity(fdim_local, 0)
+                f2v = domain.topology.connectivity(fdim_local, 0)
+                rf_facet_indices = np.concatenate(
+                    [facet_tags.find(t) for t in args.rf_tags]
+                )
+                rf_nodes = np.unique(
+                    np.concatenate([f2v.links(int(fi)) for fi in rf_facet_indices])
+                )
+            x_rf = domain.geometry.x[rf_nodes, 0]
+            x_rf_min = float(x_rf.min())
+            x_rf_max = float(x_rf.max())
+            x_rf_mid = (x_rf_min + x_rf_max) / 2.0
+            x_rf_half = (x_rf_max - x_rf_min) / 4.0  # ±25 % of full span
+            r0_x_min = x_rf_mid - x_rf_half
+            r0_x_max = x_rf_mid + x_rf_half
+            if rank == 0:
+                print(f"[r0 search] x_auto: RF x=[{x_rf_min:.4g}, {x_rf_max:.4g}], "
+                      f"centre±25%=[{r0_x_min:.4g}, {r0_x_max:.4g}] mesh units")
+                print(f"[r0 search] hint: override with "
+                      f"--r0-x-min {r0_x_min:.4g} --r0-x-max {r0_x_max:.4g}")
+        except Exception as _e:
+            if rank == 0:
+                print(f"[r0 search] x_auto failed ({_e}); no x bound applied.")
+
+    # Print active bounds summary for reproducibility.
+    if rank == 0:
+        bounds_str = (
+            f"x=[{r0_x_min},{r0_x_max}]  "
+            f"y=[{r0_y_min},{r0_y_max}]  "
+            f"z=[{r0_z_min},{r0_z_max}]"
+        )
+        print(f"[r0 search] active bounds (mesh units): {bounds_str}")
+
     # Find the RF null (centroid of low-|Ψ| cluster) using unclipped field.
-    mininfo = metrics.find_minimum_cg1(Psi, comm=comm)
+    mininfo = metrics.find_minimum_cg1(
+        Psi, comm=comm,
+        x_min=r0_x_min, x_max=r0_x_max,
+        y_min=r0_y_min, y_max=r0_y_max,
+        z_min=r0_z_min, z_max=r0_z_max,
+    )
     if rank == 0:
         print(f"[trap min] r0={mininfo.r_min.tolist()}, Psi_min={mininfo.psi_min:.4e} J")
         bbox_center = ((bbox_min + bbox_max) / 2).tolist()
@@ -305,6 +548,11 @@ def main():
         "h_mesh_estimate": h_mesh,
         "coord_unit_m_per_mesh": coord_unit,
         "vrf_V": args.vrf,
+        "r0_search_bounds_mesh": {
+            "x": [r0_x_min, r0_x_max],
+            "y": [r0_y_min, r0_y_max],
+            "z": [r0_z_min, r0_z_max],
+        },
         "r0_SI_m": (np.array(mininfo.r_min) * coord_unit).tolist(),
         "trap_min": {
             "r0_m": mininfo.r_min.tolist(),

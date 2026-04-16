@@ -1,0 +1,145 @@
+RESEARCH-RELEVANT NUMERICAL VALUES ONLY
+
+============================================================
+PAPER 1: 3D-Printed Micro Ion Trap Technology for Scalable Quantum Information Processing
+============================================================
+
+Core Trap Geometry
+- Conventional macro 3D trap ion-electrode distance: ~1 mm
+- Surface trap characteristic scale: ~100 µm
+- 3D-printed trap total RF pillar height: 300 µm
+- Opposing RF electrode separation: 200 µm
+- Ion-to-RF-electrode distance: 100 µm
+- DC electrode tuning area: 600 µm × 600 µm
+
+Fabrication Parameters
+- 3D printing laser wavelength: 780 nm
+- Objective magnification: 25×
+- Objective numerical aperture: 0.8
+- Gold coating thickness: 1 µm
+- Metal evaporation angle: 30°
+- Device turnaround time: 1–2 days
+
+RF / Trap Operation
+- RF drive frequency (experiment): 51.6 MHz
+- Comparison simulation RF drive frequency: 80 MHz
+- Comparison simulation RF amplitude: 150 V
+- Experimental RF amplitude explored: up to 160 V
+- Measured radial trap frequency range: 2.09 MHz – 24.15 MHz
+- Highest measured radial trap frequency: 24.15 MHz
+- Stability parameter at highest frequency: q = 0.903
+- Theoretical stability limit: q = 0.911
+- a parameter near limit: a = 0.0018
+
+Performance Improvements
+- 3D trap trap-frequency gain at same drive frequency: 5× higher than surface trap
+- 3D trap trap-frequency gain at constant q: 2× higher
+- Same trapping parameters achievable with ~10× less power than surface trap
+
+Cooling / Quantum Operation Metrics
+- Measured Doppler-cooled average occupation: n̄ = 0.5 ± 0.08
+- Example sideband measurement detuning: ±21.29 MHz
+- Rabi oscillation trap frequency example: 21.29 MHz
+- Measured Rabi frequency: 2π × 185 kHz
+- First oscillation contrast: 0.994 (+0.006 / -0.010)
+- 11th oscillation contrast: 0.993 (+0.007 / -0.031)
+- Estimated π-pulse error rate: ≲ 1×10^-4
+- Predicted motional error contribution at 20 MHz trap frequency: 2×10^-7
+
+Future Scaling Estimates
+- Example future ion-electrode distance: 50 µm
+- Example future RF amplitude: 160 V
+- Example future RF drive frequency: 150 MHz
+- Example future q target: 0.5
+- Predicted radial trap frequency under those conditions: 30 MHz
+- Target axial frequency for scalable operation: 10 MHz
+- Cooling time reduction estimate: from milliseconds → few 100 µs
+- Estimated scalable density: >1000 traps/cm²
+
+Vacuum / Stability
+- Pressure estimate: below 10^-10 mbar
+- Bake duration: 4 days
+- Bake temperature: 180 °C
+- Simulated electrode deformation at 200 V DC: <0.2 nm
+
+Measurement Hardware
+- Ion species: 40Ca+
+- Ion height above DC plane: 130 µm
+- Cooling laser wavelength: 397 nm
+- Cooling laser detuning: 20 MHz red
+- Repumper wavelength: 866 nm
+- Qubit transition laser wavelength: 729 nm
+- Capacitive divider ratio: 3 pF : 100 pF
+
+
+============================================================
+PAPER 2: Feasibility Study of 3D-Printed Micro Junction Array for Ion Trap Quantum Processor
+============================================================
+
+Junction Array Geometry
+- Single X-junction footprint: 600 µm × 600 µm
+- RF electrode width: 120 µm
+- Minimum RF–DC spacing: 10 µm
+- 3D RF electrode height above surface: 247 µm
+- RF cross-section dimensions: 56 µm × 82 µm
+- Support pedestal size: 56 µm square
+- Junction spacing center-to-center: 600 µm
+- Demonstrated printed array example: 3 × 3 junction array
+
+Optical Access / Imaging
+- Blocked field of view for NA = 0.3 lens: 65.3%
+- Blocked field of view for NA = 0.6 lens: 28.6%
+
+Simulation Parameters
+- Ion species: 171Yb+
+- RF drive frequency: 44.3 MHz
+- Total confinement target: 0.75 × 10^9 eV/m²
+- RF amplitude in linear-region comparison: 190 V
+
+Linear Region Performance
+- Trap height above surface: 82.3 µm
+- Trap frequency (3D design): 2.32 MHz
+- Stability parameter: qz = 0.15
+- Trap depth (3D design): 2.3 eV
+- Surface trap comparison frequency: 1.98 MHz
+- Surface trap trap depth: 74 meV
+- Trap frequency improvement: 17%
+- Trap depth improvement: 31×
+- To match frequency, surface trap RF voltage increase needed: 17%
+- Corresponding RF power increase needed: 37%
+- Equal-frequency depth still only: 100 meV
+- Depth advantage at equal frequency: 23× deeper
+- Y-direction confinement efficiency improvement: 40%
+- Y-direction depth improvement: 5×
+
+Residual Micromotion
+- Residual pseudopotential over 20 µm span: 5×10^-5 eV
+- Corresponding micromotion amplitude: 38 nm
+
+Junction Performance
+- Junction trap height near center reduced to: ~40 µm
+- Previous design confinement degradation: down to 1/8
+- New design degradation reduced to: ~1/2
+- Pseudopotential barrier along CTC path: below 7 meV
+- Barrier reduction relative to prior design: nearly 10×
+
+Heating Metrics
+- Axial secular frequency used for heating estimate: 1.13 MHz
+- RF noise level assumption: −178 dBc
+- Maximum RF-noise heating rate near junction: <16 quanta/s
+
+Surface Noise Comparison
+- Reference cryogenic heating benchmark: 50 quanta/s
+- Reference ion species: 88Sr+
+- Reference trap frequency: 850 kHz
+- Reference ion-electrode distance: 38 µm
+- Estimated Yb heating under current design: 11 quanta/s
+- Current junction ion-electrode distance near center: 40 µm
+
+Transport Performance
+- Assumed shuttling speed: 4 m/s
+- Total excitation per round trip: 0.00019 quanta
+- Improvement over state-of-the-art junction transport: ~100×
+
+General Research Claim
+- Junction motional excitation reduction: up to two orders of magnitude

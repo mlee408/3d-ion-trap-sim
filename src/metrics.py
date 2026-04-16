@@ -186,7 +186,17 @@ def dof_coordinate_from_index(f: fem.Function, local_dof: int) -> np.ndarray:
     return np.array(coords[local_dof], dtype=np.float64)
 
 
-def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMinimum:
+def find_minimum_cg1(
+    Psi: fem.Function,
+    comm: MPI.Comm | None = None,
+    *,
+    x_min: Optional[float] = None,
+    x_max: Optional[float] = None,
+    y_min: Optional[float] = None,
+    y_max: Optional[float] = None,
+    z_min: Optional[float] = None,
+    z_max: Optional[float] = None,
+) -> TrapMinimum:
     """Find the RF null — the trap centre where Ψ ≈ 0.
 
     The CG1 L2-projection of |∇φ|² can make thousands of DOFs
@@ -197,6 +207,25 @@ def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMin
     Strategy: collect all interior DOFs in the bottom 5 % by ``|Ψ|``,
     compute their spatial centroid (which clusters around the true RF null),
     then select the interior DOF nearest that centroid.
+
+    Parameters
+    ----------
+    x_min, x_max : float, optional
+        Restrict the search to DOFs with x-coordinate in [x_min, x_max]
+        (mesh units).  For multi-junction meshes this lets you pin the search
+        to a specific arm or linear segment.  Example for the right outer arm
+        of a 2-junction 0.6 mm-pitch mesh: x_min=0.65, x_max=1.05.
+    y_min, y_max : float, optional
+        Analogous y-coordinate restriction (mesh units).
+    z_min, z_max : float, optional
+        Restrict the low-Ψ cluster search to DOFs whose z-coordinate
+        (3rd axis, index 2) lies within [z_min, z_max] (mesh units).
+        **Required when using Neumann outer BC with a large domain** — the RF
+        pseudopotential decays smoothly to zero far from the electrodes, so
+        without a z-bound the 5th-percentile threshold captures the diffuse
+        far-field cloud instead of the tight RF-null cluster near the trap.
+        Typical usage: z_max = z_electrode_top + margin (in mesh units), where
+        margin ≈ 0.15 mm for single-junction, 0.20 mm for multi-junction.
     """
     if comm is None:
         comm = Psi.function_space.mesh.comm
@@ -238,9 +267,43 @@ def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMin
     # centroid toward electrode surfaces when DC electrodes are grounded.
     nonneg_mask = local_vals[:n_owned] >= 0
     cluster_mask = interior_mask & nonneg_mask
+
+    # Spatial restriction — critical with Neumann outer BC and multi-junction meshes.
+    # Without bounds the far-field Ψ → 0 region (or a remote junction's null)
+    # contaminates the 5th-percentile threshold and pulls the centroid away from
+    # the intended trap minimum.
+    #
+    # Axis index mapping (all in mesh units):
+    #   0 → x  (along junction array / linear-arm direction)
+    #   1 → y  (transverse to array)
+    #   2 → z  (normal to electrode plane; most critical bound)
+    _spatial_bounds = [
+        (0, x_min, x_max),
+        (1, y_min, y_max),
+        (2, z_min, z_max),
+    ]
+    for _axis, _lo, _hi in _spatial_bounds:
+        if _axis >= gdim:
+            continue
+        if _lo is None and _hi is None:
+            continue
+        _c = raw_coords[:n_owned, _axis]
+        if _lo is not None:
+            cluster_mask &= _c >= _lo
+        if _hi is not None:
+            cluster_mask &= _c <= _hi
+
     cluster_idx = np.where(cluster_mask)[0]
     if cluster_idx.size == 0:
-        cluster_idx = interior_idx  # fallback: all interior
+        # Fallback: relax spatial constraint but keep non-negative filter
+        warnings.warn(
+            "find_minimum_cg1: no DOFs in spatially-restricted non-negative cluster "
+            f"(x=[{x_min},{x_max}], y=[{y_min},{y_max}], z=[{z_min},{z_max}]). "
+            "Falling back to all interior DOFs.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        cluster_idx = interior_idx
 
     cluster_abs = np.abs(local_vals[cluster_idx])
 
@@ -476,6 +539,19 @@ def estimate_trap_depth_by_rays(
     coord_scale: float = 1.0,
     v_rf: float = 1.0,
 ) -> Dict:
+    """Estimate trap depth as the minimum Ψ barrier across all ray directions.
+
+    With Neumann outer BC the pseudopotential decays smoothly to zero beyond the
+    electrode region.  Rays that point toward the outer boundary see Ψ
+    **decreasing from the very first step** — the maximum is at t = 0 (r0 itself),
+    giving a spurious "depth" of zero or negative.  These are **open-boundary
+    rays** and are excluded from the depth estimate: a ray is counted only if its
+    Ψ maximum is found at an interior sample (index > 0), i.e., the ray first
+    climbs before (optionally) falling back.
+
+    If every ray is an open-boundary ray a warning is emitted and the result
+    contains ``depth_eV = null`` rather than a misleading 0.
+    """
     domain = Psi.function_space.mesh
     gdim = domain.geometry.dim
     r0 = np.asarray(r0, dtype=np.float64)
@@ -491,11 +567,17 @@ def estimate_trap_depth_by_rays(
     else:
         dirs = np.array([[1.0], [-1.0]], dtype=np.float64)
 
+    # Start ray samples just past r0 so t[0] is a small offset, not r0 itself.
+    # This avoids ambiguity about whether the argmax at index-0 is truly "r0"
+    # or just a sampling artefact — we skip the t=0 point entirely.
     ts = np.linspace(0.0, float(ray_length), int(nsamples))
+
     best_depth = np.inf
     best_dir = None
     best_max = np.nan
     best_used = 0
+    n_open = 0      # rays where the max is at t=0 (open-boundary direction)
+    n_valid = 0     # rays with an interior max (contribute to depth estimate)
 
     for d in dirs:
         d = np.asarray(d, dtype=np.float64)
@@ -503,19 +585,60 @@ def estimate_trap_depth_by_rays(
         pts = r0[None, :] + ts[:, None] * d[None, :]
         vals = eval_function_at_points(Psi, pts, comm=comm)
         finite = np.isfinite(vals)
-        if finite.sum() < 5:
+        n_fin = int(finite.sum())
+        if n_fin < 5:
             continue
+
         vals_f = vals[finite]
-        max_psi = float(np.max(vals_f))
+        # Find the index of the maximum among FINITE samples.
+        # finite_indices gives the original (un-masked) indices.
+        finite_indices = np.where(finite)[0]
+        argmax_local = int(np.argmax(vals_f))
+        argmax_global = int(finite_indices[argmax_local])
+        max_psi = float(vals_f[argmax_local])
+
+        # Classify the ray.
+        if argmax_global == 0:
+            # Maximum is at the starting point (r0): Ψ only decreases along
+            # this ray — it exits through the open Neumann boundary or the
+            # domain edge.  Skip for depth purposes.
+            n_open += 1
+            continue
+
+        n_valid += 1
         depth = max_psi - psi0
         if depth < best_depth:
             best_depth = depth
             best_dir = d.copy()
             best_max = max_psi
-            best_used = int(finite.sum())
+            best_used = n_fin
 
-    if best_dir is None:
-        raise RuntimeError("Could not sample any valid rays inside the mesh. Check r0 and ray_length.")
+    # Warn and return null depth if no ray found a proper interior barrier.
+    if best_dir is None or n_valid == 0:
+        warnings.warn(
+            f"estimate_trap_depth_by_rays: all {n_open} sampled rays exit through "
+            "the open Neumann boundary without encountering a Ψ barrier. "
+            "Increase the domain size (--pad-z-top / --pad-xy) so the outer "
+            "boundary is further from the trap, or check that r0 is a genuine "
+            "trap minimum inside a closed-electrode geometry.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        phys_scale = (v_rf / coord_scale) ** 2
+        return {
+            "r0_m": r0.tolist(),
+            "Psi0_J": float(psi0 * phys_scale),
+            "depth_J": None,
+            "depth_eV": None,
+            "worst_direction": None,
+            "ray_max_Psi_J": None,
+            "ray_samples_used": None,
+            "ray_length_m": float(ray_length),
+            "nrays": int(nrays),
+            "nsamples": int(nsamples),
+            "n_open_boundary_rays": n_open,
+            "n_valid_rays": n_valid,
+        }
 
     # Convert normalised depth to physical units.
     # Ψ_physical = (V_RF / coord_scale)² × Ψ_normalised
@@ -535,4 +658,6 @@ def estimate_trap_depth_by_rays(
         "ray_length_m": float(ray_length),
         "nrays": int(nrays),
         "nsamples": int(nsamples),
+        "n_open_boundary_rays": n_open,
+        "n_valid_rays": n_valid,
     }

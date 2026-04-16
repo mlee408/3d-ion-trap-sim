@@ -84,23 +84,80 @@ def classify_vacuum_surfaces(vacuum_vols, rf_vols, dc_vols, ground_vols):
     return rf_surfs, dc_surfs, gnd_surfs, outer_surfs, unknown_surfs
 
 
+def clip_volumes_to_x(vol_tags, x_lo, x_hi, ymin, ymax, zmin, zmax, margin=1.0):
+    """Clip 3-D volumes to x ∈ [x_lo, x_hi] via OCC intersect with a slab box.
+
+    Volumes already fully inside [x_lo, x_hi] pass through unchanged.
+    Parts outside are removed.  Returns list of (3, tag) pairs.
+
+    A flat-plane clip is far more robust than fusing overlapping solids:
+    the resulting faces are co-planar, so tiled copies meet at flush faces
+    that OCC fuse can merge without creating degenerate topology.
+    """
+    clip = gmsh.model.occ.addBox(
+        x_lo, ymin - margin, zmin - margin,
+        x_hi - x_lo,
+        (ymax - ymin) + 2 * margin,
+        (zmax - zmin) + 2 * margin,
+    )
+    result, _ = gmsh.model.occ.intersect(
+        [(3, t) for t in vol_tags],
+        [(3, clip)],
+        removeObject=True,
+        removeTool=True,
+    )
+    return [(d, t) for d, t in result if d == 3]
+
+
+def tile_and_fuse_volumes(base_vols, n_junctions, pitch_x):
+    """Copy, translate, and fuse *base_vols* along x for n_junctions unit cells.
+
+    Assumes base_vols have already been clipped to exactly pitch_x wide so
+    copies meet at flush co-planar faces.  OCC fuse of touching flat faces is
+    clean and produces a single continuous solid with no degenerate seams.
+
+    Returns the list of (3, tag) pairs after the fuse.
+    """
+    if n_junctions == 1:
+        return [(3, t) for t in base_vols]
+
+    all_dimtags = [(3, t) for t in base_vols]
+    for i in range(1, n_junctions):
+        copies = gmsh.model.occ.copy([(3, v) for v in base_vols])
+        gmsh.model.occ.translate(copies, pitch_x * i, 0.0, 0.0)
+        all_dimtags.extend((d, t) for d, t in copies if d == 3)
+
+    fused, _ = gmsh.model.occ.fuse(
+        all_dimtags[:1], all_dimtags[1:],
+        removeObject=True, removeTool=True,
+    )
+    return [(d, t) for d, t in fused if d == 3]
+
+
 def add_mesh_size_fields(
     rf_surfs, dc_surfs, gnd_surfs,
     lc_electrode, lc_center, lc_far,
     dist_min, dist_max,
-    center_radius, trap_center,
+    center_radius, trap_centers,
 ):
-    """Set mesh sizes via Distance+Threshold from electrode surfaces + Ball at trap centre.
+    """Set mesh sizes via Distance+Threshold from electrode surfaces + Ball(s) at trap centres.
 
     Uses Gmsh background mesh fields exclusively:
       1. Distance field measuring distance from all electrode surfaces (geometry-based).
       2. Threshold field that interpolates from lc_electrode (at the surface) to
          lc_far (beyond dist_max).
-      3. Optional Ball field around the expected trap centre for additional refinement.
-      4. Min field combining (2) and (3) — every point gets the finest applicable size.
+      3. One Ball field per entry in *trap_centers* for additional local refinement.
+         Pass a list of [x, y, z] points — one per linear region and/or junction centre.
+      4. Min field combining all above — every point gets the finest applicable size.
 
     This approach covers the full electrode surface area, not just geometric corner
     points, and avoids the circular dependency of older Distance-from-mesh approaches.
+
+    Parameters
+    ----------
+    trap_centers : list of [x, y, z] or None
+        Positions (mesh units) of all trap-centre Ball fields.  Pass an empty
+        list or None to disable Ball refinement.
     """
     all_electrode_surfs = sorted(rf_surfs | dc_surfs | gnd_surfs)
 
@@ -121,17 +178,20 @@ def add_mesh_size_fields(
     print(f"[fields] Distance+Threshold: lc={lc_electrode} at surfaces → "
           f"lc={lc_far} beyond dist={dist_max} (surfaces: {all_electrode_surfs})")
 
-    # Ball field around expected trap centre
-    if trap_center is not None:
-        f_ball = gmsh.model.mesh.field.add("Ball")
-        gmsh.model.mesh.field.setNumber(f_ball, "VIn",     lc_center)
-        gmsh.model.mesh.field.setNumber(f_ball, "VOut",    lc_far)
-        gmsh.model.mesh.field.setNumber(f_ball, "Radius",  center_radius)
-        gmsh.model.mesh.field.setNumber(f_ball, "XCenter", trap_center[0])
-        gmsh.model.mesh.field.setNumber(f_ball, "YCenter", trap_center[1])
-        gmsh.model.mesh.field.setNumber(f_ball, "ZCenter", trap_center[2])
-        fields.append(f_ball)
-        print(f"[fields] Ball(lc={lc_center}) centred at {trap_center}, r={center_radius}")
+    # Ball field(s) around expected trap centre(s).
+    # Each entry is a (xyz, radius) tuple so different positions can carry
+    # their own radius (e.g. outer arms vs inter-junction midpoint).
+    if trap_centers:
+        for tc, r_ball in trap_centers:
+            f_ball = gmsh.model.mesh.field.add("Ball")
+            gmsh.model.mesh.field.setNumber(f_ball, "VIn",     lc_center)
+            gmsh.model.mesh.field.setNumber(f_ball, "VOut",    lc_far)
+            gmsh.model.mesh.field.setNumber(f_ball, "Radius",  r_ball)
+            gmsh.model.mesh.field.setNumber(f_ball, "XCenter", tc[0])
+            gmsh.model.mesh.field.setNumber(f_ball, "YCenter", tc[1])
+            gmsh.model.mesh.field.setNumber(f_ball, "ZCenter", tc[2])
+            fields.append(f_ball)
+            print(f"[fields] Ball(lc={lc_center}) centred at {tc}, r={r_ball}")
 
     # Min field: every point gets the finest size from all active fields
     f_min = gmsh.model.mesh.field.add("Min")
@@ -153,7 +213,7 @@ def main():
 
     # ── Vacuum domain padding ──────────────────────────────────────────────
     # Independent x/y and z controls so the domain is deep enough above the
-    # electrode plane (where the trap minimum lives at z ≈ 80 µm) without
+    # electrode plane (where the trap minimum lives at z ≈ 80–130 µm) without
     # blowing up unnecessarily in x/y.
     ap.add_argument("--pad", type=float, default=None,
                     help="Uniform padding override (overrides --pad-xy/z-bot/z-top)")
@@ -161,10 +221,13 @@ def main():
                     help="Symmetric x/y padding beyond conductor bbox (mm, default 0.200)")
     ap.add_argument("--pad-z-bot", type=float, default=0.200,
                     help="Padding below conductor bbox in z (mm, default 0.200)")
-    ap.add_argument("--pad-z-top", type=float, default=0.400,
-                    help="Padding above conductor bbox in z (mm, default 0.400). "
-                         "Needs to be large: trap minimum is ~0.080 mm above electrode "
-                         "surface and the outer BC must not distort the field there.")
+    ap.add_argument("--pad-z-top", type=float, default=0.600,
+                    help="Padding above conductor bbox in z (mm, default 0.600). "
+                         "Must be large enough that the Neumann outer BC does not "
+                         "distort the field at the trap minimum (~80–130 µm above "
+                         "the electrode surface).  0.6 mm gives ~5× the trap height "
+                         "of clearance and is the recommended default for both single- "
+                         "and multi-junction meshes.")
 
     # ── Mesh size field parameters (mm) ───────────────────────────────────
     ap.add_argument("--lc-electrode", type=float, default=0.003,
@@ -177,17 +240,57 @@ def main():
                     help="Distance from electrode surface where fine mesh starts (mm)")
     ap.add_argument("--dist-max", type=float, default=0.050,
                     help="Distance from electrode surface where far-field size is reached (mm)")
-    ap.add_argument("--center-radius", type=float, default=0.040,
-                    help="Radius of the fine-mesh ball around the trap centre (mm, default 0.040)")
+    ap.add_argument("--center-radius", type=float, default=0.060,
+                    help="Radius of the fine-mesh ball around the primary trap centre "
+                         "(mm, default 0.060).  Covers ±60 µm around the estimated centre, "
+                         "enough to contain the trap even if the z-offset estimate is 30–40 µm "
+                         "off.  Outer-arm balls use --center-radius-junction (default 0.070).")
     ap.add_argument("--trap-center", type=float, nargs=3, default=None,
                     metavar=("X", "Y", "Z"),
-                    help="Expected trap-centre position in mesh units (mm). "
-                         "Default: RF surface centroid + --trap-center-z-offset.")
-    ap.add_argument("--trap-center-z-offset", type=float, default=0.080,
-                    help="Z offset added to the RF surface centroid to estimate the "
-                         "trap centre when --trap-center is not given (mm, default 0.080)")
+                    help="Primary expected trap-centre position in mesh units (mm). "
+                         "Adds one Ball refinement field at this point. "
+                         "Default: auto-detected from RF surface geometry (see below).")
+    ap.add_argument("--trap-center-z-offset", type=float, default=0.082,
+                    help="Z offset above the RF electrode top surface used when "
+                         "auto-estimating the trap centre for the PRIMARY (inter-junction "
+                         "or single-junction) ball field (mm, default 0.082 ≈ paper "
+                         "linear-region trap height of 82.3 µm).")
+    ap.add_argument("--trap-center-z-offset-junction", type=float, default=0.082,
+                    help="Z offset used for the automatically-added outer-arm Ball fields "
+                         "in multi-junction meshes (mm, default 0.082 ≈ paper linear-region "
+                         "trap height of 82.3 µm).  The outer arms of a multi-junction array "
+                         "have the same electrode cross-section as the single-junction linear "
+                         "region, so 0.082 is the correct default.  The inter-junction arm "
+                         "(primary ball, --trap-center-z-offset) has a lower trap height "
+                         "(~45 µm observed) but is covered by the primary ball + z-offset.")
+    ap.add_argument("--center-radius-junction", type=float, default=0.070,
+                    help="Ball radius for the auto-added outer-arm Ball fields in "
+                         "multi-junction meshes (mm, default 0.070).  Larger than the "
+                         "primary --center-radius (0.040 mm) to tolerate ±30 µm uncertainty "
+                         "in the exact trap height, ensuring the fine-mesh region always "
+                         "covers the actual RF null location.")
     ap.add_argument("--no-center-ball", action="store_true",
-                    help="Disable the trap-centre Ball field (use only Distance/Threshold)")
+                    help="Disable all trap-centre Ball fields (use only Distance/Threshold).")
+    ap.add_argument("--linear-region-x", type=float, nargs="+", default=None,
+                    metavar="X",
+                    help="One or more x-coordinates (mm) of linear-region trap centres "
+                         "for extra Ball refinement.  Useful for multi-junction meshes "
+                         "where you want fine mesh at each linear arm midpoint AND each "
+                         "junction crossing.  Y is set to 0; Z is RF-top + "
+                         "--trap-center-z-offset. "
+                         "Example for 2-junction 0.6 mm pitch: "
+                         "--linear-region-x -0.15 0.30 0.75  "
+                         "(left arm, inter-junction midpoint, right arm).")
+
+    # ── Multi-junction tiling ──────────────────────────────────────────────
+    ap.add_argument("--njunctions", type=int, default=1,
+                    help="Number of x-junctions to tile end-to-end (default 1). "
+                         "Use 2 for two connected x-junctions.")
+    ap.add_argument("--junction-pitch", type=float, default=None,
+                    help="Center-to-center junction pitch in x for tiling (mm). "
+                         "Default: 0.600 mm (the standard cell pitch). "
+                         "The physical cell is wider than this, so outer RF arms will "
+                         "overlap — the fuse merges them into one continuous beam.")
 
     ap.add_argument("--nopopup", action="store_true")
     args = ap.parse_args()
@@ -219,6 +322,49 @@ def main():
     gnd_in = import_step_volumes(args.ground)
 
     gmsh.model.occ.synchronize()
+
+    # 1b) tile junctions in x if requested
+    if args.njunctions > 1:
+        all_cond_single = rf_in + dc_in + gnd_in
+        xmin0, ymin0, zmin0, xmax0, ymax0, zmax0 = union_bbox(all_cond_single)
+        cell_span_x = xmax0 - xmin0
+        pitch_x = args.junction_pitch if args.junction_pitch is not None else 0.600
+        print(f"[tiling] {args.njunctions} junctions, pitch_x = {pitch_x:.4f} mm, "
+              f"cell bbox x-span = {cell_span_x:.4f} mm "
+              f"({'overlap' if cell_span_x > pitch_x else 'gap'} = "
+              f"{abs(cell_span_x - pitch_x):.4f} mm)")
+
+        # If the physical cell is wider than the pitch, clip each electrode to
+        # [x_c - pitch/2, x_c + pitch/2] before tiling.  This converts an
+        # overlap into a flush face — OCC fuse of co-planar flat faces is
+        # trivially robust, whereas fusing overlapping solids creates degenerate
+        # topology (AlertAcquiredSelfIntersection, wire-fix failures, etc.).
+        if cell_span_x > pitch_x + 1e-6:
+            x_c = (xmin0 + xmax0) / 2.0
+            x_lo = x_c - pitch_x / 2.0
+            x_hi = x_c + pitch_x / 2.0
+            trim = (cell_span_x - pitch_x) / 2.0
+            print(f"[tiling] clipping {trim * 1e3:.2f} µm per side "
+                  f"→ x ∈ [{x_lo:.4f}, {x_hi:.4f}] mm")
+
+            rf_in  = clip_volumes_to_x(just_tags(rf_in,  3), x_lo, x_hi,
+                                        ymin0, ymax0, zmin0, zmax0)
+            dc_in  = clip_volumes_to_x(just_tags(dc_in,  3), x_lo, x_hi,
+                                        ymin0, ymax0, zmin0, zmax0)
+            gnd_in = clip_volumes_to_x(just_tags(gnd_in, 3), x_lo, x_hi,
+                                        ymin0, ymax0, zmin0, zmax0)
+            gmsh.model.occ.synchronize()
+            print(f"[tiling] after clip: rf={len(rf_in)}, "
+                  f"dc={len(dc_in)}, gnd={len(gnd_in)}")
+
+        # Tile at pitch_x.  Copies now meet at flush co-planar faces; fuse
+        # merges them into one continuous body per electrode type.
+        rf_in  = tile_and_fuse_volumes(just_tags(rf_in,  3), args.njunctions, pitch_x)
+        dc_in  = tile_and_fuse_volumes(just_tags(dc_in,  3), args.njunctions, pitch_x)
+        gnd_in = tile_and_fuse_volumes(just_tags(gnd_in, 3), args.njunctions, pitch_x)
+        gmsh.model.occ.synchronize()
+        print(f"[tiling] after tile+fuse: rf={len(rf_in)} vol(s), "
+              f"dc={len(dc_in)} vol(s), gnd={len(gnd_in)} vol(s)")
 
     all_cond_in = rf_in + dc_in + gnd_in
     xmin, ymin, zmin, xmax, ymax, zmax = union_bbox(all_cond_in)
@@ -311,22 +457,58 @@ def main():
     gmsh.model.setPhysicalName(2, OUTER_TAG, "outer")
 
     # 6) mesh size fields
+    # Build the list of (centre, radius) pairs for Ball refinement fields.
+    # For multi-junction meshes this includes:
+    #   • primary ball at the inter-junction midpoint (z-offset = trap height there)
+    #   • arm balls at each outer arm (z-offset = outer-arm trap height)
+    # Using separate z-offsets for inter-junction vs outer-arm positions ensures
+    # the fine-mesh region is actually centred on the expected trap minimum in
+    # each location, not 30–40 µm above it.
+    trap_centers = []   # list of (xyz, radius) tuples
     if not args.no_center_ball:
+        rf_bbox = union_bbox([(2, s) for s in rf_surfs])
+        rf_x_min, rf_y_min, _, rf_x_max, rf_y_max, rf_z_top = rf_bbox
+        rf_x_mid = (rf_x_min + rf_x_max) / 2.0
+        rf_y_mid = (rf_y_min + rf_y_max) / 2.0
+
+        # Primary z-offset: inter-junction arm height or single-junction height
+        z_ball_primary = rf_z_top + args.trap_center_z_offset
+        # Outer-arm z-offset (may differ — outer arm has different RF geometry)
+        z_ball_arm     = rf_z_top + args.trap_center_z_offset_junction
+        # Per-arm ball radius (default: same as primary)
+        r_arm = args.center_radius_junction if args.center_radius_junction is not None \
+                else args.center_radius
+
         if args.trap_center is not None:
-            trap_center = args.trap_center
+            # Explicit single override — honour it exactly
+            trap_centers.append((args.trap_center, args.center_radius))
+            print(f"[trap centre] explicit override: {args.trap_center}, r={args.center_radius}")
         else:
-            # Auto-estimate: RF surface bbox centroid + z offset.
-            # The RF surfaces define the quadrupole null axis; the trap minimum
-            # is typically ~80 µm above the electrode plane in z.
-            rf_bbox = union_bbox([(2, s) for s in rf_surfs])
-            trap_center = [
-                (rf_bbox[0] + rf_bbox[3]) / 2.0,
-                (rf_bbox[1] + rf_bbox[4]) / 2.0,
-                rf_bbox[5] + args.trap_center_z_offset,  # above RF top surface
-            ]
-            print(f"[trap centre] auto-estimated from RF surface centroid: {trap_center}")
-    else:
-        trap_center = None
+            # Auto-estimate primary centre from RF surface centroid.
+            primary = [rf_x_mid, rf_y_mid, z_ball_primary]
+            trap_centers.append((primary, args.center_radius))
+            print(f"[trap centre] auto-estimated primary: {primary}, r={args.center_radius}")
+
+            # For multi-junction meshes add outer-arm balls with the correct
+            # per-arm z-offset so the fine-mesh region covers the actual trap
+            # height in those arms.
+            if args.njunctions > 1:
+                pitch_x = args.junction_pitch if args.junction_pitch is not None else 0.600
+                # Left outer arm: quarter-pitch inward from left RF edge
+                x_left  = rf_x_min + pitch_x * 0.25
+                # Right outer arm: quarter-pitch inward from right RF edge
+                x_right = rf_x_max - pitch_x * 0.25
+                for x_extra in [x_left, x_right]:
+                    extra = [x_extra, rf_y_mid, z_ball_arm]
+                    trap_centers.append((extra, r_arm))
+                    print(f"[trap centre] auto-added arm ball: {extra}, r={r_arm}")
+
+        # Additional explicit linear-region x positions (use primary z-offset)
+        if args.linear_region_x:
+            for x_lr in args.linear_region_x:
+                lr_centre = [float(x_lr), rf_y_mid, z_ball_primary]
+                trap_centers.append((lr_centre, args.center_radius))
+                print(f"[trap centre] --linear-region-x extra ball: {lr_centre}")
 
     add_mesh_size_fields(
         rf_surfs, dc_surfs, gnd_surfs,
@@ -336,7 +518,7 @@ def main():
         dist_min=args.dist_min,
         dist_max=args.dist_max,
         center_radius=args.center_radius,
-        trap_center=trap_center,
+        trap_centers=trap_centers,
     )
 
     # 7) generate and write mesh
