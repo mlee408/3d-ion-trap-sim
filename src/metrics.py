@@ -229,12 +229,23 @@ def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMin
             "No interior DOFs found. Check mesh and boundary markers."
         )
 
-    interior_abs = np.abs(local_vals[interior_idx])
     raw_coords = V.tabulate_dof_coordinates().reshape(-1, 3)[:, :gdim]
 
     # ── Centroid of the low-|Ψ| cluster ──────────────────────────────────
+    # Only consider non-negative interior DOFs for the cluster.
+    # Gibbs undershoots near grounded electrode surfaces produce Ψ < 0;
+    # the true RF null has Ψ → 0⁺.  Including negative DOFs drags the
+    # centroid toward electrode surfaces when DC electrodes are grounded.
+    nonneg_mask = local_vals[:n_owned] >= 0
+    cluster_mask = interior_mask & nonneg_mask
+    cluster_idx = np.where(cluster_mask)[0]
+    if cluster_idx.size == 0:
+        cluster_idx = interior_idx  # fallback: all interior
+
+    cluster_abs = np.abs(local_vals[cluster_idx])
+
     # Gather the global 5th-percentile threshold across all MPI ranks.
-    local_sorted = np.sort(interior_abs)
+    local_sorted = np.sort(cluster_abs)
     all_sorted = comm.allgather(local_sorted)
     global_abs = np.concatenate(all_sorted)
     threshold = float(np.percentile(global_abs, 5))
@@ -242,8 +253,8 @@ def find_minimum_cg1(Psi: fem.Function, comm: MPI.Comm | None = None) -> TrapMin
     threshold = max(threshold, float(global_abs.max()) * 1e-10,
                     float(np.finfo(np.float64).tiny))
 
-    low_mask = interior_abs <= threshold
-    low_dofs = interior_idx[low_mask]
+    low_mask = cluster_abs <= threshold
+    low_dofs = cluster_idx[low_mask]
     low_coords = raw_coords[low_dofs]
 
     local_sum = low_coords.sum(axis=0).astype(np.float64)

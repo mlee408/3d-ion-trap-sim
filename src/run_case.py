@@ -266,6 +266,14 @@ def main():
         Psi, m_kg=m, r0=mininfo.r_min, h=h, comm=comm,
         coord_scale=coord_unit, v_rf=args.vrf,
     )
+    if rank == 0 and any(ev < 0 for ev in sec["eigvals"]):
+        import warnings
+        warnings.warn(
+            f"[trap min] Hessian has negative eigenvalues {sec['eigvals']} — "
+            "r0 is not a true pseudopotential minimum. The minimum finder may have "
+            "landed on an electrode-adjacent artifact. Check r0 and the Psi field.",
+            RuntimeWarning,
+        )
 
     # Clipped copy for depth estimation (negative artefacts would deflate the
     # barrier height) and for visualisation / XDMF export.
