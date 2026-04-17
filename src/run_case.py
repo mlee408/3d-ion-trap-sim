@@ -571,6 +571,11 @@ def main():
         Psi, m_kg=m, r0=mininfo.r_min, h=h, comm=comm,
         coord_scale=coord_unit, v_rf=args.vrf,
     )
+    if rank == 0:
+        print(f"[secular] h_requested={h:.3e}  h_used={sec['h']:.3e} mesh units"
+              f"  (h_mesh={h_mesh:.3e})")
+        print(f"[secular] freq_hz={sec['freq_hz']}")
+
     _eigvals = sec["eigvals"]
     _n_neg = sum(1 for ev in _eigvals if ev < 0)
     if _n_neg > 0 and rank == 0:
@@ -626,7 +631,8 @@ def main():
         "rf_freq_Hz": args.rf_freq,
         "mass_amu": args.mass_amu,
         "charge_e": args.charge_e,
-        "h_used": h,
+        "h_used": sec["h"],        # actual step after auto-scaling inside numerical_hessian
+        "h_requested": h,          # step that was passed in (may have been overridden)
         "ray_length_used": ray_length,
         "h_mesh_estimate": h_mesh,
         "coord_unit_m_per_mesh": coord_unit,

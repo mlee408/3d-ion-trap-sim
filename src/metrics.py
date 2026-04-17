@@ -491,12 +491,19 @@ def numerical_hessian(
     *,
     comm: MPI.Comm | None = None,
     max_tries: int = 12,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, float]:
     """Compute the Hessian of Psi at r0 by central finite differences.
 
     h is auto-scaled if it looks inappropriate for the mesh's physical units
     (e.g. mesh in mm but h specified in metres).  Each failed attempt halves h;
     up to max_tries halvings are tried before raising.
+
+    Returns
+    -------
+    (H, h_used) : (ndarray, float)
+        H       — symmetric Hessian matrix
+        h_used  — the actual finite-difference step that was used (may differ
+                  from the input h if auto-scaling was applied)
     """
     r0 = np.asarray(r0, dtype=np.float64)
     gdim = int(r0.shape[0])
@@ -565,7 +572,7 @@ def numerical_hessian(
                 break
 
         if ok and np.all(np.isfinite(H)):
-            return H
+            return H, hk
 
     raise ValueError(
         f"Hessian could not be computed at r0={r0.tolist()}. "
@@ -604,7 +611,7 @@ def secular_frequencies_from_pseudopotential(
     -------
     dict with omega_rad_s and freq_hz in physical SI units.
     """
-    H = numerical_hessian(Psi, r0=r0, h=h, comm=comm)
+    H, h_used = numerical_hessian(Psi, r0=r0, h=h, comm=comm)
     eigvals, eigvecs = np.linalg.eigh(H)
 
     # Derivation:
@@ -618,7 +625,7 @@ def secular_frequencies_from_pseudopotential(
     freq = omega / (2.0 * np.pi)
     return SecularFrequencies(
         r0=np.array(r0, dtype=np.float64),
-        h=float(h),
+        h=float(h_used),           # actual step used, after any auto-scaling
         hessian=H,
         eigvals=eigvals,
         eigvecs=eigvecs,
@@ -671,6 +678,9 @@ def estimate_trap_depth_by_rays(
     psi0 = float(eval_function_at_points(Psi, np.array([r0]), comm=comm)[0])
     if not np.isfinite(psi0):
         raise ValueError("r0 is outside mesh or Psi could not be evaluated at r0.")
+    # CG2 interpolation can yield tiny negative values even on a clipped field;
+    # clamp here so depth = max_psi - psi0 is never inflated by a negative base.
+    psi0 = max(psi0, 0.0)
 
     if gdim == 3:
         dirs = _fibonacci_sphere(max(6, int(nrays)))
@@ -680,17 +690,29 @@ def estimate_trap_depth_by_rays(
     else:
         dirs = np.array([[1.0], [-1.0]], dtype=np.float64)
 
-    # Start ray samples just past r0 so t[0] is a small offset, not r0 itself.
-    # This avoids ambiguity about whether the argmax at index-0 is truly "r0"
-    # or just a sampling artefact — we skip the t=0 point entirely.
-    ts = np.linspace(0.0, float(ray_length), int(nsamples))
+    # Start at t = one step past r0 so the first sample is not r0 itself.
+    # This prevents open-boundary misclassification for rays that immediately
+    # exit the mesh (only r0 = ts[0] would be finite → argmax at index 0).
+    dt = float(ray_length) / max(int(nsamples) - 1, 1)
+    ts = np.linspace(dt, float(ray_length), int(nsamples))
 
-    best_depth = np.inf
-    best_dir = None
-    best_max = np.nan
-    best_used = 0
-    n_open = 0      # rays where the max is at t=0 (open-boundary direction)
-    n_valid = 0     # rays with an interior max (contribute to depth estimate)
+    # ── Per-ray record: (depth_FEM, direction_unit_vec, direction_class, is_phys)
+    # direction_class: "upward" | "lateral" | "downward"
+    # is_phys:  True  → local max in interior (real saddle-point barrier)
+    #           False → argmax at last finite sample (ray exits mesh ascending,
+    #                   i.e. hits solid electrode — not a physical escape route)
+    _RayRec = tuple   # (depth_FEM, dir_vec, dir_class, is_phys)
+    all_rays: list = []
+
+    n_open = 0
+    n_electrode_hit = 0
+    n_physical = 0
+
+    # Physical-barrier trackers (used for depth_eV)
+    best_phys_depth = np.inf
+    best_phys_dir: Optional[np.ndarray] = None
+    best_phys_max = np.nan
+    best_phys_used = 0
 
     for d in dirs:
         d = np.asarray(d, dtype=np.float64)
@@ -699,78 +721,155 @@ def estimate_trap_depth_by_rays(
         vals = eval_function_at_points(Psi, pts, comm=comm)
         finite = np.isfinite(vals)
         n_fin = int(finite.sum())
-        if n_fin < 5:
+        if n_fin < 3:
             continue
 
         vals_f = vals[finite]
-        # Find the index of the maximum among FINITE samples.
-        # finite_indices gives the original (un-masked) indices.
         finite_indices = np.where(finite)[0]
         argmax_local = int(np.argmax(vals_f))
         argmax_global = int(finite_indices[argmax_local])
+        last_finite_idx = int(finite_indices[-1])
         max_psi = float(vals_f[argmax_local])
 
-        # Classify the ray.
+        # ── Open-boundary ray ────────────────────────────────────────────────
+        # argmax at the very first finite sample means Ψ only decreases along
+        # this direction — pointing toward the Neumann far-field.  No barrier.
         if argmax_global == 0:
-            # Maximum is at the starting point (r0): Ψ only decreases along
-            # this ray — it exits through the open Neumann boundary or the
-            # domain edge.  Skip for depth purposes.
             n_open += 1
             continue
 
-        n_valid += 1
         depth = max_psi - psi0
-        if depth < best_depth:
-            best_depth = depth
-            best_dir = d.copy()
-            best_max = max_psi
-            best_used = n_fin
 
-    # Warn and return null depth if no ray found a proper interior barrier.
-    if best_dir is None or n_valid == 0:
+        # ── Direction classification ─────────────────────────────────────────
+        # Based on the z-component (electrode-normal axis).
+        # Lateral rays are the primary transport/escape directions.
+        if gdim >= 3:
+            if d[2] > 0.5:
+                dir_class = "upward"      # toward RF pillar tops
+            elif d[2] < -0.5:
+                dir_class = "downward"    # toward DC substrate
+            else:
+                dir_class = "lateral"     # along electrode plane / junction
+        else:
+            dir_class = "lateral"
+
+        # ── Physical-barrier vs electrode-hit ────────────────────────────────
+        # If the argmax is at the LAST finite sample, the ray exited the mesh
+        # while Ψ was still at its maximum (i.e., it hit a solid electrode or
+        # domain boundary while ascending).  Ions cannot escape through solid
+        # metal, so these barriers are not physical escape routes.
+        # If the argmax is at an interior point (finite samples exist after it),
+        # Ψ rose then fell — a genuine saddle-point barrier.
+        is_phys = (argmax_global < last_finite_idx)
+
+        all_rays.append((float(depth), d.copy(), dir_class, is_phys))
+
+        if is_phys:
+            n_physical += 1
+            if depth < best_phys_depth:
+                best_phys_depth = depth
+                best_phys_dir = d.copy()
+                best_phys_max = max_psi
+                best_phys_used = n_fin
+        else:
+            n_electrode_hit += 1
+
+    # ── Compute physical scale once ──────────────────────────────────────────
+    # Ψ_physical [J] = (V_RF / coord_scale)² × Ψ_FEM
+    # coord_scale has units of m/mesh_unit (e.g. 1e-3 for mm mesh).
+    phys_scale = (v_rf / coord_scale) ** 2
+    psi0_phys_J = psi0 * phys_scale
+
+    # ── Diagnostics ─────────────────────────────────────────────────────────
+    # Print per-family sorted barrier distributions.
+    phys_rays = [(dep, dv, dc) for dep, dv, dc, ip in all_rays if ip]
+    elec_rays  = [(dep, dv, dc) for dep, dv, dc, ip in all_rays if not ip]
+    phys_rays.sort(key=lambda x: x[0])
+    elec_rays.sort(key=lambda x: x[0])
+
+    _n_total = n_open + n_electrode_hit + n_physical
+    print(f"[depth] psi0_FEM={psi0:.3e}  psi0_phys={psi0_phys_J / _E_CHARGE:.3e} eV  "
+          f"(v_rf={v_rf} V, coord_scale={coord_scale:.0e} m/mesh_unit)")
+    print(f"[depth] ray counts: total={_n_total}  open={n_open}  "
+          f"electrode-hit={n_electrode_hit}  physical-barrier={n_physical}")
+
+    def _print_rays(label: str, rays: list, show: int = 5) -> None:
+        nd = len(rays)
+        if nd == 0:
+            print(f"  {label}: (none)")
+            return
+        print(f"  {label} ({nd} rays, sorted by barrier height):")
+        for i, (dep, dv, dc) in enumerate(rays[:show]):
+            print(f"    [{i+1}/{nd}] {dep * phys_scale / _E_CHARGE:.4f} eV "
+                  f"({dep:.3e} FEM)  class={dc}  dir={dv.round(3).tolist()}")
+        if nd > 2 * show:
+            print(f"    ... ({nd - 2*show} middle rays omitted) ...")
+        for i, (dep, dv, dc) in enumerate(rays[max(0, nd - show):]):
+            print(f"    [{nd - show + i + 1}/{nd}] {dep * phys_scale / _E_CHARGE:.4f} eV "
+                  f"({dep:.3e} FEM)  class={dc}  dir={dv.round(3).tolist()}")
+
+    print("[depth] ── Physical barriers (local max in interior) ──")
+    _print_rays("physical", phys_rays)
+    print("[depth] ── Electrode-hit rays (monotonic ascent, excluded from depth_eV) ──")
+    _print_rays("electrode-hit", elec_rays)
+
+    # ── Warn if no physical barriers found ──────────────────────────────────
+    if n_physical == 0:
         warnings.warn(
-            f"estimate_trap_depth_by_rays: all {n_open} sampled rays exit through "
-            "the open Neumann boundary without encountering a Ψ barrier. "
-            "Increase the domain size (--pad-z-top / --pad-xy) so the outer "
-            "boundary is further from the trap, or check that r0 is a genuine "
-            "trap minimum inside a closed-electrode geometry.",
+            f"estimate_trap_depth_by_rays: no physical-barrier rays found "
+            f"({n_electrode_hit} electrode-hit, {n_open} open-boundary). "
+            "depth_eV will be null.  Increase ray density (--depth-nrays) or "
+            "check that r0 is well inside the electrode structure.",
             RuntimeWarning,
             stacklevel=2,
         )
-        phys_scale = (v_rf / coord_scale) ** 2
         return {
             "r0_m": r0.tolist(),
-            "Psi0_J": float(psi0 * phys_scale),
+            "Psi0_J": float(psi0_phys_J),
             "depth_J": None,
             "depth_eV": None,
+            "depth_raw_eV": None,
             "worst_direction": None,
             "ray_max_Psi_J": None,
             "ray_samples_used": None,
-            "ray_length_m": float(ray_length),
+            "ray_length_mesh": float(ray_length),
             "nrays": int(nrays),
             "nsamples": int(nsamples),
             "n_open_boundary_rays": n_open,
-            "n_valid_rays": n_valid,
+            "n_electrode_hit_rays": n_electrode_hit,
+            "n_physical_barrier_rays": n_physical,
         }
 
-    # Convert normalised depth to physical units.
-    # Ψ_physical = (V_RF / coord_scale)² × Ψ_normalised
-    phys_scale = (v_rf / coord_scale) ** 2
-    depth_phys_J = best_depth * phys_scale
-    psi0_phys_J = psi0 * phys_scale
-    max_phys_J = best_max * phys_scale
+    # ── Depth values ─────────────────────────────────────────────────────────
+    depth_phys_J = best_phys_depth * phys_scale
+    max_phys_J = best_phys_max * phys_scale
+
+    # Raw minimum across ALL valid rays (including electrode hits) — for debug.
+    best_raw_depth = min(dep for dep, _, _, _ in all_rays)
+    best_raw_eV = float(best_raw_depth * phys_scale / _E_CHARGE)
+
+    phys_min_eV = float(depth_phys_J / _E_CHARGE)
+    phys_max_eV = float(phys_rays[-1][0] * phys_scale / _E_CHARGE)
+
+    print(f"[depth] physical depth (worst escape) = {phys_min_eV:.4f} eV")
+    print(f"[depth] physical max barrier           = {phys_max_eV:.4f} eV")
+    print(f"[depth] raw min (incl. electrode hits) = {best_raw_eV:.4f} eV  "
+          f"(not used for reported depth)")
 
     return {
         "r0_m": r0.tolist(),
         "Psi0_J": float(psi0_phys_J),
         "depth_J": float(depth_phys_J),
-        "depth_eV": float(depth_phys_J / _E_CHARGE),
-        "worst_direction": best_dir.tolist(),
+        "depth_eV": float(phys_min_eV),          # min barrier among physical rays
+        "depth_max_eV": float(phys_max_eV),       # max barrier among physical rays
+        "depth_raw_eV": float(best_raw_eV),       # unfiltered min (for diagnostics)
+        "worst_direction": best_phys_dir.tolist(),
         "ray_max_Psi_J": float(max_phys_J),
-        "ray_samples_used": int(best_used),
-        "ray_length_m": float(ray_length),
+        "ray_samples_used": int(best_phys_used),
+        "ray_length_mesh": float(ray_length),
         "nrays": int(nrays),
         "nsamples": int(nsamples),
         "n_open_boundary_rays": n_open,
-        "n_valid_rays": n_valid,
+        "n_electrode_hit_rays": n_electrode_hit,
+        "n_physical_barrier_rays": n_physical,
     }
