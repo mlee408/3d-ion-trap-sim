@@ -186,6 +186,12 @@ def main():
     ap.add_argument("--depth-ray-length", type=float, default=200e-6)
     ap.add_argument("--depth-nrays", type=int, default=48)
     ap.add_argument("--no-depth", action="store_true")
+    ap.add_argument(
+        "--transport-mode", type=str, default="fast", choices=["fast", "full"],
+        help="Transport barrier evaluation mode. 'fast' (default): x-scan + eigvec only, "
+             "no verbose ray listings. 'full': adds CTC height-following path scan and "
+             "full diagnostic output. Use 'full' for validation runs only.",
+    )
     ap.add_argument("--prefix", type=str, default="case")
     # Minimum-finder spatial bounds (mesh units).
     # With Neumann outer BC the pseudopotential decays smoothly to zero far
@@ -612,12 +618,47 @@ def main():
         Psi_clipped, np.array([mininfo.r_min], dtype=np.float64), comm=comm
     )[0])
 
+    # ── Transport direction from weakest secular mode ───────────────────────
+    # The eigenvectors in sec["eigvecs"] are columns, sorted by eigenvalue
+    # (ascending).  The first column is the weakest mode — typically the axial
+    # transport / junction direction with the smallest confinement.
+    _eigvals_arr = np.array(sec["eigvals"])
+    _eigvecs_arr = np.array(sec["eigvecs"])
+    _weak_idx = int(np.argmin(_eigvals_arr))
+    transport_eigvec = _eigvecs_arr[:, _weak_idx]
+    if rank == 0:
+        print(f"[depth] weak secular mode idx={_weak_idx}  "
+              f"eigval={_eigvals_arr[_weak_idx]:.4e}  "
+              f"eigvec={transport_eigvec.round(4).tolist()}")
+
     depth = None
     if not args.no_depth:
         depth = metrics.estimate_trap_depth_by_rays(
             Psi_clipped, r0=mininfo.r_min, ray_length=ray_length, nrays=args.depth_nrays, comm=comm,
             coord_scale=coord_unit, v_rf=args.vrf,
+            transport_dir=transport_eigvec,
+            transport_mode=args.transport_mode,
         )
+        if rank == 0 and depth is not None:
+            print("[depth summary] ── Sweep metrics ──")
+            print(f"[depth summary]   r0.z              = {float(mininfo.r_min[2]) * coord_unit * 1e6:.2f} µm")
+            print(f"[depth summary]   radial_depth_core = {depth.get('radial_depth_core_eV')} eV  "
+                  f"({depth.get('n_core_radial_rays')} rays)")
+            print(f"[depth summary]   transport_xscan   = {depth.get('transport_barrier_xscan_eV')} eV  "
+                  f"interior={depth.get('transport_barrier_xscan_interior')}")
+            print(f"[depth summary]   eigvec-scan       = {depth.get('transport_barrier_eigvec_eV')} eV  "
+                  f"(dir: {depth.get('transport_dir_source')})")
+            if args.transport_mode == "full":
+                print("[depth summary] ── Full transport (CTC) ──")
+                print(f"[depth summary]   ctc_like          = "
+                      f"{depth.get('transport_barrier_ctc_like_eV')} eV  "
+                      f"interior={depth.get('transport_barrier_ctc_interior')}  "
+                      f"barrier at x={depth.get('ctc_barrier_x_mesh')} z={depth.get('ctc_barrier_z_mesh')} (mesh)")
+                print("[depth summary] ── Broad radial depth ──")
+                print(f"[depth summary]   min={depth.get('radial_depth_broad_min_eV')} eV  "
+                      f"median={depth.get('radial_depth_broad_median_eV')} eV  "
+                      f"max={depth.get('radial_depth_broad_max_eV')} eV  "
+                      f"({depth.get('n_broad_radial_rays')} rays)")
 
     outdir = args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
