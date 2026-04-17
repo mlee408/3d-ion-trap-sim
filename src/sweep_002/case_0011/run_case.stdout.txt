@@ -1,0 +1,43 @@
+
+[mesh] tdim=3, gdim=3
+[mesh] bbox min=[-0.5280001090600637, -0.5280001090600367, -0.22000009955297], max=[0.5280001090600304, 0.5280001090600303, 0.7269868891570459]
+[mesh] estimated cell size h_mesh=1.3389e-02
+[auto-scale] h=4.0167e-02 (3.0×h_mesh, degree=2), ray_length=1.7683e+00 (mesh unit ~1.3389e-02)
+[BC] RF Dirichlet tags : [1]
+[BC] GND Dirichlet tags: [3]
+[BC] Neumann (outer)   : [4]
+[phi_rf] min=0.0000  max=1.0399
+[psi_raw] min=-9.7674e-25  max=6.4497e-24  n_negative=8120/3680040
+[r0 search] z_electrode_top=0.288 mesh units, margin=0.05 → z_max=0.338
+[r0 search] z_min auto-set to 0.0 (DC surface). Override with --r0-z-min if your trap sits below z=0.
+[r0 search] active bounds (mesh units): x=[None,None]  y=[None,None]  z=[0.0,0.337999987602]
+[trap min] r0=[-0.00048179263769964367, -0.002316154699894122, 0.2803781369787834], Psi_min=nan J
+[trap min] r0_SI=[-4.817926376996437e-07, -2.316154699894122e-06, 0.00028037813697878337] m
+[trap min] bbox center=[-1.6653345369377348e-14, -3.219646771412954e-15, 0.2534933948020379]
+[debug Ψ scan] z (mm) → Ψ_FEM:
+  z=0.000  Psi=9.9536e-29
+  z=0.010  Psi=2.5979e-29
+  z=0.020  Psi=2.7137e-30
+  z=0.030  Psi=5.4353e-31
+  z=0.040  Psi=3.6988e-31
+  z=0.050  Psi=1.5805e-31
+  z=0.060  Psi=9.5983e-32
+  z=0.070  Psi=4.1545e-32
+  z=0.080  Psi=1.9164e-32
+  z=0.090  Psi=2.0695e-32
+  z=0.100  Psi=9.6229e-32
+  z=0.110  Psi=2.1352e-31
+  z=0.120  Psi=4.0968e-31
+  z=0.130  Psi=6.0156e-31
+  z=0.140  Psi=8.5120e-31
+  z=0.150  Psi=1.1548e-30
+  z=0.160  Psi=1.4474e-30
+  z=0.170  Psi=1.7998e-30
+  z=0.180  Psi=2.2674e-30
+  z=0.190  Psi=3.0618e-30
+  z=0.200  Psi=5.0549e-30
+  z=0.210  Psi=nan
+  z=0.220  Psi=nan
+  z=0.230  Psi=nan
+  z=0.240  Psi=nan
+  z=0.250  Psi=nan

@@ -38,6 +38,8 @@ python automate.py \
   --rf-tags 1 \
   --ground-tags 3 \
   --outer-tags 4 \
+  --r0-z-min 0.0 \
+  --r0-z-max 0.15 \
   --param lc_electrode:0.002:0.008 \
   --param lc_center:0.003:0.010 \
   --param lc_far:0.020:0.060 \

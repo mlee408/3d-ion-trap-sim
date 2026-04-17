@@ -1,0 +1,4 @@
+ld: warning: duplicate -rpath '/Users/jaewonkim/opt/anaconda3/envs/fenicsx/lib' ignored
+ld: warning: duplicate -rpath '/Users/jaewonkim/opt/anaconda3/envs/fenicsx/lib' ignored
+ld: warning: duplicate -rpath '/Users/jaewonkim/opt/anaconda3/envs/fenicsx/lib' ignored
+ld: warning: duplicate -rpath '/Users/jaewonkim/opt/anaconda3/envs/fenicsx/lib' ignored

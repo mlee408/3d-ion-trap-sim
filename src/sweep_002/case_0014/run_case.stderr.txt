@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "/Users/jaewonkim/Documents/Jaewon_folder/Berkeley/Senior/CS_191B/3d-ion-trap-sim/src/run_case.py", line 664, in <module>
+    main()
+  File "/Users/jaewonkim/Documents/Jaewon_folder/Berkeley/Senior/CS_191B/3d-ion-trap-sim/src/run_case.py", line 570, in main
+    sec = metrics.secular_frequencies_from_pseudopotential(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jaewonkim/Documents/Jaewon_folder/Berkeley/Senior/CS_191B/3d-ion-trap-sim/src/metrics.py", line 614, in secular_frequencies_from_pseudopotential
+    H, h_used = numerical_hessian(Psi, r0=r0, h=h, comm=comm)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jaewonkim/Documents/Jaewon_folder/Berkeley/Senior/CS_191B/3d-ion-trap-sim/src/metrics.py", line 536, in numerical_hessian
+    raise ValueError(
+ValueError: Psi is NaN/inf at r0=[-0.003932302557439404, 0.0011916899769037277, 0.27831886994833027]. The trap minimum lies outside the mesh, or boundary DOF exclusion failed.

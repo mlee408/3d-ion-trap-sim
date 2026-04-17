@@ -1,0 +1,196 @@
+
+[mesh] tdim=3, gdim=3
+[mesh] bbox min=[-0.5280001090600637, -0.5280001090600367, -0.22000009955297], max=[0.5280001090600304, 0.5280001090600303, 0.7326940694030535]
+[mesh] estimated cell size h_mesh=2.0886e-02
+[auto-scale] h=6.2659e-02 (3.0×h_mesh, degree=2), ray_length=1.7714e+00 (mesh unit ~2.0886e-02)
+[BC] RF Dirichlet tags : [1]
+[BC] GND Dirichlet tags: [3]
+[BC] Neumann (outer)   : [4]
+[phi_rf] min=0.0000  max=1.0498
+[psi_raw] min=-2.6512e-25  max=8.8090e-25  n_negative=3431/942365
+[r0 search] z_electrode_top=0.288 mesh units, margin=0.05 → z_max=0.338
+[r0 search] z_min auto-set to 0.0 (DC surface). Override with --r0-z-min if your trap sits below z=0.
+[r0 search] active bounds (mesh units): x=[None,None]  y=[None,None]  z=[0.0,0.337999987602]
+[trap min] r0=[-0.007266837434253073, 0.006180283166773179, 0.3287174658625267], Psi_min=3.0641e-32 J
+[trap min] r0_SI=[-7.266837434253073e-06, 6.180283166773179e-06, 0.0003287174658625267] m
+[trap min] bbox center=[-1.6653345369377348e-14, -3.219646771412954e-15, 0.2563469849250417]
+[debug Ψ scan] z (mm) → Ψ_FEM:
+  z=0.000  Psi=1.7094e-27
+  z=0.010  Psi=-1.9338e-29
+  z=0.020  Psi=-2.0879e-30
+  z=0.030  Psi=1.5449e-31
+  z=0.040  Psi=-7.2250e-31
+  z=0.050  Psi=5.7286e-31
+  z=0.060  Psi=1.9221e-31
+  z=0.070  Psi=-7.3572e-32
+  z=0.080  Psi=5.5936e-32
+  z=0.090  Psi=7.4017e-32
+  z=0.100  Psi=1.8140e-31
+  z=0.110  Psi=3.1811e-31
+  z=0.120  Psi=4.9826e-31
+  z=0.130  Psi=7.0118e-31
+  z=0.140  Psi=9.2960e-31
+  z=0.150  Psi=1.1844e-30
+  z=0.160  Psi=1.4835e-30
+  z=0.170  Psi=1.8414e-30
+  z=0.180  Psi=2.2732e-30
+  z=0.190  Psi=2.9766e-30
+  z=0.200  Psi=3.3434e-30
+  z=0.210  Psi=1.1142e-30
+  z=0.220  Psi=nan
+  z=0.230  Psi=nan
+  z=0.240  Psi=nan
+  z=0.250  Psi=nan
+[secular] h_requested=6.266e-02  h_used=3.133e-02 mesh units  (h_mesh=2.089e-02)
+[secular] freq_hz=[276800.81241306313, 295623.4958995204, 728572.7651960665]
+[depth] psi0_FEM=3.064e-32  psi0_phys=4.303e-03 eV  (v_rf=150.0 V, coord_scale=1e-03 m/mesh_unit)
+[depth] ray counts: total=48  open=1  electrode-hit=0  physical-barrier=47
+[depth] ── Physical barriers (local max in interior) ──
+  physical (47 rays, sorted by barrier height):
+    [1/47] 0.0003 eV (2.179e-33 FEM)  class=lateral  dir=[0.69, 0.687, 0.229]
+    [2/47] 0.0003 eV (2.371e-33 FEM)  class=lateral  dir=[0.986, -0.133, 0.104]
+    [3/47] 0.0004 eV (3.106e-33 FEM)  class=lateral  dir=[-0.759, 0.44, 0.479]
+    [4/47] 0.0005 eV (3.586e-33 FEM)  class=lateral  dir=[-0.962, -0.04, 0.271]
+    [5/47] 0.0006 eV (4.015e-33 FEM)  class=upward  dir=[0.35, 0.749, 0.562]
+    ... (37 middle rays omitted) ...
+    [43/47] 114.6633 eV (8.165e-28 FEM)  class=downward  dir=[-0.314, 0.149, -0.938]
+    [44/47] 216.5706 eV (1.542e-27 FEM)  class=downward  dir=[-0.364, 0.579, -0.729]
+    [45/47] 958.7120 eV (6.827e-27 FEM)  class=downward  dir=[0.608, 0.462, -0.646]
+    [46/47] 1379.5506 eV (9.823e-27 FEM)  class=downward  dir=[0.614, -0.168, -0.771]
+    [47/47] 2013.4751 eV (1.434e-26 FEM)  class=downward  dir=[0.181, 0.488, -0.854]
+[depth] ── Electrode-hit rays (monotonic ascent, excluded from depth_eV) ──
+  electrode-hit: (none)
+[depth] physical depth (worst escape) = 0.0003 eV
+[depth] physical max barrier           = 2013.4751 eV
+[depth] raw min (incl. electrode hits) = 0.0003 eV  (not used for reported depth)
+{
+  "mesh": "/Users/jaewonkim/Documents/Jaewon_folder/Berkeley/Senior/CS_191B/3d-ion-trap-sim/src/sweep_002/case_0010/mesh.msh",
+  "rf_tags": [
+    1
+  ],
+  "ground_tags": [
+    3
+  ],
+  "rf_freq_Hz": 40000000.0,
+  "mass_amu": 40.0,
+  "charge_e": 1.0,
+  "h_used": 0.0313294831028647,
+  "h_requested": 0.0626589662057294,
+  "ray_length_used": 1.7714116125006416,
+  "h_mesh_estimate": 0.020886322068576466,
+  "coord_unit_m_per_mesh": 0.001,
+  "vrf_V": 150.0,
+  "r0_search_bounds_mesh": {
+    "x": [
+      null,
+      null
+    ],
+    "y": [
+      null,
+      null
+    ],
+    "z": [
+      0.0,
+      0.337999987602
+    ]
+  },
+  "r0_SI_m": [
+    -7.266837434253073e-06,
+    6.180283166773179e-06,
+    0.0003287174658625267
+  ],
+  "trap_min": {
+    "r0_m": [
+      -0.007266837434253073,
+      0.006180283166773179,
+      0.3287174658625267
+    ],
+    "Psi_min_J": 3.064057416712367e-32,
+    "Psi_min_raw_J": 3.064057416712367e-32,
+    "rank_found": 0,
+    "dof_index": 912582
+  },
+  "secular": {
+    "r0": [
+      -0.007266837434253073,
+      0.006180283166773179,
+      0.3287174658625267
+    ],
+    "h": 0.0313294831028647,
+    "hessian": [
+      [
+        1.0214661239119289e-29,
+        -1.0964055795975679e-31,
+        6.984033235267422e-30
+      ],
+      [
+        -1.0964055795975679e-31,
+        1.0316464772352154e-29,
+        -4.919174823546638e-30
+      ],
+      [
+        6.984033235267422e-30,
+        -4.919174823546638e-30,
+        6.044649303680995e-29
+      ]
+    ],
+    "eigvals": [
+      8.92937430532623e-30,
+      1.0185074364836271e-29,
+      6.18631703781189e-29
+    ],
+    "eigvecs": [
+      [
+        0.8432187311101397,
+        0.5207043157320248,
+        -0.13360084985900927
+      ],
+      [
+        -0.5121926852298042,
+        0.8536636779552937,
+        0.0944297523925759
+      ],
+      [
+        -0.16322017247291543,
+        0.011195557953242341,
+        -0.9865261450058115
+      ]
+    ],
+    "omega_rad_s": [
+      1739190.797569131,
+      1857457.2058929312,
+      4577757.693491127
+    ],
+    "freq_hz": [
+      276800.81241306313,
+      295623.4958995204,
+      728572.7651960665
+    ]
+  },
+  "depth": {
+    "r0_m": [
+      -0.007266837434253073,
+      0.006180283166773179,
+      0.3287174658625267
+    ],
+    "Psi0_J": 6.894129187602825e-22,
+    "depth_J": 4.9021154720950586e-23,
+    "depth_eV": 0.00030596598203135814,
+    "depth_max_eV": 2013.475112678808,
+    "depth_raw_eV": 0.00030596598203135814,
+    "worst_direction": [
+      0.6899654780526981,
+      0.6866078050709886,
+      0.22916666666666663
+    ],
+    "ray_max_Psi_J": 7.384340734812331e-22,
+    "ray_samples_used": 85,
+    "ray_length_mesh": 1.7714116125006416,
+    "nrays": 48,
+    "nsamples": 200,
+    "n_open_boundary_rays": 1,
+    "n_electrode_hit_rays": 0,
+    "n_physical_barrier_rays": 47
+  }
+}
+Wrote: /Users/jaewonkim/Documents/Jaewon_folder/Berkeley/Senior/CS_191B/3d-ion-trap-sim/src/sweep_002/case_0010/auto_case_0010_fields.xdmf
