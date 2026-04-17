@@ -20,18 +20,36 @@ Typical usage
 3. Run a random search over parameter bounds.
 4. Collect JSON reports and a CSV summary.
 
-Example
+Example (run from src/ directory)
 -------
 python automate.py \
-  --run-case /path/to/run_case.py \
-  --mesh-template "python make_mesh.py --height {rf_height} --gap {rf_gap} --out {mesh_path}" \
-  --workdir ./sweep_001 \
-  --rf-tags 1 2 \
-  --ground-tags 3 4 5 \
-  --param rf_height:40:120 \
-  --param rf_gap:10:60 \
-  --param junction_rounding:0:30 \
-  --n-cases 20
+  --run-case ./run_case.py \
+  --mesh-template "python ../meshes/run_case.py \
+    --rf ../meshes/step/rf.step \
+    --dc ../meshes/step/dc.step \
+    --ground ../meshes/step/ground.step \
+    --lc-electrode {lc_electrode} \
+    --lc-center {lc_center} \
+    --lc-far {lc_far} \
+    --pad-z-top {pad_z_top} \
+    --nopopup \
+    --out {mesh_path}" \
+  --workdir ./sweep_000 \
+  --rf-tags 1 \
+  --ground-tags 3 \
+  --outer-tags 4 \
+  --param lc_electrode:0.002:0.008 \
+  --param lc_center:0.003:0.010 \
+  --param lc_far:0.020:0.060 \
+  --param pad_z_top:0.300:0.800 \
+  --degree 2 \
+  --mass-amu 40.0 \
+  --charge-e 1.0 \
+  --rf-freq 40e6 \
+  --vrf 150 \
+  --coord-unit 1e-3 \
+  --n-cases 20 \
+  --seed 42
 """
 
 import argparse
@@ -47,7 +65,6 @@ import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
 
 # -----------------------------------------------------------------------------
 # Data models
@@ -83,6 +100,17 @@ class RunConfig:
     vrf: float
     coord_unit: Optional[float]
     no_depth: bool
+    # RF-null search bounds (mesh units); None means no bound / use run_case.py default
+    r0_z_min: Optional[float]
+    r0_z_max: Optional[float]
+    r0_x_min: Optional[float]
+    r0_x_max: Optional[float]
+    r0_y_min: Optional[float]
+    r0_y_max: Optional[float]
+    r0_search_margin: Optional[float]
+    r0_x_auto: bool
+    # Outer (far-field / Neumann) boundary tags — do NOT include in ground_tags
+    outer_tags: List[int]
 
 
 @dataclass
@@ -146,11 +174,22 @@ def mkdir(path: Path) -> Path:
 
 
 def write_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
 
 
 def load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text())
+
+def find_paths(obj, prefix="root"):
+    if isinstance(obj, Path):
+        print(prefix, "->", obj)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            find_paths(v, f"{prefix}.{k}")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            find_paths(v, f"{prefix}[{i}]")
+
 
 
 def render_template(template: str, mapping: Dict[str, Any]) -> str:
@@ -298,9 +337,9 @@ def generate_mesh(
     - {case_dir}
     - {mesh_path}
     """
-    mesh_path = case_dir / "mesh.msh"
+    mesh_path = (case_dir / "mesh.msh").resolve()
     mapping: Dict[str, Any] = dict(params)
-    mapping["case_dir"] = str(case_dir)
+    mapping["case_dir"] = str(case_dir.resolve())
     mapping["mesh_path"] = str(mesh_path)
 
     command_str = render_template(mesh_template, mapping)
@@ -308,7 +347,7 @@ def generate_mesh(
 
     gen_stdout = case_dir / "meshgen.stdout.txt"
     gen_stderr = case_dir / "meshgen.stderr.txt"
-    rc = run_subprocess(cmd, cwd=case_dir, stdout_path=gen_stdout, stderr_path=gen_stderr)
+    rc = run_subprocess(cmd, cwd=None, stdout_path=gen_stdout, stderr_path=gen_stderr)
     if rc != 0:
         raise RuntimeError(
             f"Mesh generation failed with exit code {rc}. See {gen_stderr}"
@@ -331,9 +370,9 @@ def generate_mesh(
 def build_run_case_command(cfg: RunConfig, mesh_path: Path, case_dir: Path, case_prefix: str) -> List[str]:
     cmd: List[str] = [
         sys.executable,
-        str(cfg.run_case_py),
-        "--mesh", str(mesh_path),
-        "--outdir", str(case_dir),
+        str(cfg.run_case_py.resolve()),
+        "--mesh", str(mesh_path.resolve()),
+        "--outdir", str(case_dir.resolve()),
         "--degree", str(cfg.degree),
         "--rf-freq", str(cfg.rf_freq),
         "--mass-amu", str(cfg.mass_amu),
@@ -350,6 +389,24 @@ def build_run_case_command(cfg: RunConfig, mesh_path: Path, case_dir: Path, case
     if cfg.no_depth:
         cmd.append("--no-depth")
 
+    # RF-null search bounds
+    if cfg.r0_z_min is not None:
+        cmd.extend(["--r0-z-min", str(cfg.r0_z_min)])
+    if cfg.r0_z_max is not None:
+        cmd.extend(["--r0-z-max", str(cfg.r0_z_max)])
+    if cfg.r0_x_min is not None:
+        cmd.extend(["--r0-x-min", str(cfg.r0_x_min)])
+    if cfg.r0_x_max is not None:
+        cmd.extend(["--r0-x-max", str(cfg.r0_x_max)])
+    if cfg.r0_y_min is not None:
+        cmd.extend(["--r0-y-min", str(cfg.r0_y_min)])
+    if cfg.r0_y_max is not None:
+        cmd.extend(["--r0-y-max", str(cfg.r0_y_max)])
+    if cfg.r0_search_margin is not None:
+        cmd.extend(["--r0-search-margin", str(cfg.r0_search_margin)])
+    if cfg.r0_x_auto:
+        cmd.append("--r0-x-auto")
+
     cmd.append("--rf-tags")
     cmd.extend(str(t) for t in cfg.rf_tags)
 
@@ -359,6 +416,10 @@ def build_run_case_command(cfg: RunConfig, mesh_path: Path, case_dir: Path, case
     if cfg.basis_tags:
         cmd.append("--basis-tags")
         cmd.extend(str(t) for t in cfg.basis_tags)
+
+    if cfg.outer_tags:
+        cmd.append("--outer-tags")
+        cmd.extend(str(t) for t in cfg.outer_tags)
 
     return cmd
 
@@ -373,8 +434,10 @@ def infer_report_path(case_dir: Path, case_prefix: str) -> Optional[Path]:
         if p.exists():
             return p
 
-    # Fallback: search for a single json file in case_dir
-    jsons = sorted(case_dir.glob("*.json"))
+    # Fallback: search for a single json file in case_dir, excluding params.json
+    # (which is always written by automate.py before run_case.py runs, so it
+    # would otherwise be picked up on failures as a false-positive "report").
+    jsons = [p for p in sorted(case_dir.glob("*.json")) if p.name != "params.json"]
     if len(jsons) == 1:
         return jsons[0]
     return None
@@ -630,7 +693,7 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Parameter range in format name:low:high. Repeat for each parameter.")
     ap.add_argument("--n-cases", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--max-workers", type=int, default=1,
+    ap.add_argument("--max-workers", type=int, default=8,
                     help="Number of concurrent case evaluations to run in separate processes.")
     ap.add_argument("--resume", action="store_true",
                     help="Skip cases already recorded in summary.csv for this workdir.")
@@ -646,6 +709,25 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--vrf", type=float, default=1.0)
     ap.add_argument("--coord-unit", type=float, default=None)
     ap.add_argument("--no-depth", action="store_true")
+
+    # RF-null search bounds passed through to run_case.py
+    ap.add_argument("--r0-z-min", type=float, default=None,
+                    help="Lower z bound for RF-null search (mesh units).")
+    ap.add_argument("--r0-z-max", type=float, default=None,
+                    help="Upper z bound for RF-null search (mesh units). "
+                         "Auto-detected by run_case.py from electrode top + margin if omitted.")
+    ap.add_argument("--r0-x-min", type=float, default=None)
+    ap.add_argument("--r0-x-max", type=float, default=None)
+    ap.add_argument("--r0-y-min", type=float, default=None)
+    ap.add_argument("--r0-y-max", type=float, default=None)
+    ap.add_argument("--r0-search-margin", type=float, default=None,
+                    help="Margin (metres) above electrode top for z auto-detect. "
+                         "Passed to run_case.py only when explicitly set.")
+    ap.add_argument("--r0-x-auto", action="store_true",
+                    help="Pass --r0-x-auto to run_case.py (auto-detect x bounds from RF geometry).")
+    ap.add_argument("--outer-tags", type=int, nargs="*", default=[4],
+                    help="Facet tags for the outer Neumann boundary (default: [4]). "
+                         "Must match --outer-tags in run_case.py.")
 
     return ap
 
@@ -677,6 +759,15 @@ def main() -> None:
         vrf=args.vrf,
         coord_unit=args.coord_unit,
         no_depth=args.no_depth,
+        r0_z_min=args.r0_z_min,
+        r0_z_max=args.r0_z_max,
+        r0_x_min=args.r0_x_min,
+        r0_x_max=args.r0_x_max,
+        r0_y_min=args.r0_y_min,
+        r0_y_max=args.r0_y_max,
+        r0_search_margin=args.r0_search_margin,
+        r0_x_auto=args.r0_x_auto,
+        outer_tags=list(args.outer_tags) if args.outer_tags else [],
     )
 
     config_dump = {
@@ -685,6 +776,7 @@ def main() -> None:
         "n_cases": args.n_cases,
         "seed": args.seed,
     }
+    find_paths(config_dump)
     write_json(cfg.workdir / "automation_config.json", config_dump)
 
     results = run_parallel_random_search(
