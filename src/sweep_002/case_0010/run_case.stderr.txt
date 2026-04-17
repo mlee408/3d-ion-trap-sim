@@ -1,2 +1,0 @@
-/Users/jaewonkim/Documents/Jaewon_folder/Berkeley/Senior/CS_191B/3d-ion-trap-sim/src/run_case.py:664: UserWarning: [trap min] r0.z=0.3287 is within 15% of the search ceiling z_max=0.338 (mesh units).  This strongly suggests the 5th-percentile cluster centroid drifted into the Neumann far-field vacuum instead of the true RF null.  Re-run with a tighter --r0-z-max, e.g.  --r0-z-max 0.0822  (aim for ~1.5× the expected trap height).
-  main()
