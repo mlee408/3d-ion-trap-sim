@@ -159,6 +159,145 @@ def write_xdmf(out_path: Path, domain, fields: Sequence[fem.Function]):
                 xdmf.write_function(f_out)
 
 
+def compute_post_r0_metrics(
+    Psi: fem.Function,
+    *,
+    m_kg: float,
+    r0: np.ndarray,
+    h: float,
+    coord_unit: float,
+    vrf: float,
+    ray_length: float,
+    nrays: int = 48,
+    transport_mode: str = "fast",
+    compute_depth: bool = True,
+    comm=None,
+) -> dict:
+    """Canonical post-r0 physics pipeline shared by run_case.py and run_sweep_metrics.py.
+
+    Computes secular frequencies from the Hessian of the UNCLIPPED pseudopotential,
+    clips Psi for depth estimation, extracts the transport eigenvector from the weakest
+    secular mode, and (if compute_depth=True) evaluates fast or full depth metrics.
+
+    Parameters
+    ----------
+    Psi            : unclipped RF pseudopotential (from compute_rf_pseudopotential)
+    m_kg           : ion mass in kg
+    r0             : trap minimum in mesh units (from find_minimum_cg1)
+    h              : Hessian finite-difference step in mesh units
+    coord_unit     : metres per mesh unit (e.g., 1e-3 for mm, 1e-6 for µm)
+    vrf            : RF electrode voltage amplitude in volts
+    ray_length     : depth-ray length in mesh units
+    nrays          : number of radial rays for depth estimation
+    transport_mode : "fast" (eigvec + x-scan only) or "full" (adds CTC path)
+    compute_depth  : if False, skip depth estimation (depth key will be None)
+    comm           : MPI communicator (default: domain.comm)
+
+    Returns
+    -------
+    dict with keys:
+        sec              – output of secular_frequencies_from_pseudopotential
+        depth            – output of estimate_trap_depth_by_rays, or None
+        Psi_clipped      – clipped FEM Function (non-negative, for depth / XDMF)
+        transport_eigvec – unit eigenvector of the weakest secular mode
+        psi_min_clipped  – Ψ₀ evaluated on Psi_clipped at r0
+
+    Raises
+    ------
+    RuntimeError if all Hessian eigenvalues are negative (r0 is not a local minimum).
+    """
+    import warnings as _w
+
+    if comm is None:
+        comm = Psi.function_space.mesh.comm
+
+    r0 = np.asarray(r0, dtype=np.float64)
+
+    # ── Consistency diagnostics (temporary — remove after validation) ────────
+    if comm.rank == 0:
+        try:
+            _elem = Psi.function_space.ufl_element()
+            _elem_str = f"family={_elem.family()}  degree={_elem.degree()}"
+        except Exception:
+            _elem_str = type(Psi.function_space.element).__name__
+        print(f"[consistency] Psi (secular input) : type={type(Psi).__name__}  "
+              f"name={Psi.name!r}  element={_elem_str}")
+        print(f"[consistency] vrf            = {vrf!r} V")
+        print(f"[consistency] coord_unit     = {coord_unit:.4e} m/mesh_unit")
+        print(f"[consistency] m_kg           = {m_kg:.6e} kg")
+        print(f"[consistency] h (Hessian)    = {h:.4e} mesh units")
+        print(f"[consistency] ray_length     = {ray_length:.4e} mesh units")
+
+    # ── 1. Secular frequencies on UNCLIPPED Psi ─────────────────────────────
+    sec = metrics.secular_frequencies_from_pseudopotential(
+        Psi, m_kg=m_kg, r0=r0, h=h, comm=comm,
+        coord_scale=coord_unit, v_rf=vrf,
+    )
+
+    eigvals = sec["eigvals"]   # list (from SecularFrequencies.to_jsonable)
+
+    # ── 2. Eigenvalue validation ─────────────────────────────────────────────
+    n_neg = sum(1 for ev in eigvals if ev < 0)
+    if n_neg > 0 and comm.rank == 0:
+        _w.warn(
+            f"[secular] Hessian has {n_neg} negative eigenvalue(s): {eigvals}. "
+            "r0 is not a true local Ψ minimum (it may be a saddle point or an "
+            "electrode-adjacent artifact). "
+            "Tighten --r0-z-min / --r0-z-max / --r0-x-min / --r0-x-max so the "
+            "search stays inside the physical trapping corridor. "
+            f"Current r0={r0.tolist()} (mesh units).",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+    if all(ev < 0 for ev in eigvals):
+        raise RuntimeError(
+            "[secular] All Hessian eigenvalues are negative — r0 is not a local "
+            "minimum at all.  Re-run with tighter search bounds, e.g.: "
+            f"--r0-z-min 0.02 --r0-z-max 0.12  (current r0.z = "
+            f"{float(r0[2]) if r0.shape[0] >= 3 else 'N/A':.4g})"
+        )
+
+    # ── 3. Transport direction from weakest secular mode ─────────────────────
+    eigvals_arr = np.array(eigvals)
+    eigvecs_arr = np.array(sec["eigvecs"])
+    weak_idx = int(np.argmin(eigvals_arr))
+    transport_eigvec = eigvecs_arr[:, weak_idx]
+
+    # ── 4. Clipped Psi (non-negative) for depth rays and XDMF ───────────────
+    Psi_clipped = fem.Function(Psi.function_space)
+    Psi_clipped.x.array[:] = np.maximum(Psi.x.array, 0.0)
+    Psi_clipped.name = "Psi_rf"
+    if comm.rank == 0:
+        print(f"[consistency] Psi_clipped (depth input): type={type(Psi_clipped).__name__}  "
+              f"name={Psi_clipped.name!r}  same_space={Psi_clipped.function_space is Psi.function_space}")
+
+    # ── 5. Ψ₀ from the CLIPPED field at r0 ──────────────────────────────────
+    # Using the clipped field ensures trap_min.Psi_min_J and depth.Psi0_J are
+    # consistent (both from the same Psi_clipped, without Gibbs-ringing ambiguity).
+    psi_min_clipped = float(metrics.eval_function_at_points(
+        Psi_clipped, np.array([r0], dtype=np.float64), comm=comm
+    )[0])
+
+    # ── 6. Depth metrics ─────────────────────────────────────────────────────
+    depth = None
+    if compute_depth:
+        depth = metrics.estimate_trap_depth_by_rays(
+            Psi_clipped, r0=r0, ray_length=ray_length, nrays=nrays, comm=comm,
+            coord_scale=coord_unit, v_rf=vrf,
+            transport_dir=transport_eigvec,
+            transport_mode=transport_mode,
+        )
+
+    return {
+        "sec": sec,
+        "depth": depth,
+        "Psi_clipped": Psi_clipped,
+        "transport_eigvec": transport_eigvec,
+        "psi_min_clipped": psi_min_clipped,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mesh", type=Path, required=True)
@@ -572,93 +711,56 @@ def main():
         for _zv, _pv in zip(_z_scan, _psi_scan):
             print(f"  z={_zv:.3f}  Psi={_pv:.4e}")
 
-    # Secular frequencies from Hessian of the UNCLIPPED Ψ at the RF null.
-    sec = metrics.secular_frequencies_from_pseudopotential(
-        Psi, m_kg=m, r0=mininfo.r_min, h=h, comm=comm,
-        coord_scale=coord_unit, v_rf=args.vrf,
+    # ── Post-r0 physics: secular frequencies + depth ────────────────────────
+    # compute_post_r0_metrics is the single canonical implementation shared with
+    # run_sweep_metrics.py.  Both scripts must call this helper so the physics
+    # path never diverges.
+    if rank == 0:
+        print(f"[consistency] charge_C       = {q:.6e} C  (charge_e={args.charge_e})")
+    post = compute_post_r0_metrics(
+        Psi, m_kg=m, r0=mininfo.r_min, h=h,
+        coord_unit=coord_unit, vrf=args.vrf,
+        ray_length=ray_length, nrays=args.depth_nrays,
+        transport_mode=args.transport_mode,
+        compute_depth=not args.no_depth,
+        comm=comm,
     )
+    sec            = post["sec"]
+    depth          = post["depth"]
+    Psi_clipped    = post["Psi_clipped"]
+    transport_eigvec = post["transport_eigvec"]
+    psi_min_clipped  = post["psi_min_clipped"]
+
     if rank == 0:
         print(f"[secular] h_requested={h:.3e}  h_used={sec['h']:.3e} mesh units"
               f"  (h_mesh={h_mesh:.3e})")
         print(f"[secular] freq_hz={sec['freq_hz']}")
-
-    _eigvals = sec["eigvals"]
-    _n_neg = sum(1 for ev in _eigvals if ev < 0)
-    if _n_neg > 0 and rank == 0:
-        import warnings as _w
-        _w.warn(
-            f"[secular] Hessian has {_n_neg} negative eigenvalue(s): {_eigvals}. "
-            "r0 is not a true local Ψ minimum (it may be a saddle point or an "
-            "electrode-adjacent artifact). "
-            "Tighten --r0-z-min / --r0-z-max / --r0-x-min / --r0-x-max so the "
-            "search stays inside the physical trapping corridor.  "
-            f"Current r0={mininfo.r_min.tolist()} (mesh units).",
-            RuntimeWarning,
-        )
-    # Treat all-negative Hessian as a hard failure — frequencies are meaningless.
-    if all(ev < 0 for ev in _eigvals):
-        raise RuntimeError(
-            "[secular] All Hessian eigenvalues are negative — r0 is not a local "
-            "minimum at all.  Re-run with tighter search bounds, e.g.: "
-            f"--r0-z-min 0.02 --r0-z-max 0.12  (current r0.z = "
-            f"{float(mininfo.r_min[2]) if mininfo.r_min.shape[0] >= 3 else 'N/A':.4g})"
-        )
-
-    # Clipped copy for depth estimation (negative artefacts would deflate the
-    # barrier height) and for visualisation / XDMF export.
-    Psi_clipped = fem.Function(Psi.function_space)
-    Psi_clipped.x.array[:] = np.maximum(Psi.x.array, 0.0)
-    Psi_clipped.name = "Psi_rf"
-
-    # Canonical Ψ₀ at r0 from the CLIPPED field.  Using the clipped field here
-    # ensures trap_min.Psi_min_J and depth.Psi0_J are consistent (both come
-    # from the same Psi_clipped evaluated at the same r0, without ambiguity
-    # from Gibbs-ringing negative values in the raw field).
-    psi_min_clipped = float(metrics.eval_function_at_points(
-        Psi_clipped, np.array([mininfo.r_min], dtype=np.float64), comm=comm
-    )[0])
-
-    # ── Transport direction from weakest secular mode ───────────────────────
-    # The eigenvectors in sec["eigvecs"] are columns, sorted by eigenvalue
-    # (ascending).  The first column is the weakest mode — typically the axial
-    # transport / junction direction with the smallest confinement.
-    _eigvals_arr = np.array(sec["eigvals"])
-    _eigvecs_arr = np.array(sec["eigvecs"])
-    _weak_idx = int(np.argmin(_eigvals_arr))
-    transport_eigvec = _eigvecs_arr[:, _weak_idx]
-    if rank == 0:
+        _eigvals_arr = np.array(sec["eigvals"])
+        _weak_idx = int(np.argmin(_eigvals_arr))
         print(f"[depth] weak secular mode idx={_weak_idx}  "
               f"eigval={_eigvals_arr[_weak_idx]:.4e}  "
               f"eigvec={transport_eigvec.round(4).tolist()}")
 
-    depth = None
-    if not args.no_depth:
-        depth = metrics.estimate_trap_depth_by_rays(
-            Psi_clipped, r0=mininfo.r_min, ray_length=ray_length, nrays=args.depth_nrays, comm=comm,
-            coord_scale=coord_unit, v_rf=args.vrf,
-            transport_dir=transport_eigvec,
-            transport_mode=args.transport_mode,
-        )
-        if rank == 0 and depth is not None:
-            print("[depth summary] ── Sweep metrics ──")
-            print(f"[depth summary]   r0.z              = {float(mininfo.r_min[2]) * coord_unit * 1e6:.2f} µm")
-            print(f"[depth summary]   radial_depth_core = {depth.get('radial_depth_core_eV')} eV  "
-                  f"({depth.get('n_core_radial_rays')} rays)")
-            print(f"[depth summary]   transport_xscan   = {depth.get('transport_barrier_xscan_eV')} eV  "
-                  f"interior={depth.get('transport_barrier_xscan_interior')}")
-            print(f"[depth summary]   eigvec-scan       = {depth.get('transport_barrier_eigvec_eV')} eV  "
-                  f"(dir: {depth.get('transport_dir_source')})")
-            if args.transport_mode == "full":
-                print("[depth summary] ── Full transport (CTC) ──")
-                print(f"[depth summary]   ctc_like          = "
-                      f"{depth.get('transport_barrier_ctc_like_eV')} eV  "
-                      f"interior={depth.get('transport_barrier_ctc_interior')}  "
-                      f"barrier at x={depth.get('ctc_barrier_x_mesh')} z={depth.get('ctc_barrier_z_mesh')} (mesh)")
-                print("[depth summary] ── Broad radial depth ──")
-                print(f"[depth summary]   min={depth.get('radial_depth_broad_min_eV')} eV  "
-                      f"median={depth.get('radial_depth_broad_median_eV')} eV  "
-                      f"max={depth.get('radial_depth_broad_max_eV')} eV  "
-                      f"({depth.get('n_broad_radial_rays')} rays)")
+    if depth is not None and rank == 0:
+        print("[depth summary] ── Sweep metrics ──")
+        print(f"[depth summary]   r0.z              = {float(mininfo.r_min[2]) * coord_unit * 1e6:.2f} µm")
+        print(f"[depth summary]   radial_depth_core = {depth.get('radial_depth_core_eV')} eV  "
+              f"({depth.get('n_core_radial_rays')} rays)")
+        print(f"[depth summary]   transport_xscan   = {depth.get('transport_barrier_xscan_eV')} eV  "
+              f"interior={depth.get('transport_barrier_xscan_interior')}")
+        print(f"[depth summary]   eigvec-scan       = {depth.get('transport_barrier_eigvec_eV')} eV  "
+              f"(dir: {depth.get('transport_dir_source')})")
+        if args.transport_mode == "full":
+            print("[depth summary] ── Full transport (CTC) ──")
+            print(f"[depth summary]   ctc_like          = "
+                  f"{depth.get('transport_barrier_ctc_like_eV')} eV  "
+                  f"interior={depth.get('transport_barrier_ctc_interior')}  "
+                  f"barrier at x={depth.get('ctc_barrier_x_mesh')} z={depth.get('ctc_barrier_z_mesh')} (mesh)")
+            print("[depth summary] ── Broad radial depth ──")
+            print(f"[depth summary]   min={depth.get('radial_depth_broad_min_eV')} eV  "
+                  f"median={depth.get('radial_depth_broad_median_eV')} eV  "
+                  f"max={depth.get('radial_depth_broad_max_eV')} eV  "
+                  f"({depth.get('n_broad_radial_rays')} rays)")
 
     outdir = args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
