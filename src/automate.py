@@ -34,12 +34,10 @@ python automate.py \
     --pad-z-top {pad_z_top} \
     --nopopup \
     --out {mesh_path}" \
-  --workdir ./sweep_000 \
+  --workdir ./sweep_002 \
   --rf-tags 1 \
   --ground-tags 3 \
   --outer-tags 4 \
-  --r0-z-min 0.0 \
-  --r0-z-max 0.15 \
   --param lc_electrode:0.002:0.008 \
   --param lc_center:0.003:0.010 \
   --param lc_far:0.020:0.060 \
@@ -563,88 +561,172 @@ def _load_existing_results(summary_csv: Path) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def run_parallel_random_search(
+def _params_to_list(params: Dict[str, float], specs: Sequence[ParamSpec]) -> List[float]:
+    return [params[s.name] for s in specs]
+
+
+def _list_to_params(values: List[float], specs: Sequence[ParamSpec]) -> Dict[str, float]:
+    return {s.name: float(v) for s, v in zip(specs, values)}
+
+
+def run_bayesian_search(
     cfg: RunConfig,
     param_specs: Sequence[ParamSpec],
     *,
     n_cases: int,
+    n_random_start: int,
     seed: int,
     max_workers: int,
     resume: bool,
 ) -> List[CaseResult]:
+    """Bayesian optimisation loop using scikit-optimize's Gaussian Process surrogate.
+
+    Strategy
+    --------
+    1. Run ``n_random_start`` cases with Latin-hypercube sampling to explore the
+       space before the GP has enough data to be useful.
+    2. After each completed batch, fit a GP surrogate to all scored results so far
+       and use Expected Improvement (EI) acquisition to pick the next point(s).
+    3. Failed cases (score=None) are assigned a penalty score so the surrogate
+       learns to avoid those regions of parameter space.
+    4. Progress is written to summary.csv / summary.jsonl after every completed
+       case, exactly as in the random search, so runs are resumable.
+
+    Falls back to pure random search if scikit-optimize is not installed.
+    """
+    try:
+        from skopt import Optimizer
+        from skopt.space import Real
+        _has_skopt = True
+    except ImportError:
+        _has_skopt = False
+        print("[bayes] scikit-optimize not found — falling back to random search.")
+        print("[bayes] Install with: pip install scikit-optimize")
+
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     rng = random.Random(seed)
     results: List[CaseResult] = []
-
     summary_csv = cfg.workdir / "summary.csv"
-    all_jsonl = cfg.workdir / "summary.jsonl"
+    all_jsonl   = cfg.workdir / "summary.jsonl"
 
+    # ── Resume: reload already-completed cases ────────────────────────────
     existing = _load_existing_results(summary_csv) if resume else {}
+    case_counter = [max((int(k.split("_")[1]) for k in existing), default=-1) + 1]
 
-    # Pre-sample parameters deterministically from the provided seed so resumed
-    # runs reproduce the same candidate set/order.
-    planned: List[Tuple[int, Dict[str, float]]] = []
-    for i in range(n_cases):
-        params = sample_random_params(param_specs, rng)
-        planned.append((i, params))
+    def next_case_index() -> int:
+        idx = case_counter[0]
+        case_counter[0] += 1
+        return idx
 
-    pending: List[Tuple[int, Dict[str, float]]] = []
-    for i, params in planned:
-        case_id = f"case_{i:04d}"
-        if resume and case_id in existing:
-            continue
-        pending.append((i, params))
+    def record(result: CaseResult) -> None:
+        results.append(result)
+        row = _result_row(result)
+        append_csv_row(summary_csv, row)
+        with all_jsonl.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+        print(
+            f"[{result.case_id}] {result.status} | score={result.score} "
+            f"| elapsed={result.elapsed_s:.1f}s | {result.case_dir}"
+        )
 
+    def submit_batch(executor, param_list: List[Dict[str, float]]) -> List[CaseResult]:
+        futures = {
+            executor.submit(evaluate_case, next_case_index(), p, cfg=cfg): p
+            for p in param_list
+        }
+        batch_results = []
+        for fut in as_completed(futures):
+            r = fut.result()
+            record(r)
+            batch_results.append(r)
+        return batch_results
+
+    # Penalty used for failed cases so the surrogate avoids those regions.
+    # Set to slightly below the worst observed score, updated as runs come in.
+    def failure_penalty(scored: List[CaseResult]) -> float:
+        valid_scores = [r.score for r in scored if r.score is not None]
+        if not valid_scores:
+            return -1e6
+        return min(valid_scores) - abs(min(valid_scores)) * 0.1
+
+    # ── Seed the optimizer with existing results if resuming ─────────────
+    all_x: List[List[float]] = []
+    all_y: List[float] = []
     if resume and existing:
-        print(f"Resume enabled: found {len(existing)} existing case rows in {summary_csv}")
-        print(f"Skipping {len(planned) - len(pending)} already-recorded cases")
+        print(f"[bayes] Resume: loading {len(existing)} existing rows.")
+        for row in existing.values():
+            try:
+                x = [float(row[f"param_{s.name}"]) for s in param_specs]
+                y_raw = row.get("score", "")
+                y = float(y_raw) if y_raw not in ("", "None", None) else None
+                all_x.append(x)
+                all_y.append(y)  # type: ignore[arg-type]
+            except (KeyError, ValueError):
+                pass
 
-    if max_workers < 1:
-        raise ValueError("max_workers must be >= 1")
+    if not _has_skopt:
+        # ── Pure random fallback ──────────────────────────────────────────
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            remaining = n_cases - len(existing)
+            param_list = [sample_random_params(param_specs, rng) for _ in range(remaining)]
+            submit_batch(ex, param_list)
+        return results
 
-    def _submit(executor: ProcessPoolExecutor, item: Tuple[int, Dict[str, float]]):
-        idx, params = item
-        return executor.submit(evaluate_case, idx, params, cfg=cfg)
+    # ── Bayesian loop ─────────────────────────────────────────────────────
+    dimensions = [Real(s.low, s.high, name=s.name) for s in param_specs]
+    opt = Optimizer(
+        dimensions=dimensions,
+        base_estimator="GP",
+        acq_func="EI",           # Expected Improvement
+        acq_optimizer="lbfgs",
+        n_initial_points=n_random_start,
+        random_state=seed,
+    )
+
+    # Feed existing results into the optimizer so it starts warm.
+    if all_x:
+        pen = failure_penalty([r for r in results])
+        y_feed = [(-y if y is not None else -pen) for y in all_y]
+        # skopt minimizes, so negate the score (we want to maximize).
+        opt.tell(all_x, y_feed)
+        print(f"[bayes] Warm-started optimizer with {len(all_x)} existing points.")
+
+    total_done = len(existing)
+    remaining  = n_cases - total_done
 
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        future_map = {}
-        pending_iter = iter(pending)
+        while remaining > 0:
+            # Ask for a batch of suggestions (one per worker, up to remaining).
+            batch_size = min(max_workers, remaining)
 
-        # Fill the worker pool initially
-        for _ in range(min(max_workers, len(pending))):
-            try:
-                item = next(pending_iter)
-            except StopIteration:
-                break
-            fut = _submit(ex, item)
-            future_map[fut] = item[0]
+            # During initial random exploration, ask() returns LHS points.
+            # After n_initial_points, it uses the GP + EI acquisition.
+            suggested = opt.ask(n_points=batch_size)
+            if not isinstance(suggested[0], list):
+                suggested = [suggested]   # single-point ask returns a flat list
 
-        while future_map:
-            for fut in as_completed(list(future_map.keys()), timeout=None):
-                _ = future_map.pop(fut)
-                result = fut.result()
-                results.append(result)
+            param_batch = [_list_to_params(x, param_specs) for x in suggested]
+            batch_results = submit_batch(ex, param_batch)
 
-                row = _result_row(result)
-                append_csv_row(summary_csv, row)
-                with all_jsonl.open("a") as f:
-                    f.write(json.dumps(row) + "")
+            # Update the surrogate with completed results.
+            pen = failure_penalty(results)
+            xs_new = [_params_to_list(r.params, param_specs) for r in batch_results]
+            ys_new = [-(r.score if r.score is not None else pen) for r in batch_results]
+            opt.tell(xs_new, ys_new)
 
-                status = result.status
-                score = result.score
+            remaining -= len(batch_results)
+            total_done += len(batch_results)
+
+            # Print current best.
+            valid = [r for r in results if r.score is not None]
+            if valid:
+                best = max(valid, key=lambda r: r.score)  # type: ignore[arg-type]
                 print(
-                    f"[{result.case_id}] {status} | score={score} | elapsed={result.elapsed_s:.1f}s | {result.case_dir}"
+                    f"[bayes] {total_done}/{total_done + remaining} done | "
+                    f"best so far: {best.case_id} score={best.score:.4g} "
+                    f"params={best.params}"
                 )
-
-                try:
-                    item = next(pending_iter)
-                except StopIteration:
-                    item = None
-                if item is not None:
-                    new_fut = _submit(ex, item)
-                    future_map[new_fut] = item[0]
-                break
 
     return results
 
@@ -694,8 +776,12 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--param", action="append", default=[],
                     help="Parameter range in format name:low:high. Repeat for each parameter.")
     ap.add_argument("--n-cases", type=int, default=20)
+    ap.add_argument("--n-random-start", type=int, default=5,
+                    help="Number of random (Latin-hypercube) cases to run before the "
+                         "Bayesian GP surrogate takes over. Rule of thumb: ~2-3× the "
+                         "number of parameters. Default: 5.")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--max-workers", type=int, default=8,
+    ap.add_argument("--max-workers", type=int, default=12,
                     help="Number of concurrent case evaluations to run in separate processes.")
     ap.add_argument("--resume", action="store_true",
                     help="Skip cases already recorded in summary.csv for this workdir.")
@@ -781,10 +867,11 @@ def main() -> None:
     find_paths(config_dump)
     write_json(cfg.workdir / "automation_config.json", config_dump)
 
-    results = run_parallel_random_search(
+    results = run_bayesian_search(
         cfg,
         param_specs,
         n_cases=args.n_cases,
+        n_random_start=args.n_random_start,
         seed=args.seed,
         max_workers=args.max_workers,
         resume=args.resume,
