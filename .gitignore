@@ -11,4 +11,4 @@ results/
 .ipynb_checkpoints/
 .DS_Store
 .vscode/
-**/ .DS_Store
+**/.DS_Store
