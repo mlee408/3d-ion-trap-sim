@@ -71,15 +71,20 @@ def build_rf_cell(
     out_step: bool = False,
     out_mesh: bool = False,
     gui: bool = False,
+    base_step_path: str | None = None,
 ) -> None:
     """
     Build one RF lattice cell and export requested file formats.
 
     Parameters
     ----------
-    rf_height    : support beam height, also sets top-of-lattice z [µm]
-    rf_thickness : uniform scale factor applied to lattice beam cross-section
-    window_n     : number of windows per side (total windows = window_n²)
+    rf_height      : support beam height, also sets top-of-lattice z [µm]
+    rf_thickness   : uniform scale factor applied to lattice beam cross-section
+    window_n       : number of windows per side (total windows = window_n²)
+    base_step_path : optional path to rf_surface.step (the original RF base plate
+                     with X-shaped cutout at z=[-0.01, 0]).  When provided it
+                     is imported and fused with the parametric cell so the
+                     complete RF electrode matches the original footprint.
     """
     import gmsh
 
@@ -218,6 +223,37 @@ def build_rf_cell(
     occ.translate(fused, 0.0, 0.0, -0.02)
     occ.synchronize()
 
+    # ── 3b. Import and fuse RF base plate ────────────────────────────────────
+    # The base plate (z=[-0.01, 0]) has an X-shaped cutout matching the
+    # DC pad and ground corner positions — it must come from the original STEP
+    # because reconstructing that cutout analytically is impractical.
+    if base_step_path is not None:
+        import os
+        if not os.path.exists(base_step_path):
+            raise FileNotFoundError(
+                f"rf_surface.step not found at: {base_step_path}\n"
+                "Extract it from rf.step by running:\n"
+                "  python extract_rf_surface.py"
+            )
+        before = set(t for _, t in occ.getEntities(3))
+        occ.importShapes(base_step_path)
+        occ.synchronize()
+        after  = set(t for _, t in occ.getEntities(3))
+        base_vols = [(3, t) for t in sorted(after - before)]
+        if base_vols:
+            print(f"  Imported RF base plate: {len(base_vols)} vol(s) from {base_step_path}")
+            # fused currently holds the translated parametric cell dimtags
+            all_vols = [(d, t) for d, t in fused if d == 3] + base_vols
+            if len(all_vols) > 1:
+                fused, _ = occ.fuse(
+                    all_vols[:1], all_vols[1:],
+                    removeObject=True, removeTool=True,
+                )
+                occ.synchronize()
+                print(f"  Fused into {len([x for x in fused if x[0]==3])} RF vol(s)")
+        else:
+            print("  WARNING: no volumes found in base_step_path — skipping base plate.")
+
     # ── 4. Export ─────────────────────────────────────────────────────────────
     t_int = int(round(rf_thickness * 100))
     stem  = f"rfcell_h{int(rf_height)}_t{t_int:03d}_n{window_n}"
@@ -284,6 +320,12 @@ def main() -> None:
         "--gui", action="store_true", default=False,
         help="Launch Gmsh GUI after build",
     )
+    parser.add_argument(
+        "--base-step", type=str, default=None,
+        dest="base_step",
+        help="Path to rf_surface.step (original RF base plate with X-shaped cutout). "
+             "When provided, fused with the parametric cell for a complete RF electrode.",
+    )
     args = parser.parse_args()
 
     print(
@@ -297,13 +339,14 @@ def main() -> None:
 
     try:
         build_rf_cell(
-            rf_height    = args.rf_height,
-            rf_thickness = args.rf_thickness,
-            window_n     = args.window_n,
-            out_brep     = args.brep,
-            out_step     = args.step,
-            out_mesh     = args.mesh,
-            gui          = args.gui,
+            rf_height      = args.rf_height,
+            rf_thickness   = args.rf_thickness,
+            window_n       = args.window_n,
+            out_brep       = args.brep,
+            out_step       = args.step,
+            out_mesh       = args.mesh,
+            gui            = args.gui,
+            base_step_path = args.base_step,
         )
     except ValueError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
