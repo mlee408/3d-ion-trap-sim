@@ -658,19 +658,40 @@ def estimate_trap_depth_by_rays(
     comm: MPI.Comm | None = None,
     coord_scale: float = 1.0,
     v_rf: float = 1.0,
+    transport_dir: Optional[np.ndarray] = None,
+    transport_mode: str = "fast",
 ) -> Dict:
-    """Estimate trap depth as the minimum Ψ barrier across all ray directions.
+    """Estimate radial trap depth and transport barrier as separate metrics.
 
-    With Neumann outer BC the pseudopotential decays smoothly to zero beyond the
-    electrode region.  Rays that point toward the outer boundary see Ψ
-    **decreasing from the very first step** — the maximum is at t = 0 (r0 itself),
-    giving a spurious "depth" of zero or negative.  These are **open-boundary
-    rays** and are excluded from the depth estimate: a ray is counted only if its
-    Ψ maximum is found at an interior sample (index > 0), i.e., the ray first
-    climbs before (optionally) falling back.
+    Radial trap depth — two definitions
+    ------------------------------------
+    Broad: interior-barrier rays with d[z] ≥ 0, |d·t_dir| < 0.7,
+           barrier z > 10 % of trap height, Tukey-fence IQR outlier rejection.
+    Core : as broad, plus d[z] > 0.3 (strongly upward) AND
+           |d·t_dir| < 0.3 (mostly perpendicular to trap axis).
+           ``radial_depth_core_eV`` (median of core rays) is the primary
+           paper-comparison metric corresponding to the linear-region radial
+           well depth.
 
-    If every ray is an open-boundary ray a warning is emitted and the result
-    contains ``depth_eV = null`` rather than a misleading 0.
+    Transport / junction barrier — tiered by transport_mode
+    --------------------------------------------------------
+    transport_mode="fast" (default):
+        eigvec-scan + x-scan only.  ~2×nsamples Ψ evals per direction.
+        Suppresses verbose ray listings and CTC path diagnostics.
+        Use for routine runs and parameter sweeps.
+    transport_mode="full":
+        eigvec-scan + x-scan + CTC-like height-following path.
+        CTC cost is capped: 30 x-steps, 2 transverse scales × 2 rounds,
+        early stopping after 10 consecutive descending steps post-peak.
+        Prints full ray listings and CTC path diagnostics for validation.
+
+    Parameters
+    ----------
+    transport_dir : optional unit vector (mesh-gdim)
+        Eigenvector of the weakest secular mode; used for the eigvec scan and
+        for excluding transport-like rays from radial metrics.  Defaults to x.
+    transport_mode : "fast" | "full"
+        Controls which transport metrics are computed and verbosity level.
     """
     domain = Psi.function_space.mesh
     gdim = domain.geometry.dim
@@ -678,8 +699,6 @@ def estimate_trap_depth_by_rays(
     psi0 = float(eval_function_at_points(Psi, np.array([r0]), comm=comm)[0])
     if not np.isfinite(psi0):
         raise ValueError("r0 is outside mesh or Psi could not be evaluated at r0.")
-    # CG2 interpolation can yield tiny negative values even on a clipped field;
-    # clamp here so depth = max_psi - psi0 is never inflated by a negative base.
     psi0 = max(psi0, 0.0)
 
     if gdim == 3:
@@ -690,29 +709,106 @@ def estimate_trap_depth_by_rays(
     else:
         dirs = np.array([[1.0], [-1.0]], dtype=np.float64)
 
-    # Start at t = one step past r0 so the first sample is not r0 itself.
-    # This prevents open-boundary misclassification for rays that immediately
-    # exit the mesh (only r0 = ts[0] would be finite → argmax at index 0).
     dt = float(ray_length) / max(int(nsamples) - 1, 1)
     ts = np.linspace(dt, float(ray_length), int(nsamples))
 
-    # ── Per-ray record: (depth_FEM, direction_unit_vec, direction_class, is_phys)
-    # direction_class: "upward" | "lateral" | "downward"
-    # is_phys:  True  → local max in interior (real saddle-point barrier)
-    #           False → argmax at last finite sample (ray exits mesh ascending,
-    #                   i.e. hits solid electrode — not a physical escape route)
-    _RayRec = tuple   # (depth_FEM, dir_vec, dir_class, is_phys)
+    # Normalised transport direction
+    if transport_dir is not None:
+        t_dir = np.asarray(transport_dir, dtype=np.float64)[:gdim].copy()
+        t_dir_source = "eigvec"
+    else:
+        t_dir = np.zeros(gdim, dtype=np.float64); t_dir[0] = 1.0
+        t_dir_source = "x-axis"
+    t_dir = t_dir / (np.linalg.norm(t_dir) + 1e-30)
+
+    z_r0 = float(r0[2]) if gdim >= 3 else 0.0
+    z_barrier_min = max(0.0, z_r0 * 0.1)
+
+    # ── 1-D straight-line scan ────────────────────────────────────────────────
+    def _scan_barrier_1d(direction: np.ndarray) -> Tuple[float, bool, float, Optional[np.ndarray]]:
+        """Return (barrier_FEM, is_interior, t_at_max, r_at_max)."""
+        d = np.asarray(direction, dtype=np.float64)
+        d = d / (np.linalg.norm(d) + 1e-30)
+        pts = r0[None, :] + ts[:, None] * d[None, :]
+        vals = eval_function_at_points(Psi, pts, comm=comm)
+        finite = np.isfinite(vals)
+        if int(finite.sum()) < 3:
+            return np.nan, False, np.nan, None
+        vals_f = vals[finite]
+        finite_indices = np.where(finite)[0]
+        argmax_local = int(np.argmax(vals_f))
+        argmax_global = int(finite_indices[argmax_local])
+        last_finite_idx = int(finite_indices[-1])
+        if argmax_global == 0:
+            return np.nan, False, np.nan, None
+        max_psi = float(vals_f[argmax_local])
+        t_max = float(ts[argmax_global])
+        return max_psi - psi0, (argmax_global < last_finite_idx), t_max, r0 + t_max * d
+
+    # ── CTC-like height-following scan ────────────────────────────────────────
+    # Walks in x; at each x step uses multi-scale coordinate descent in the
+    # transverse plane (y, z for 3-D) to track the Ψ valley floor.
+    # Returns (barrier_FEM, is_interior, path_data, argmax_idx).
+    # path_data: list of (x, y, z, psi_FEM) tuples including the starting point.
+    def _ctc_scan(x_sign: int, n_steps: int = 30) -> Tuple[float, bool, list, int]:
+        h_mesh = _estimate_cell_h(domain)
+        h_yz_base = h_mesh * 1.5
+        x_step = float(x_sign) * ray_length / n_steps
+        cur_pos = r0.copy()
+
+        def _entry(pos: np.ndarray, psi: float) -> tuple:
+            return (float(pos[0]),
+                    float(pos[1]) if gdim > 1 else 0.0,
+                    float(pos[2]) if gdim > 2 else 0.0,
+                    float(psi))
+
+        path: list = [_entry(r0, psi0)]
+        peak_idx = 0
+        steps_past_peak = 0
+
+        for k in range(1, n_steps + 1):
+            trial = cur_pos.copy()
+            trial[0] = r0[0] + k * x_step
+            cur_v = float(eval_function_at_points(Psi, trial[None, :], comm=comm)[0])
+            if not np.isfinite(cur_v):
+                break   # left the mesh
+
+            # Reduced: 2 scales × 2 rounds (was 3 × 3)
+            for h_scale in (2.0, 1.0):
+                h = h_yz_base * h_scale
+                for _ in range(2):
+                    for ax in range(1, gdim):
+                        for sign in (+1.0, -1.0):
+                            cand = trial.copy(); cand[ax] += sign * h
+                            v = float(eval_function_at_points(Psi, cand[None, :], comm=comm)[0])
+                            if np.isfinite(v) and v < cur_v:
+                                cur_v = v; trial = cand
+
+            path.append(_entry(trial, cur_v))
+            cur_pos = trial.copy()
+
+            # Early stopping: break after 10 consecutive descending steps past peak
+            if cur_v > path[peak_idx][3]:
+                peak_idx = len(path) - 1
+                steps_past_peak = 0
+            else:
+                steps_past_peak += 1
+                if steps_past_peak >= 10:
+                    break
+
+        if len(path) < 3:
+            return np.nan, False, path, 0
+
+        psi_arr = np.array([e[3] for e in path], dtype=np.float64)
+        argmax = int(np.argmax(psi_arr))
+        if argmax == 0:
+            return np.nan, False, path, 0
+        return float(psi_arr[argmax]) - psi0, (argmax < len(path) - 1), path, argmax
+
+    # ── Ray scan loop ─────────────────────────────────────────────────────────
+    # entry: (depth_FEM, d_unit, dir_class, is_phys, t_barrier, r_barrier)
     all_rays: list = []
-
-    n_open = 0
-    n_electrode_hit = 0
-    n_physical = 0
-
-    # Physical-barrier trackers (used for depth_eV)
-    best_phys_depth = np.inf
-    best_phys_dir: Optional[np.ndarray] = None
-    best_phys_max = np.nan
-    best_phys_used = 0
+    n_open = 0; n_electrode_hit = 0; n_physical = 0
 
     for d in dirs:
         d = np.asarray(d, dtype=np.float64)
@@ -720,156 +816,273 @@ def estimate_trap_depth_by_rays(
         pts = r0[None, :] + ts[:, None] * d[None, :]
         vals = eval_function_at_points(Psi, pts, comm=comm)
         finite = np.isfinite(vals)
-        n_fin = int(finite.sum())
-        if n_fin < 3:
+        if int(finite.sum()) < 3:
             continue
-
         vals_f = vals[finite]
         finite_indices = np.where(finite)[0]
         argmax_local = int(np.argmax(vals_f))
         argmax_global = int(finite_indices[argmax_local])
         last_finite_idx = int(finite_indices[-1])
         max_psi = float(vals_f[argmax_local])
-
-        # ── Open-boundary ray ────────────────────────────────────────────────
-        # argmax at the very first finite sample means Ψ only decreases along
-        # this direction — pointing toward the Neumann far-field.  No barrier.
         if argmax_global == 0:
-            n_open += 1
-            continue
-
+            n_open += 1; continue
         depth = max_psi - psi0
-
-        # ── Direction classification ─────────────────────────────────────────
-        # Based on the z-component (electrode-normal axis).
-        # Lateral rays are the primary transport/escape directions.
+        t_bar = float(ts[argmax_global])
+        r_bar = r0 + t_bar * d
         if gdim >= 3:
-            if d[2] > 0.5:
-                dir_class = "upward"      # toward RF pillar tops
-            elif d[2] < -0.5:
-                dir_class = "downward"    # toward DC substrate
-            else:
-                dir_class = "lateral"     # along electrode plane / junction
+            if d[2] > 0.5:    dir_class = "upward"
+            elif d[2] < -0.5: dir_class = "downward"
+            else:              dir_class = "lateral"
         else:
             dir_class = "lateral"
-
-        # ── Physical-barrier vs electrode-hit ────────────────────────────────
-        # If the argmax is at the LAST finite sample, the ray exited the mesh
-        # while Ψ was still at its maximum (i.e., it hit a solid electrode or
-        # domain boundary while ascending).  Ions cannot escape through solid
-        # metal, so these barriers are not physical escape routes.
-        # If the argmax is at an interior point (finite samples exist after it),
-        # Ψ rose then fell — a genuine saddle-point barrier.
         is_phys = (argmax_global < last_finite_idx)
+        all_rays.append((float(depth), d.copy(), dir_class, is_phys, t_bar, r_bar.copy()))
+        if is_phys: n_physical += 1
+        else:       n_electrode_hit += 1
 
-        all_rays.append((float(depth), d.copy(), dir_class, is_phys))
-
-        if is_phys:
-            n_physical += 1
-            if depth < best_phys_depth:
-                best_phys_depth = depth
-                best_phys_dir = d.copy()
-                best_phys_max = max_psi
-                best_phys_used = n_fin
-        else:
-            n_electrode_hit += 1
-
-    # ── Compute physical scale once ──────────────────────────────────────────
-    # Ψ_physical [J] = (V_RF / coord_scale)² × Ψ_FEM
-    # coord_scale has units of m/mesh_unit (e.g. 1e-3 for mm mesh).
+    # ── Physical scale ────────────────────────────────────────────────────────
     phys_scale = (v_rf / coord_scale) ** 2
     psi0_phys_J = psi0 * phys_scale
 
-    # ── Diagnostics ─────────────────────────────────────────────────────────
-    # Print per-family sorted barrier distributions.
-    phys_rays = [(dep, dv, dc) for dep, dv, dc, ip in all_rays if ip]
-    elec_rays  = [(dep, dv, dc) for dep, dv, dc, ip in all_rays if not ip]
-    phys_rays.sort(key=lambda x: x[0])
-    elec_rays.sort(key=lambda x: x[0])
+    # ── Radial ray filters ────────────────────────────────────────────────────
+    # Broad: interior, non-downward, non-transport, barrier above substrate floor
+    # Core:  broad + strongly upward (d[z]>0.3) + tighter transport exclusion (<0.3)
+    _BROAD_T_THR = 0.7   # cos threshold for broad transport exclusion (~46°)
+    _CORE_DZ    = 0.3    # minimum d[z] for core rays
+    _CORE_T_THR = 0.3    # cos threshold for core transport exclusion (~17°)
 
+    def _broad_ok(e) -> bool:
+        _, dv, _, ip, _, r_b = e
+        if not ip: return False
+        if gdim >= 3 and dv[2] < 0: return False
+        if abs(float(np.dot(dv, t_dir))) > _BROAD_T_THR: return False
+        if gdim >= 3 and float(r_b[2]) < z_barrier_min: return False
+        return True
+
+    def _core_ok(e) -> bool:
+        _, dv, _, _, _, _ = e
+        if not _broad_ok(e): return False
+        if gdim >= 3 and dv[2] <= _CORE_DZ: return False
+        if abs(float(np.dot(dv, t_dir))) > _CORE_T_THR: return False
+        return True
+
+    def _iqr_filter(rays: list) -> Tuple[list, int]:
+        if len(rays) < 4:
+            return rays, 0
+        ds = np.array([e[0] for e in rays])
+        q25, q75 = float(np.percentile(ds, 25)), float(np.percentile(ds, 75))
+        cut = q75 + 5.0 * (q75 - q25)
+        kept = [e for e in rays if e[0] <= cut]
+        return kept, len(rays) - len(kept)
+
+    broad_rays, n_broad_out = _iqr_filter([e for e in all_rays if _broad_ok(e)])
+    core_rays,  n_core_out  = _iqr_filter([e for e in all_rays if _core_ok(e)])
+    broad_sorted = sorted(broad_rays, key=lambda e: e[0])
+    core_sorted  = sorted(core_rays,  key=lambda e: e[0])
+
+    down_phys = sorted([e for e in all_rays if e[3] and e[2] == "downward"], key=lambda e: e[0])
+    phys_rays = sorted([e for e in all_rays if e[3]],                        key=lambda e: e[0])
+    elec_rays = sorted([e for e in all_rays if not e[3]],                    key=lambda e: e[0])
     _n_total = n_open + n_electrode_hit + n_physical
-    print(f"[depth] psi0_FEM={psi0:.3e}  psi0_phys={psi0_phys_J / _E_CHARGE:.3e} eV  "
-          f"(v_rf={v_rf} V, coord_scale={coord_scale:.0e} m/mesh_unit)")
-    print(f"[depth] ray counts: total={_n_total}  open={n_open}  "
-          f"electrode-hit={n_electrode_hit}  physical-barrier={n_physical}")
 
+    # ── Print helpers ─────────────────────────────────────────────────────────
     def _print_rays(label: str, rays: list, show: int = 5) -> None:
         nd = len(rays)
         if nd == 0:
-            print(f"  {label}: (none)")
-            return
+            print(f"  {label}: (none)"); return
         print(f"  {label} ({nd} rays, sorted by barrier height):")
-        for i, (dep, dv, dc) in enumerate(rays[:show]):
-            print(f"    [{i+1}/{nd}] {dep * phys_scale / _E_CHARGE:.4f} eV "
-                  f"({dep:.3e} FEM)  class={dc}  dir={dv.round(3).tolist()}")
+        for i, e in enumerate(rays[:show]):
+            dep, dv, dc = e[0], e[1], e[2]
+            extra = (f"  t_bar={e[4]:.4g}  z_bar={float(e[5][2]):.4g}"
+                     if len(e) >= 6 and gdim >= 3 else "")
+            print(f"    [{i+1}/{nd}] {dep*phys_scale/_E_CHARGE:.4f} eV "
+                  f"({dep:.3e} FEM)  class={dc}  "
+                  f"dir={np.asarray(dv).round(3).tolist()}{extra}")
         if nd > 2 * show:
-            print(f"    ... ({nd - 2*show} middle rays omitted) ...")
-        for i, (dep, dv, dc) in enumerate(rays[max(0, nd - show):]):
-            print(f"    [{nd - show + i + 1}/{nd}] {dep * phys_scale / _E_CHARGE:.4f} eV "
-                  f"({dep:.3e} FEM)  class={dc}  dir={dv.round(3).tolist()}")
+            print(f"    ... ({nd - 2*show} middle omitted) ...")
+        for i, e in enumerate(rays[max(0, nd - show):]):
+            dep, dv, dc = e[0], e[1], e[2]
+            print(f"    [{nd-show+i+1}/{nd}] {dep*phys_scale/_E_CHARGE:.4f} eV "
+                  f"({dep:.3e} FEM)  class={dc}  dir={np.asarray(dv).round(3).tolist()}")
 
-    print("[depth] ── Physical barriers (local max in interior) ──")
-    _print_rays("physical", phys_rays)
-    print("[depth] ── Electrode-hit rays (monotonic ascent, excluded from depth_eV) ──")
-    _print_rays("electrode-hit", elec_rays)
+    def _print_ctc_path(label: str, barrier: float, interior: bool,
+                        path: list, argmax_idx: int) -> None:
+        n = len(path)
+        b_eV = barrier * phys_scale / _E_CHARGE if np.isfinite(barrier) else float("nan")
+        print(f"  CTC-{label}: {n} steps  barrier={b_eV:.6f} eV  interior={interior}")
+        if np.isnan(barrier) or n < 2:
+            return
+        stride = max(1, (n - 1) // 10)
+        rows = sorted(set(list(range(0, n, stride)) + [argmax_idx]))
+        for k in rows:
+            if k >= n: continue
+            px, py, pz, pv = path[k]
+            tag = " <-- BARRIER" if k == argmax_idx else ""
+            print(f"    k={k:3d}: x={px:.4f} y={py:.4f} z={pz:.4f} "
+                  f"Psi={pv:.3e} ({pv*phys_scale/_E_CHARGE:.4f} eV){tag}")
 
-    # ── Warn if no physical barriers found ──────────────────────────────────
-    if n_physical == 0:
+    # ── Diagnostics: ray families (full mode only) ───────────────────────────
+    if transport_mode == "full":
+        print(f"[depth] psi0_FEM={psi0:.3e}  psi0_phys={psi0_phys_J/_E_CHARGE:.3e} eV  "
+              f"(v_rf={v_rf} V, coord_scale={coord_scale:.0e} m/mesh_unit)")
+        print(f"[depth] ray counts: total={_n_total}  open={n_open}  "
+              f"electrode-hit={n_electrode_hit}  physical-barrier={n_physical}")
+        n_broad_cands = len(broad_rays) + n_broad_out
+        n_core_cands  = len(core_rays)  + n_core_out
+        print(f"[depth] broad filter: {len(broad_rays)}/{n_broad_cands} kept  "
+              f"{n_broad_out} IQR-outliers excluded  "
+              f"(d[z]≥0, |d·t|<{_BROAD_T_THR}, z_bar≥{z_barrier_min:.4g})")
+        print(f"[depth] core  filter: {len(core_rays)}/{n_core_cands} kept  "
+              f"{n_core_out} IQR-outliers excluded  "
+              f"(d[z]>{_CORE_DZ}, |d·t|<{_CORE_T_THR})")
+        print("[depth] ── Core radial rays (strongly upward, perpendicular to transport) ──")
+        _print_rays("core", core_sorted)
+        print("[depth] ── Broad radial rays (d[z]≥0, non-transport, interior barrier) ──")
+        _print_rays("broad", broad_sorted)
+        print("[depth] ── Downward rays (substrate-facing, excluded) ──")
+        _print_rays("downward-phys", down_phys)
+        print("[depth] ── Electrode-hit / geometry-blocked rays ──")
+        _print_rays("electrode-hit", elec_rays)
+
+    # ── Transport barriers ────────────────────────────────────────────────────
+    # 1. Eigvec scan
+    _ev_p, _ev_ip, _, _ = _scan_barrier_1d(t_dir)
+    _ev_n, _ev_in, _, _ = _scan_barrier_1d(-t_dir)
+    _ev_c = [(b, bi) for b, bi in ((_ev_p, _ev_ip), (_ev_n, _ev_in)) if np.isfinite(b)]
+    if _ev_c:
+        _ev_FEM, _ev_int = min(_ev_c, key=lambda x: x[0])
+        tb_eigvec_eV: Optional[float] = float(_ev_FEM * phys_scale / _E_CHARGE)
+        tb_eigvec_int: bool = bool(_ev_int)
+    else:
+        tb_eigvec_eV = None; tb_eigvec_int = False
+
+    # 2. Pure x-scan
+    _xd = np.zeros(gdim); _xd[0] = 1.0
+    _xp, _xip, _, _ = _scan_barrier_1d(_xd)
+    _xn, _xin, _, _ = _scan_barrier_1d(-_xd)
+    _x_c = [(b, bi) for b, bi in ((_xp, _xip), (_xn, _xin)) if np.isfinite(b)]
+    if _x_c:
+        _x_FEM, _x_int = min(_x_c, key=lambda x: x[0])
+        tb_xscan_eV: Optional[float] = float(_x_FEM * phys_scale / _E_CHARGE)
+        tb_xscan_int: bool = bool(_x_int)
+    else:
+        tb_xscan_eV = None; tb_xscan_int = False
+
+    # 3. CTC-like height-following scan (full mode only)
+    if transport_mode == "full":
+        print("[depth] ── CTC-like path scan (height-following) ──")
+        _cp, _cip, _cpd, _cpai = _ctc_scan(+1)
+        _cn, _cin, _cnd, _cnai = _ctc_scan(-1)
+        _print_ctc_path("+x", _cp, _cip, _cpd, _cpai)
+        _print_ctc_path("-x", _cn, _cin, _cnd, _cnai)
+
+        _c_c = [(b, bi) for b, bi in ((_cp, _cip), (_cn, _cin)) if np.isfinite(b)]
+        if _c_c:
+            _c_FEM, _c_int = min(_c_c, key=lambda x: x[0])
+            tb_ctc_eV: Optional[float] = float(_c_FEM * phys_scale / _E_CHARGE)
+            tb_ctc_int: bool = bool(_c_int)
+            _best_path = _cpd if (np.isfinite(_cp) and (not np.isfinite(_cn) or _cp <= _cn)) else _cnd
+            _best_ai   = _cpai if (np.isfinite(_cp) and (not np.isfinite(_cn) or _cp <= _cn)) else _cnai
+            _ctc_bx = float(_best_path[_best_ai][0]) if _best_ai < len(_best_path) else None
+            _ctc_bz = float(_best_path[_best_ai][2]) if _best_ai < len(_best_path) else None
+        else:
+            tb_ctc_eV = None; tb_ctc_int = False
+            _ctc_bx = None; _ctc_bz = None
+    else:
+        tb_ctc_eV = None; tb_ctc_int = False
+        _ctc_bx = None; _ctc_bz = None
+
+    def _fmt_tb(label: str, eV: Optional[float], interior: bool) -> str:
+        return f"  {label}: n/a" if eV is None else f"  {label}: {eV:.6f} eV  interior={interior}"
+
+    print(f"[depth] transport axis = {t_dir.round(3).tolist()} (source: {t_dir_source})")
+    print("[depth] ── Transport barrier summary ──")
+    print(_fmt_tb("eigvec-scan ", tb_eigvec_eV, tb_eigvec_int))
+    print(_fmt_tb("x-scan      ", tb_xscan_eV,  tb_xscan_int))
+    if transport_mode == "full":
+        print(_fmt_tb("ctc-like    ", tb_ctc_eV,    tb_ctc_int))
+        if _ctc_bx is not None:
+            print(f"  ctc barrier at: x={_ctc_bx:.4f}  z={_ctc_bz:.4f} (mesh units)")
+
+    # ── Radial depth statistics ───────────────────────────────────────────────
+    def _ray_stats(rays: list, label: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        if not rays:
+            return None, None, None
+        evs = np.array([e[0] * phys_scale / _E_CHARGE for e in rays])
+        mn, md, mx = float(evs.min()), float(np.median(evs)), float(evs.max())
+        print(f"[depth] {label}: min={mn:.4f} eV  median={md:.4f} eV  max={mx:.4f} eV  "
+              f"({len(rays)} rays)")
+        return mn, md, mx
+
+    if transport_mode == "full":
+        core_min_eV,  core_med_eV,  core_max_eV  = _ray_stats(core_rays,  "radial_core ")
+        broad_min_eV, broad_med_eV, broad_max_eV = _ray_stats(broad_rays, "radial_broad")
+    else:
+        def _ray_stats_silent(rays):
+            if not rays:
+                return None, None, None
+            evs = np.array([e[0] * phys_scale / _E_CHARGE for e in rays])
+            return float(evs.min()), float(np.median(evs)), float(evs.max())
+        core_min_eV,  core_med_eV,  core_max_eV  = _ray_stats_silent(core_rays)
+        broad_min_eV, broad_med_eV, broad_max_eV = _ray_stats_silent(broad_rays)
+
+    if not core_rays:
         warnings.warn(
-            f"estimate_trap_depth_by_rays: no physical-barrier rays found "
-            f"({n_electrode_hit} electrode-hit, {n_open} open-boundary). "
-            "depth_eV will be null.  Increase ray density (--depth-nrays) or "
-            "check that r0 is well inside the electrode structure.",
-            RuntimeWarning,
-            stacklevel=2,
+            "estimate_trap_depth_by_rays: no core radial rays found after filtering. "
+            "radial_depth_core_eV will be null.  Increase --depth-nrays or check r0.",
+            RuntimeWarning, stacklevel=2,
         )
-        return {
-            "r0_m": r0.tolist(),
-            "Psi0_J": float(psi0_phys_J),
-            "depth_J": None,
-            "depth_eV": None,
-            "depth_raw_eV": None,
-            "worst_direction": None,
-            "ray_max_Psi_J": None,
-            "ray_samples_used": None,
-            "ray_length_mesh": float(ray_length),
-            "nrays": int(nrays),
-            "nsamples": int(nsamples),
-            "n_open_boundary_rays": n_open,
-            "n_electrode_hit_rays": n_electrode_hit,
-            "n_physical_barrier_rays": n_physical,
-        }
+    if not broad_rays:
+        warnings.warn(
+            "estimate_trap_depth_by_rays: no broad radial rays found after filtering. "
+            "radial_depth_broad_* will be null.",
+            RuntimeWarning, stacklevel=2,
+        )
 
-    # ── Depth values ─────────────────────────────────────────────────────────
-    depth_phys_J = best_phys_depth * phys_scale
-    max_phys_J = best_phys_max * phys_scale
-
-    # Raw minimum across ALL valid rays (including electrode hits) — for debug.
-    best_raw_depth = min(dep for dep, _, _, _ in all_rays)
-    best_raw_eV = float(best_raw_depth * phys_scale / _E_CHARGE)
-
-    phys_min_eV = float(depth_phys_J / _E_CHARGE)
-    phys_max_eV = float(phys_rays[-1][0] * phys_scale / _E_CHARGE)
-
-    print(f"[depth] physical depth (worst escape) = {phys_min_eV:.4f} eV")
-    print(f"[depth] physical max barrier           = {phys_max_eV:.4f} eV")
-    print(f"[depth] raw min (incl. electrode hits) = {best_raw_eV:.4f} eV  "
-          f"(not used for reported depth)")
+    # ── Debug-only values ─────────────────────────────────────────────────────
+    best_legacy_eV: Optional[float] = (
+        float(phys_rays[0][0] * phys_scale / _E_CHARGE) if phys_rays else None
+    )
+    best_legacy_dir: Optional[list] = phys_rays[0][1].tolist() if phys_rays else None
+    best_raw_eV: Optional[float] = (
+        float(min(e[0] for e in all_rays) * phys_scale / _E_CHARGE) if all_rays else None
+    )
 
     return {
         "r0_m": r0.tolist(),
         "Psi0_J": float(psi0_phys_J),
-        "depth_J": float(depth_phys_J),
-        "depth_eV": float(phys_min_eV),          # min barrier among physical rays
-        "depth_max_eV": float(phys_max_eV),       # max barrier among physical rays
-        "depth_raw_eV": float(best_raw_eV),       # unfiltered min (for diagnostics)
-        "worst_direction": best_phys_dir.tolist(),
-        "ray_max_Psi_J": float(max_phys_J),
-        "ray_samples_used": int(best_phys_used),
+        # ── Paper-comparison metrics ──
+        "radial_depth_core_eV": core_med_eV,
+        "radial_depth_core_min_eV": core_min_eV,
+        "radial_depth_core_max_eV": core_max_eV,
+        "n_core_radial_rays": len(core_rays),
+        "n_core_outliers_excluded": n_core_out,
+        "transport_barrier_ctc_like_eV": tb_ctc_eV,
+        "transport_barrier_ctc_interior": tb_ctc_int,
+        "ctc_barrier_x_mesh": _ctc_bx,
+        "ctc_barrier_z_mesh": _ctc_bz,
+        # ── Secondary transport metrics ──
+        "transport_barrier_eigvec_eV": tb_eigvec_eV,
+        "transport_barrier_eigvec_interior": tb_eigvec_int,
+        "transport_barrier_xscan_eV": tb_xscan_eV,
+        "transport_barrier_xscan_interior": tb_xscan_int,
+        "transport_dir_used": t_dir.tolist(),
+        "transport_dir_source": t_dir_source,
+        # ── Broad radial depth (diagnostics) ──
+        "radial_depth_broad_min_eV": broad_min_eV,
+        "radial_depth_broad_median_eV": broad_med_eV,
+        "radial_depth_broad_max_eV": broad_max_eV,
+        "n_broad_radial_rays": len(broad_rays),
+        "n_broad_outliers_excluded": n_broad_out,
+        # ── Debug-only ──
+        "depth_all_phys_min_eV": best_legacy_eV,
+        "depth_raw_eV": best_raw_eV,
+        "worst_direction": best_legacy_dir,
         "ray_length_mesh": float(ray_length),
         "nrays": int(nrays),
         "nsamples": int(nsamples),
         "n_open_boundary_rays": n_open,
         "n_electrode_hit_rays": n_electrode_hit,
         "n_physical_barrier_rays": n_physical,
+        "n_downward_physical_rays": len(down_phys),
     }
