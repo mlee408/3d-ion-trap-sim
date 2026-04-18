@@ -42,6 +42,7 @@ Smoke-test set (n = 1, 2, 3)
 """
 
 import argparse
+from typing import Optional
 import sys
 
 # ---------------------------------------------------------------------------
@@ -67,11 +68,12 @@ def build_rf_cell(
     rf_height: float,
     rf_thickness: float,
     window_n: int,
+    rf_width_um: Optional[float] = None,
     out_brep: bool = True,
     out_step: bool = False,
     out_mesh: bool = False,
     gui: bool = False,
-    base_step_path: str | None = None,
+    base_step_path: Optional[str] = None,
 ) -> None:
     """
     Build one RF lattice cell and export requested file formats.
@@ -81,12 +83,19 @@ def build_rf_cell(
     rf_height      : support beam height, also sets top-of-lattice z [µm]
     rf_thickness   : uniform scale factor applied to lattice beam cross-section
     window_n       : number of windows per side (total windows = window_n²)
-    base_step_path : optional path to rf_surface.step (the original RF base plate
+    base_step_path : optional path to rf_base.step (the original RF base plate
                      with X-shaped cutout at z=[-0.01, 0]).  When provided it
                      is imported and fused with the parametric cell so the
                      complete RF electrode matches the original footprint.
     """
     import gmsh
+
+    # ── rf_width_um overrides rf_thickness ───────────────────────────────────
+    # When rf_width_um is provided, compute rf_thickness from it so that the
+    # horizontal diamond diagonal equals rf_width_um.  This lets the sweep
+    # work in physical µm units (10, 15, 20 ... µm) rather than scale factors.
+    if rf_width_um is not None:
+        rf_thickness = rf_width_um / LATTICE_DH_BASE_UM
 
     # ── derived dimensions (µm) ──────────────────────────────────────────────
     half_sp = SUPPORT_SPACING_UM / 2.0               # 300 µm from origin to corner
@@ -231,9 +240,9 @@ def build_rf_cell(
         import os
         if not os.path.exists(base_step_path):
             raise FileNotFoundError(
-                f"rf_surface.step not found at: {base_step_path}\n"
+                f"rf_base.step not found at: {base_step_path}\n"
                 "Extract it from rf.step by running:\n"
-                "  python extract_rf_surface.py"
+                "  python extract_rf_base.py"
             )
         before = set(t for _, t in occ.getEntities(3))
         occ.importShapes(base_step_path)
@@ -305,6 +314,12 @@ def main() -> None:
         help="Number of windows per side (total = window_n²)",
     )
     parser.add_argument(
+        "--rf_width_um", type=float, default=None,
+        help="Electrode width in µm (sets horizontal diamond diagonal directly). "
+             "When provided, overrides --rf_thickness. "
+             "Minimum recommended: 10 µm, step size: 5 µm.",
+    )
+    parser.add_argument(
         "--no-brep", dest="brep", action="store_false", default=True,
         help="Suppress .brep output",
     )
@@ -323,15 +338,19 @@ def main() -> None:
     parser.add_argument(
         "--base-step", type=str, default=None,
         dest="base_step",
-        help="Path to rf_surface.step (original RF base plate with X-shaped cutout). "
+        help="Path to rf_base.step (original RF base plate with X-shaped cutout). "
              "When provided, fused with the parametric cell for a complete RF electrode.",
     )
     args = parser.parse_args()
 
+    _eff_thickness = (args.rf_width_um / LATTICE_DH_BASE_UM
+                      if args.rf_width_um is not None else args.rf_thickness)
+    _eff_width_um  = args.rf_width_um if args.rf_width_um is not None                      else args.rf_thickness * LATTICE_DH_BASE_UM
     print(
         f"\nRF lattice cell\n"
         f"  rf_height    = {args.rf_height} µm\n"
-        f"  rf_thickness = {args.rf_thickness}  (scale factor)\n"
+        f"  rf_width_um  = {_eff_width_um:.1f} µm  "
+        f"(rf_thickness = {_eff_thickness:.4f})\n"
         f"  window_n     = {args.window_n}  "
         f"({args.window_n}×{args.window_n} = {args.window_n**2} windows, "
         f"{args.window_n + 1} ribs/side)\n"
@@ -342,6 +361,7 @@ def main() -> None:
             rf_height      = args.rf_height,
             rf_thickness   = args.rf_thickness,
             window_n       = args.window_n,
+            rf_width_um    = args.rf_width_um,
             out_brep       = args.brep,
             out_step       = args.step,
             out_mesh       = args.mesh,

@@ -22,10 +22,39 @@ Typical usage
 
 Example (run from src/ directory)
 -------
-for N in 1 2 3 4; do
+python automate.py \
+  --run-case ./run_case.py \
+  --mesh-template "python ../meshes/run_case.py \
+    --rf ../meshes/step/rf.step \
+    --dc ../meshes/step/dc.step \
+    --ground ../meshes/step/ground.step \
+    --lc-electrode {lc_electrode} \
+    --lc-center {lc_center} \
+    --lc-far {lc_far} \
+    --pad-z-top {pad_z_top} \
+    --nopopup \
+    --out {mesh_path}" \
+  --workdir ./sweep_002 \
+  --rf-tags 1 \
+  --ground-tags 3 \
+  --outer-tags 4 \
+  --param lc_electrode:0.002:0.008 \
+  --param lc_center:0.003:0.010 \
+  --param lc_far:0.020:0.060 \
+  --param pad_z_top:0.300:0.800 \
+  --degree 2 \
+  --mass-amu 40.0 \
+  --charge-e 1.0 \
+  --rf-freq 40e6 \
+  --vrf 150 \
+  --coord-unit 1e-3 \
+  --n-cases 20 \
+  --seed 42
+
+  for N in 1 2 3 4; do
   python automate.py \
-    --run-case "$(pwd)/run_case.py" \
-    --mesh-template "python $(pwd)/make_mesh_parametric.py --window-n $N --rf-height {rf_height} --rf-thickness {rf_thickness} --out {mesh_path}" \
+    --run-case "$(pwd)/run_sweep_metrics.py" \
+    --mesh-template "python $(pwd)/../scripts/make_mesh_parametric.py --window-n $N --rf-height {rf_height} --rf-thickness {rf_thickness} --out {mesh_path}" \
     --workdir ./sweep_geom_n${N} \
     --rf-tags 1 --ground-tags 3 --outer-tags 4 \
     --r0-z-min 0.0 --r0-z-max 0.15 \
@@ -214,7 +243,10 @@ def sample_random_params(specs: Sequence[ParamSpec], rng: random.Random) -> Dict
 def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Optional[float]]:
     """Extract the subset of metrics that the scorer needs.
 
-    This is written defensively because report schemas often change slightly.
+    Handles both report formats:
+      - run_case.py      : keys 'depth.depth_eV', 'secular.freq_hz', 'r0_SI_m'
+      - run_sweep_metrics.py : keys 'radial_depth_core_eV', 'strong_freq_min_hz',
+                               'strong_freq_max_hz', 'r0_x_m'/'r0_y_m'/'r0_z_m'
     """
     depth_eV = None
     min_freq_hz = None
@@ -222,12 +254,32 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Optional[fl
     mode_spread_hz = None
     center_offset_m = None
 
-    # Depth
+    # ── run_sweep_metrics.py format (flat keys) ───────────────────────────
+    if "radial_depth_core_eV" in report or "strong_freq_min_hz" in report:
+        depth_eV   = safe_float(report.get("radial_depth_core_eV"))
+        min_freq_hz = safe_float(report.get("strong_freq_min_hz"))
+        max_freq_hz = safe_float(report.get("strong_freq_max_hz"))
+        if min_freq_hz is not None and max_freq_hz is not None:
+            mode_spread_hz = max_freq_hz - min_freq_hz
+        x = safe_float(report.get("r0_x_m"))
+        y = safe_float(report.get("r0_y_m"))
+        z = safe_float(report.get("r0_z_m"))
+        vals = [v for v in (x, y, z) if v is not None]
+        if vals:
+            center_offset_m = math.sqrt(sum(v * v for v in vals))
+        return {
+            "depth_eV": depth_eV,
+            "min_freq_hz": min_freq_hz,
+            "max_freq_hz": max_freq_hz,
+            "mode_spread_hz": mode_spread_hz,
+            "center_offset_m": center_offset_m,
+        }
+
+    # ── run_case.py format (nested keys) ─────────────────────────────────
     depth = report.get("depth")
     if isinstance(depth, dict):
         depth_eV = safe_float(depth.get("depth_eV"))
 
-    # Frequencies
     secular = report.get("secular") or report.get("secular_frequencies")
     if isinstance(secular, dict):
         freq_hz = secular.get("freq_hz") or secular.get("frequencies_hz")
@@ -239,12 +291,8 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Optional[fl
                 max_freq_hz = max(freq_vals)
                 mode_spread_hz = max_freq_hz - min_freq_hz
 
-    # Trap center offset from bbox center or origin if not available
-    trap_min = report.get("trap_min") or {}
     r0_si = report.get("r0_SI_m")
     if isinstance(r0_si, list) and r0_si:
-        # Default: norm from origin. Later you can replace this with distance
-        # from expected design axis or from linear-trap center.
         vals = [safe_float(x) for x in r0_si]
         vals = [x for x in vals if x is not None]
         if vals:
@@ -412,7 +460,8 @@ def build_run_case_command(cfg: RunConfig, mesh_path: Path, case_dir: Path, case
 
 def infer_report_path(case_dir: Path, case_prefix: str) -> Optional[Path]:
     candidates = [
-        case_dir / f"{case_prefix}_report.json",
+        case_dir / f"{case_prefix}_sweep.json",    # run_sweep_metrics.py
+        case_dir / f"{case_prefix}_report.json",   # run_case.py
         case_dir / "report.json",
     ]
     for p in candidates:
@@ -420,8 +469,6 @@ def infer_report_path(case_dir: Path, case_prefix: str) -> Optional[Path]:
             return p
 
     # Fallback: search for a single json file in case_dir, excluding params.json
-    # (which is always written by automate.py before run_case.py runs, so it
-    # would otherwise be picked up on failures as a false-positive "report").
     jsons = [p for p in sorted(case_dir.glob("*.json")) if p.name != "params.json"]
     if len(jsons) == 1:
         return jsons[0]
@@ -766,7 +813,7 @@ def build_argparser() -> argparse.ArgumentParser:
                          "Bayesian GP surrogate takes over. Rule of thumb: ~2-3× the "
                          "number of parameters. Default: 5.")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--max-workers", type=int, default=12,
+    ap.add_argument("--max-workers", type=int, default=4,
                     help="Number of concurrent case evaluations to run in separate processes.")
     ap.add_argument("--resume", action="store_true",
                     help="Skip cases already recorded in summary.csv for this workdir.")

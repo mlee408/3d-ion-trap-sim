@@ -10,6 +10,5 @@ outputs/
 results/
 .ipynb_checkpoints/
 .DS_Store
-<<<<<<< HEAD
-=======e
->>>>>>> 12b39b1ba7ad770b2fb3dbe7ee53a95743d5067c
+.vscode/
+sweeps/
