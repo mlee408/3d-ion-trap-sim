@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""
+rf_cell_gen.py  –  Standalone parametric CAD/mesh generator for the 3D RF lattice cell.
+
+All Gmsh coordinates are in millimetres (Gmsh default unit).
+User-facing parameters are in micrometres; the script converts internally.
+
+Elementary structures
+---------------------
+  1. Support beam   – rectangular prism, 56 µm × 56 µm × rf_height
+  2. Lattice beam   – prism with diamond cross section, length 656 µm
+                      diamond: 56 µm horizontal × 82 µm vertical (baseline)
+
+Geometry layout
+---------------
+  • Four support beams at corners, centre-to-centre spacing = 600 µm in x and y.
+  • (window_n + 1) lattice ribs in each direction, creating window_n × window_n windows.
+  • Outer rib positions coincide with support beam centres (±300 µm from origin).
+  • Top of every lattice beam = top of support beam = z = rf_height.
+
+Usage
+-----
+  python rf_cell_gen.py [options]
+
+  --rf_height    H   support beam height [µm]  (default 290)
+  --rf_thickness T   scale factor for lattice beam cross-section (default 1.0)
+  --window_n     N   windows per side (default 2 → 2×2 = 4 windows)
+  --step             also write .step
+  --mesh             also generate and write .msh
+  --no-brep          suppress .brep output
+  --gui              launch Gmsh GUI after build
+
+Baseline example
+----------------
+  python rf_cell_gen.py --rf_height 290 --rf_thickness 1.0 --window_n 2
+
+Smoke-test set (n = 1, 2, 3)
+-----------------------------
+  python rf_cell_gen.py --window_n 1 --rf_height 290 --rf_thickness 1.0
+  python rf_cell_gen.py --window_n 2 --rf_height 290 --rf_thickness 1.0
+  python rf_cell_gen.py --window_n 3 --rf_height 290 --rf_thickness 1.0
+"""
+
+import argparse
+import sys
+
+# ---------------------------------------------------------------------------
+# Baseline geometric constants (all in µm)
+# ---------------------------------------------------------------------------
+SUPPORT_SIDE_UM    = 56.0    # support beam square cross-section side
+SUPPORT_SPACING_UM = 600.0   # centre-to-centre distance between support beams
+LATTICE_LENGTH_UM  = 656.0   # lattice beam length (fixed in v1)
+LATTICE_DH_BASE_UM = 56.0    # baseline horizontal diamond diagonal
+LATTICE_DV_BASE_UM = 82.0    # baseline vertical diamond diagonal
+
+
+def um(x: float) -> float:
+    """Convert µm → mm (Gmsh model unit)."""
+    return x * 1e-3
+
+
+# ---------------------------------------------------------------------------
+# Core builder
+# ---------------------------------------------------------------------------
+
+def build_rf_cell(
+    rf_height: float,
+    rf_thickness: float,
+    window_n: int,
+    out_brep: bool = True,
+    out_step: bool = False,
+    out_mesh: bool = False,
+    gui: bool = False,
+) -> None:
+    """
+    Build one RF lattice cell and export requested file formats.
+
+    Parameters
+    ----------
+    rf_height    : support beam height, also sets top-of-lattice z [µm]
+    rf_thickness : uniform scale factor applied to lattice beam cross-section
+    window_n     : number of windows per side (total windows = window_n²)
+    """
+    import gmsh
+
+    # ── derived dimensions (µm) ──────────────────────────────────────────────
+    half_sp = SUPPORT_SPACING_UM / 2.0               # 300 µm from origin to corner
+    s_half  = SUPPORT_SIDE_UM / 2.0                  # 28 µm half-side of support
+
+    dh = LATTICE_DH_BASE_UM * rf_thickness           # scaled horizontal diagonal
+    dv = LATTICE_DV_BASE_UM * rf_thickness           # scaled vertical diagonal
+    half_l = LATTICE_LENGTH_UM / 2.0                 # 328 µm half-length of lattice beam
+
+    # z coordinates of the lattice beam diamond cross-section
+    z_top    = rf_height          # top vertex (= top of support beam)
+    z_centre = rf_height - dv / 2.0
+    z_bot    = rf_height - dv
+
+    if z_bot < 0.0:
+        print(
+            f"WARNING: lattice beam bottom vertex z = {z_bot:.1f} µm < 0. "
+            "Increase rf_height or reduce rf_thickness.",
+            file=sys.stderr,
+        )
+
+    # ── rib positions along x and y (µm from origin) ────────────────────────
+    if window_n < 1:
+        raise ValueError(f"window_n must be ≥ 1, got {window_n}")
+
+    rib_spacing = SUPPORT_SPACING_UM / window_n   # µm between adjacent ribs
+
+    # Check that adjacent ribs do not overlap (minimum clear gap > 0)
+    min_gap = rib_spacing - dh
+    if min_gap <= 0.0:
+        raise ValueError(
+            f"Invalid geometry: rib spacing {rib_spacing:.1f} µm ≤ lattice beam "
+            f"horizontal width {dh:.1f} µm (gap = {min_gap:.1f} µm). "
+            "Reduce window_n or rf_thickness."
+        )
+
+    # Positions of ribs: n+1 equally spaced from -half_sp to +half_sp
+    rib_pos = [-half_sp + i * rib_spacing for i in range(window_n + 1)]
+
+    # ── Gmsh / OCC setup ─────────────────────────────────────────────────────
+    gmsh.initialize()
+    gmsh.model.add("rf_cell")
+    occ = gmsh.model.occ
+
+    solids: list[tuple[int, int]] = []   # (dim=3, tag) collected before fuse
+
+    # ── 1. Support beams ─────────────────────────────────────────────────────
+    # Four rectangular prisms at the corners of the 600 µm × 600 µm square.
+    corners = [
+        (-half_sp, -half_sp),
+        ( half_sp, -half_sp),
+        ( half_sp,  half_sp),
+        (-half_sp,  half_sp),
+    ]
+    for cx_um, cy_um in corners:
+        tag = occ.addBox(
+            um(cx_um - s_half), um(cy_um - s_half), um(0.0),
+            um(SUPPORT_SIDE_UM), um(SUPPORT_SIDE_UM), um(rf_height),
+        )
+        solids.append((3, tag))
+
+    # ── 2. Lattice beam primitives ───────────────────────────────────────────
+    # Each beam is built by:
+    #   a) drawing the 4-vertex diamond in the cross-section plane at the
+    #      near end of the beam, then
+    #   b) extruding along the beam axis for LATTICE_LENGTH_UM.
+
+    def _diamond_prism_along_x(y_um: float) -> int:
+        """Create a diamond-section prism running along X, centred at y=y_um [µm]."""
+        x0 = um(-half_l)        # starting x position (far left)
+        # Diamond vertices in the Y-Z plane (all at x = x0)
+        p = [
+            occ.addPoint(x0, um(y_um),          um(z_top)),     # top
+            occ.addPoint(x0, um(y_um + dh / 2), um(z_centre)),  # +y (right)
+            occ.addPoint(x0, um(y_um),          um(z_bot)),     # bottom
+            occ.addPoint(x0, um(y_um - dh / 2), um(z_centre)),  # -y (left)
+        ]
+        lines = [
+            occ.addLine(p[0], p[1]),
+            occ.addLine(p[1], p[2]),
+            occ.addLine(p[2], p[3]),
+            occ.addLine(p[3], p[0]),
+        ]
+        loop = occ.addCurveLoop(lines)
+        surf = occ.addPlaneSurface([loop])
+        ext  = occ.extrude([(2, surf)], um(LATTICE_LENGTH_UM), 0.0, 0.0)
+        vols = [tag for dim, tag in ext if dim == 3]
+        return vols[0]
+
+    def _diamond_prism_along_y(x_um: float) -> int:
+        """Create a diamond-section prism running along Y, centred at x=x_um [µm]."""
+        y0 = um(-half_l)        # starting y position (far front)
+        # Diamond vertices in the X-Z plane (all at y = y0)
+        p = [
+            occ.addPoint(um(x_um),          y0, um(z_top)),     # top
+            occ.addPoint(um(x_um + dh / 2), y0, um(z_centre)),  # +x (right)
+            occ.addPoint(um(x_um),          y0, um(z_bot)),     # bottom
+            occ.addPoint(um(x_um - dh / 2), y0, um(z_centre)),  # -x (left)
+        ]
+        lines = [
+            occ.addLine(p[0], p[1]),
+            occ.addLine(p[1], p[2]),
+            occ.addLine(p[2], p[3]),
+            occ.addLine(p[3], p[0]),
+        ]
+        loop = occ.addCurveLoop(lines)
+        surf = occ.addPlaneSurface([loop])
+        ext  = occ.extrude([(2, surf)], 0.0, um(LATTICE_LENGTH_UM), 0.0)
+        vols = [tag for dim, tag in ext if dim == 3]
+        return vols[0]
+
+    # Beams running along X at each rib Y position
+    for y in rib_pos:
+        tag = _diamond_prism_along_x(y)
+        solids.append((3, tag))
+
+    # Beams running along Y at each rib X position
+    for x in rib_pos:
+        tag = _diamond_prism_along_y(x)
+        solids.append((3, tag))
+
+    # ── 3. Boolean fuse ──────────────────────────────────────────────────────
+    occ.synchronize()
+
+    if len(solids) > 1:
+        fused, _ = occ.fuse(
+            [solids[0]], solids[1:],
+            removeObject=True,
+            removeTool=True,
+        )
+    else:
+        fused = solids
+
+    occ.translate(fused, 0.0, 0.0, -0.02)
+    occ.synchronize()
+
+    # ── 4. Export ─────────────────────────────────────────────────────────────
+    t_int = int(round(rf_thickness * 100))
+    stem  = f"rfcell_h{int(rf_height)}_t{t_int:03d}_n{window_n}"
+
+    if out_brep:
+        fname = stem + ".brep"
+        gmsh.write(fname)
+        print(f"  Wrote  {fname}")
+
+    if out_step:
+        fname = stem + ".step"
+        gmsh.write(fname)
+        print(f"  Wrote  {fname}")
+
+    if out_mesh:
+        gmsh.option.setNumber("Mesh.Algorithm3D", 4)        # Frontal-Delaunay
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMin",  um(8.0))
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", um(40.0))
+        gmsh.model.mesh.generate(3)
+        fname = stem + ".msh"
+        gmsh.write(fname)
+        print(f"  Wrote  {fname}")
+
+    if gui:
+        gmsh.fltk.run()
+
+    gmsh.finalize()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="RF lattice cell – parametric CAD/mesh generator (v1)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--rf_height", type=float, default=290.0,
+        help="Support beam height / top-of-lattice z [µm]",
+    )
+    parser.add_argument(
+        "--rf_thickness", type=float, default=1.0,
+        help="Uniform scale factor for lattice beam cross-section",
+    )
+    parser.add_argument(
+        "--window_n", type=int, default=2,
+        help="Number of windows per side (total = window_n²)",
+    )
+    parser.add_argument(
+        "--no-brep", dest="brep", action="store_false", default=True,
+        help="Suppress .brep output",
+    )
+    parser.add_argument(
+        "--step", action="store_true", default=False,
+        help="Also export .step",
+    )
+    parser.add_argument(
+        "--mesh", action="store_true", default=False,
+        help="Also generate and export .msh (3D mesh)",
+    )
+    parser.add_argument(
+        "--gui", action="store_true", default=False,
+        help="Launch Gmsh GUI after build",
+    )
+    args = parser.parse_args()
+
+    print(
+        f"\nRF lattice cell\n"
+        f"  rf_height    = {args.rf_height} µm\n"
+        f"  rf_thickness = {args.rf_thickness}  (scale factor)\n"
+        f"  window_n     = {args.window_n}  "
+        f"({args.window_n}×{args.window_n} = {args.window_n**2} windows, "
+        f"{args.window_n + 1} ribs/side)\n"
+    )
+
+    try:
+        build_rf_cell(
+            rf_height    = args.rf_height,
+            rf_thickness = args.rf_thickness,
+            window_n     = args.window_n,
+            out_brep     = args.brep,
+            out_step     = args.step,
+            out_mesh     = args.mesh,
+            gui          = args.gui,
+        )
+    except ValueError as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print("Done.\n")
+
+
+if __name__ == "__main__":
+    main()
