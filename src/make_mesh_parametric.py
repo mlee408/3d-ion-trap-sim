@@ -30,11 +30,11 @@ import sys
 from pathlib import Path
 
 HERE        = Path(__file__).resolve().parent
-RF_CELL_GEN = HERE / "rf_cell_gen.py"
+RF_CELL_GEN = HERE.parent / "meshes" / "rf_cell_gen.py"
 MESH_SCRIPT = HERE.parent / "meshes" / "run_case.py"
 DC_STEP     = HERE.parent / "meshes" / "step" / "dc.step"
 GND_STEP    = HERE.parent / "meshes" / "step" / "ground.step"
-RF_BASE_STEP = HERE.parent / "meshes" / "step" / "rf_base.step"
+rf_surface_STEP = HERE.parent / "meshes" / "step" / "rf_surface.step"
 
 # Optimised mesh quality settings from sweep_mesh -- update these
 OPT_LC_ELECTRODE = 0.003
@@ -81,7 +81,7 @@ def main() -> int:
         "--window_n",     str(window_n),
         "--rf_height",    str(rf_height),
         "--rf_thickness", str(rf_thickness),
-        "--base-step",    str(RF_BASE_STEP),
+        "--base-step",    str(rf_surface_STEP),
         "--step",
         "--no-brep",
     ]

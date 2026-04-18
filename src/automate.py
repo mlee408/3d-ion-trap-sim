@@ -22,34 +22,19 @@ Typical usage
 
 Example (run from src/ directory)
 -------
-python automate.py \
-  --run-case ./run_case.py \
-  --mesh-template "python ../meshes/run_case.py \
-    --rf ../meshes/step/rf.step \
-    --dc ../meshes/step/dc.step \
-    --ground ../meshes/step/ground.step \
-    --lc-electrode {lc_electrode} \
-    --lc-center {lc_center} \
-    --lc-far {lc_far} \
-    --pad-z-top {pad_z_top} \
-    --nopopup \
-    --out {mesh_path}" \
-  --workdir ./sweep_002 \
-  --rf-tags 1 \
-  --ground-tags 3 \
-  --outer-tags 4 \
-  --param lc_electrode:0.002:0.008 \
-  --param lc_center:0.003:0.010 \
-  --param lc_far:0.020:0.060 \
-  --param pad_z_top:0.300:0.800 \
-  --degree 2 \
-  --mass-amu 40.0 \
-  --charge-e 1.0 \
-  --rf-freq 40e6 \
-  --vrf 150 \
-  --coord-unit 1e-3 \
-  --n-cases 20 \
-  --seed 42
+for N in 1 2 3 4; do
+  python automate.py \
+    --run-case "$(pwd)/run_case.py" \
+    --mesh-template "python $(pwd)/make_mesh_parametric.py --window-n $N --rf-height {rf_height} --rf-thickness {rf_thickness} --out {mesh_path}" \
+    --workdir ./sweep_geom_n${N} \
+    --rf-tags 1 --ground-tags 3 --outer-tags 4 \
+    --r0-z-min 0.0 --r0-z-max 0.15 \
+    --param rf_height:200.0:400.0 \
+    --param rf_thickness:0.5:2.0 \
+    --degree 2 --mass-amu 40.0 --charge-e 1.0 \
+    --rf-freq 40e6 --vrf 150 --coord-unit 1e-3 \
+    --n-cases 15 --n-random-start 5 --seed 42
+done
 """
 
 import argparse
