@@ -9,3 +9,6 @@ __pycache__/
 outputs/
 results/
 .ipynb_checkpoints/
+.DS_Store
+.vscode/
+**/ .DS_Store
