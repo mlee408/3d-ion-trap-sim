@@ -1,0 +1,38 @@
+{
+  "mesh": "../meshes/trap_2j.msh",
+  "prefix": "trap_2j",
+  "r0_x_m": 0.00028653635522498874,
+  "r0_y_m": -2.837162177662162e-07,
+  "r0_z_m": 8.30175205728222e-05,
+  "freq1_hz": 4070.524554764482,
+  "freq2_hz": 53774.025090586256,
+  "freq3_hz": 64425.88981096036,
+  "strong_freq_min_hz": 4070.524554764482,
+  "strong_freq_max_hz": 64425.88981096036,
+  "radial_depth_core_eV": 9.054533764303387e-05,
+  "transport_barrier_xscan_eV": 9.788100653865198e-06,
+  "transport_barrier_eigvec_eV": 9.737501341048882e-06,
+  "h_used": 0.049468104961357715,
+  "success": true,
+  "notes": null,
+  "rf_freq_Hz": 40000000.0,
+  "vrf_V": 1.0,
+  "mass_amu": 40.0,
+  "charge_e": 1.0,
+  "degree": 2,
+  "coord_unit_m_per_mesh": 0.001,
+  "r0_search_bounds_mesh": {
+    "x": [
+      0.2,
+      0.4
+    ],
+    "y": [
+      -0.05,
+      0.05
+    ],
+    "z": [
+      0.0,
+      0.12
+    ]
+  }
+}

@@ -3,9 +3,9 @@
 make_mesh_parametric.py
 
 Wrapper for the geometry sweep using rf_cell_gen.py (partner's parametric
-RF cell generator) + meshes/run_case.py (mesh pipeline).
+RF cell generator) + geometry/assemble_mesh.py (mesh pipeline).
 
-Place this file in src/ alongside automate.py and rf_cell_gen.py.
+Place this file in scripts/.
 
 Parameters swept by automate.py:
     {window_n}      -- windows per side (1/2/3/4 -> 1/4/9/16 openings)
@@ -14,7 +14,7 @@ Parameters swept by automate.py:
 
 Mesh quality defaults: update OPT_* with best values from sweep_mesh.
 
-Example --mesh-template for automate.py (run from src/):
+Example --mesh-template for automate.py (run from scripts/):
     python $(pwd)/make_mesh_parametric.py \
         --window-n {window_n} \
         --rf-height {rf_height} \
@@ -29,12 +29,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-HERE        = Path(__file__).resolve().parent
-RF_CELL_GEN = HERE.parent / "meshes" / "rf_cell_gen.py"
-MESH_SCRIPT = HERE.parent / "meshes" / "run_case.py"
-DC_STEP     = HERE.parent / "meshes" / "step" / "dc.step"
-GND_STEP    = HERE.parent / "meshes" / "step" / "ground.step"
-rf_surface_STEP = HERE.parent / "meshes" / "step" / "rf_surface.step"
+HERE        = Path(__file__).resolve().parent   # scripts/
+ROOT        = HERE.parent                        # trap_sim/
+RF_CELL_GEN = ROOT / "geometry" / "rf_cell_gen.py"
+MESH_SCRIPT = ROOT / "geometry" / "assemble_mesh.py"
+DC_STEP     = ROOT / "cad" / "base" / "dc.step"
+GND_STEP    = ROOT / "cad" / "base" / "ground.step"
+rf_surface_STEP = ROOT / "cad" / "base" / "rf_surface.step"
 
 # Optimised mesh quality settings from sweep_mesh -- update these
 OPT_LC_ELECTRODE = 0.003

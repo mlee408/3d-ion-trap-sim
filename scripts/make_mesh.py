@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-make_mesh.py  — thin wrapper around meshes/run_case.py for use with automate.py.
+make_mesh.py  — thin wrapper around geometry/assemble_mesh.py for use with automate.py.
 
-Place this file in src/ (next to automate.py).  automate.py calls it via
---mesh-template with the four mesh-quality parameters substituted in.
+Place this file in scripts/.  automate.py calls it via --mesh-template with
+the four mesh-quality parameters substituted in.
 
 Usage (handled automatically by automate.py):
     python make_mesh.py \
@@ -13,8 +13,7 @@ Usage (handled automatically by automate.py):
         --pad-z-top 0.600 \
         --out /path/to/case_XXXX/mesh.msh
 
-The STEP file paths are resolved relative to this script's location,
-so this file must stay in src/ alongside automate.py.
+The STEP file paths are resolved relative to this script's location.
 """
 
 from __future__ import annotations
@@ -24,14 +23,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent          # src/
-REPO_ROOT = HERE.parent                          # 3d-ion-trap-sim/
-MESH_SCRIPT = REPO_ROOT / "meshes" / "run_case.py"
-STEP_DIR = REPO_ROOT / "meshes" / "step"
+HERE = Path(__file__).resolve().parent          # scripts/
+REPO_ROOT = HERE.parent                          # trap_sim/
+MESH_SCRIPT = REPO_ROOT / "geometry" / "assemble_mesh.py"
 
-RF_STEP     = STEP_DIR / "rf.step"
-DC_STEP     = STEP_DIR / "dc.step"
-GROUND_STEP = STEP_DIR / "ground.step"
+RF_STEP     = REPO_ROOT / "cad" / "base" / "rf.step"
+DC_STEP     = REPO_ROOT / "cad" / "base" / "dc.step"
+GROUND_STEP = REPO_ROOT / "cad" / "base" / "ground.step"
 
 
 def main() -> int:
