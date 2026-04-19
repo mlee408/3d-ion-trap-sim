@@ -50,20 +50,6 @@ python automate.py \
   --coord-unit 1e-3 \
   --n-cases 20 \
   --seed 42
-
-  for N in 1 2 3 4; do
-  python automate.py \
-    --run-case "$(pwd)/run_sweep_metrics.py" \
-    --mesh-template "python $(pwd)/../scripts/make_mesh_parametric.py --window-n $N --rf-height {rf_height} --rf-thickness {rf_thickness} --out {mesh_path}" \
-    --workdir ./sweep_geom_n${N} \
-    --rf-tags 1 --ground-tags 3 --outer-tags 4 \
-    --r0-z-min 0.0 --r0-z-max 0.15 \
-    --param rf_height:200.0:400.0 \
-    --param rf_thickness:0.5:2.0 \
-    --degree 2 --mass-amu 40.0 --charge-e 1.0 \
-    --rf-freq 40e6 --vrf 150 --coord-unit 1e-3 \
-    --n-cases 15 --n-random-start 5 --seed 42
-done
 """
 
 import argparse
@@ -401,6 +387,11 @@ def generate_mesh(
 
 
 def build_run_case_command(cfg: RunConfig, mesh_path: Path, case_dir: Path, case_prefix: str) -> List[str]:
+    # Detect whether we are calling run_sweep_metrics.py (lightweight) or
+    # run_case.py (full). run_sweep_metrics.py does not accept --h,
+    # --depth-ray-length, or --no-depth.
+    is_sweep = cfg.run_case_py.name == "run_sweep_metrics.py"
+
     cmd: List[str] = [
         sys.executable,
         str(cfg.run_case_py.resolve()),
@@ -410,17 +401,20 @@ def build_run_case_command(cfg: RunConfig, mesh_path: Path, case_dir: Path, case
         "--rf-freq", str(cfg.rf_freq),
         "--mass-amu", str(cfg.mass_amu),
         "--charge-e", str(cfg.charge_e),
-        "--h", str(cfg.h),
-        "--depth-ray-length", str(cfg.depth_ray_length),
         "--depth-nrays", str(cfg.depth_nrays),
         "--prefix", case_prefix,
         "--vrf", str(cfg.vrf),
     ]
 
+    # run_case.py-only arguments
+    if not is_sweep:
+        cmd.extend(["--h", str(cfg.h)])
+        cmd.extend(["--depth-ray-length", str(cfg.depth_ray_length)])
+        if cfg.no_depth:
+            cmd.append("--no-depth")
+
     if cfg.coord_unit is not None:
         cmd.extend(["--coord-unit", str(cfg.coord_unit)])
-    if cfg.no_depth:
-        cmd.append("--no-depth")
 
     # RF-null search bounds
     if cfg.r0_z_min is not None:
