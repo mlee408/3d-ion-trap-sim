@@ -1,0 +1,43 @@
+{
+  "_description": "Single-case reference for the 4-window half-thickness 3D RF sample",
+  "_geometry": {
+    "window_n": 2,
+    "window_count": 4,
+    "rf_height_um": 145.0,
+    "rf_height_baseline_um": 290.0,
+    "rf_thickness_scale": 1.0,
+    "window_clear_width_um": 244.0,
+    "rib_spacing_um": 300.0,
+    "note_thickness": "rf_height halved from 290→145 µm (50% of baseline main 3D RF body height)"
+  },
+  "_run": {
+    "mesh": "../meshes/generated/rf_4win_halft_h145_t100.msh",
+    "result_dir": "../results/4win_halft_single",
+    "result_file": "../results/4win_halft_single/win4halft_sweep.json",
+    "run_command": "cd src && /path/to/fenicsx/python run_sweep_metrics.py --mesh ../meshes/generated/rf_4win_halft_h145_t100.msh --outdir ../results/4win_halft_single --prefix win4halft --rf-tags 1 --ground-tags 3 --outer-tags 4 --degree 2 --rf-freq 40e6 --mass-amu 40.0 --charge-e 1.0 --vrf 150 --coord-unit 1e-3 --r0-z-min 0.13 --r0-z-max 0.45 --depth-nrays 24"
+  },
+  "_physical_tags": {
+    "RF": 1,
+    "DC": 2,
+    "GROUND": 3,
+    "OUTER": 4,
+    "VACUUM_VOL": 100
+  },
+  "r0_x_m": 4.8e-06,
+  "r0_y_m": -1.09e-05,
+  "r0_z_m": 3.972e-04,
+  "freq1_hz": 45055.0,
+  "freq2_hz": 50249.0,
+  "freq3_hz": 70127.0,
+  "radial_depth_core_eV": 7.25e-06,
+  "transport_barrier_xscan_eV": 3.91e-05,
+  "success": true,
+  "physical_min_ok": false,
+  "note_physics": "r0 drifted to far-field vacuum (z=397 µm >> cage top 125 µm). The 3D cage geometry at default voltages/params does not form a strong RF null in the above-cage region with this search range. The far-field minimum is an artefact of Psi→0 at the Neumann boundary, not a real trap. Re-run with explicit r0 in cage window region (z~60–80 µm, x/y offset from rib centers) for a physics-meaningful result.",
+  "rf_freq_Hz": 40000000.0,
+  "vrf_V": 150.0,
+  "mass_amu": 40.0,
+  "charge_e": 1.0,
+  "degree": 2,
+  "coord_unit_m_per_mesh": 0.001
+}

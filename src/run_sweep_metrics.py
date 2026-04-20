@@ -58,7 +58,12 @@ def main() -> None:
     ap.add_argument("--r0-z-max", type=float, default=None)
     ap.add_argument(
         "--r0-search-margin", type=float, default=5.0e-5,
-        help="Physical margin (m) above RF electrode top for z_max auto-detect (default 50 µm).",
+        help="Physical margin in metres for z_max auto-detect (default 5e-5 m = 50 µm). "
+             "For 3D blade/rail traps (electrode top > this margin in metres): margin is "
+             "SUBTRACTED from electrode top to exclude the electrode-tip saddle-point artifact. "
+             "For surface traps (electrode top ≈ 0): margin is added above the electrode. "
+             "Override entirely with explicit --r0-z-max (e.g. --r0-z-max 0.12 for mm-unit "
+             "mesh with ~82 µm expected trap height).",
     )
     ap.add_argument(
         "--r0-x-auto", action="store_true",
@@ -131,6 +136,11 @@ def main() -> None:
 
     gnd_electrode_tags = [t for t in args.ground_tags if t not in outer_tags]
 
+    if rank == 0:
+        print(f"[BC] RF Dirichlet tags : {args.rf_tags}  (φ = 1 V)")
+        print(f"[BC] GND Dirichlet tags: {gnd_electrode_tags}  (φ = 0 V)")
+        print(f"[BC] Neumann (outer)   : {sorted(outer_tags)}  (∂φ/∂n = 0)")
+
     bc_map_rf: Dict[int, float] = {tag: 1.0 for tag in args.rf_tags}
     bc_map_rf.update({tag: 0.0 for tag in gnd_electrode_tags})
 
@@ -175,10 +185,25 @@ def main() -> None:
             )
             z_electrode_top = float(domain.geometry.x[rf_nodes, 2].max())
             margin_mesh = args.r0_search_margin / coord_unit   # metres → mesh units
-            r0_z_max = z_electrode_top + margin_mesh
+            # 3D blade/rail traps: ion is trapped INSIDE the electrode structure
+            # (ion height << electrode_top).  The electrode-tip region just below
+            # the blade top has a saddle-point artifact where |∇φ|→0 from the
+            # geometry transition.  Adding margin above pushes z_max further into
+            # this artifact zone.  For 3D traps we must SUBTRACT the margin to
+            # restrict the search below the electrode top.
+            # Surface traps: electrode near z=0, ion above → add margin.
+            # Heuristic: electrode_top in metres > r0_search_margin → 3D trap.
+            _elec_top_m = z_electrode_top * coord_unit  # physical metres
+            if _elec_top_m > args.r0_search_margin:
+                r0_z_max = z_electrode_top - margin_mesh  # 3D trap: exclude tip artifact
+                _margin_dir = "below electrode top"
+            else:
+                r0_z_max = z_electrode_top + margin_mesh  # surface trap: above electrode
+                _margin_dir = "above electrode top"
             if rank == 0:
-                print(f"[r0 search] z_electrode_top={z_electrode_top:.4g} mesh units, "
-                      f"margin={margin_mesh:.4g} → z_max={r0_z_max:.4g}")
+                print(f"[r0 search] z_electrode_top={z_electrode_top:.4g} mesh units "
+                      f"({_elec_top_m*1e6:.1f} µm)  margin={margin_mesh:.4g} ({_margin_dir})"
+                      f"  → z_max={r0_z_max:.4g} mesh units")
         except Exception as _e:
             if rank == 0:
                 print(f"[r0 search] z_max auto-detect failed ({_e}); no z bound applied.")
@@ -230,6 +255,38 @@ def main() -> None:
               f"y=[{r0_y_min},{r0_y_max}]  "
               f"z=[{r0_z_min},{r0_z_max}]")
 
+    # ── Debug: z-distribution of low-Ψ interior DOFs in the search window ───
+    # Print where the bottom-5% Ψ cluster sits in z BEFORE the minimum finder
+    # runs.  A cluster near z_electrode_top indicates an electrode-tip artifact;
+    # a cluster near the expected trap height indicates a healthy search domain.
+    if rank == 0:
+        try:
+            _V = Psi.function_space
+            _n_owned = _V.dofmap.index_map.size_local
+            _raw_coords = _V.tabulate_dof_coordinates().reshape(-1, 3)
+            _vals = Psi.x.array[:_n_owned]
+            _z_all = _raw_coords[:_n_owned, 2]
+            _zmask = (
+                (_vals >= 0)
+                & (_z_all >= (r0_z_min if r0_z_min is not None else -np.inf))
+                & (_z_all <= (r0_z_max if r0_z_max is not None else np.inf))
+            )
+            if _zmask.any():
+                _z_cand = _z_all[_zmask]
+                _v_cand = _vals[_zmask]
+                _p5 = float(np.percentile(_v_cand, 5))
+                _low_z = _z_cand[_v_cand <= _p5]
+                _pct = np.percentile(_low_z, [5, 25, 50, 75, 95])
+                print(f"[r0 debug] z of bottom-5%% Ψ DOFs in window "
+                      f"[{r0_z_min},{r0_z_max}] mesh units:")
+                print(f"  z percentiles [5,25,50,75,95] = "
+                      f"{[f'{v:.4g}' for v in _pct]} mesh units")
+                print(f"  → in µm: {[f'{v*coord_unit*1e6:.1f}' for v in _pct]}")
+                print(f"  (target: cluster near expected trap height "
+                      f"~{82:.0f} µm = {82e-6/coord_unit:.4g} mesh units)")
+        except Exception as _de:
+            print(f"[r0 debug] z-distribution check failed: {_de}")
+
     # ── Find trap minimum ────────────────────────────────────────────────────
     mininfo = metrics.find_minimum_cg1(
         Psi, comm=comm,
@@ -238,11 +295,11 @@ def main() -> None:
         z_min=r0_z_min, z_max=r0_z_max,
     )
 
-    r0_SI = np.array(mininfo.r_min) * coord_unit
+    _r0_SI_coarse = np.array(mininfo.r_min) * coord_unit
 
     if rank == 0:
-        print(f"[trap min] r0={mininfo.r_min.tolist()}, Psi_min={mininfo.psi_min:.4e} J")
-        print(f"[trap min] r0_SI={r0_SI.tolist()} m")
+        print(f"[trap min] r0 (coarse)={mininfo.r_min.tolist()}, Psi_min={mininfo.psi_min:.4e} J")
+        print(f"[trap min] r0_SI (coarse, pre-refinement)={_r0_SI_coarse.tolist()} m")
 
     # Hard-reject minimum below DC surface
     if mininfo.r_min.shape[0] >= 3 and float(mininfo.r_min[2]) < 0.0:
@@ -280,6 +337,12 @@ def main() -> None:
     )
     sec   = post["sec"]
     depth = post["depth"]
+    hessian_status = post.get("hessian_status", "unknown")
+
+    # Use the extra-refined r0 (updated inside compute_post_r0_metrics) for
+    # all output quantities — it may differ slightly from mininfo.r_min.
+    r0_final = np.array(post.get("r0_refined", mininfo.r_min.tolist()), dtype=np.float64)
+    r0_SI    = r0_final * coord_unit
 
     # ── Compute strong-mode frequencies (top 2 by magnitude) ────────────────
     # Sort all positive-eigenvalue frequencies descending and take the top two.
@@ -299,17 +362,20 @@ def main() -> None:
         n_strong      = len(all_pos)                            # total positive modes
         strong_modes_ok = n_strong >= 2
 
-        z_um = float(mininfo.r_min[2]) * coord_unit * 1e6 if mininfo.r_min.shape[0] >= 3 else float("nan")
+        z_um = float(r0_final[2]) * coord_unit * 1e6 if r0_final.shape[0] >= 3 else float("nan")
         physical_min_ok = (
-            mininfo.r_min.shape[0] >= 3
-            and float(mininfo.r_min[2]) > 0.0
-            and (r0_z_max is None or float(mininfo.r_min[2]) < 0.85 * r0_z_max)
+            r0_final.shape[0] >= 3
+            and float(r0_final[2]) > 0.0
+            and (r0_z_max is None or float(r0_final[2]) < 0.85 * r0_z_max)
+            and hessian_status in ("valid", "borderline_numeric")
         )
 
         print(f"[sweep] h_used={sec['h']:.3e}  all_freq_hz={[f'{f:.4e}' for f in freqs]}")
         print(f"[sweep result]  r0.z={z_um:.2f} µm  "
               f"strong_freqs=[{strong_fmin/1e6:.3f}, {strong_fmax/1e6:.3f}] MHz  "
               f"radial_depth={depth.get('radial_depth_core_eV')} eV  "
+              f"depth_z={depth.get('depth_z_eV')} eV (paper-comparable)  "
+              f"depth_y={depth.get('depth_y_eV')} eV  "
               f"xscan_barrier={depth.get('transport_barrier_xscan_eV')} eV")
 
     # ── Build compact JSON record ────────────────────────────────────────────
@@ -326,6 +392,16 @@ def main() -> None:
             # top-2 radial confinement modes (axial excluded)
             "strong_freq_min_hz": strong_fmin,
             "strong_freq_max_hz": strong_fmax,
+            # ── Axis-specific depth (paper-comparable; no electrode-hit exclusion) ──
+            "depth_z_eV": depth.get("depth_z_eV"),          # min(+z, -z) barrier
+            "depth_z_plus_eV": depth.get("depth_z_plus_eV"),
+            "depth_z_minus_eV": depth.get("depth_z_minus_eV"),
+            "depth_z_interior": depth.get("depth_z_interior"),
+            "depth_y_eV": depth.get("depth_y_eV"),          # min(+y, -y) barrier
+            "depth_y_plus_eV": depth.get("depth_y_plus_eV"),
+            "depth_y_minus_eV": depth.get("depth_y_minus_eV"),
+            "depth_y_interior": depth.get("depth_y_interior"),
+            # ── Fibonacci-sphere radial depth (electrode-hit rays excluded) ──
             "radial_depth_core_eV": depth.get("radial_depth_core_eV"),
             "transport_barrier_xscan_eV": depth.get("transport_barrier_xscan_eV"),
             "transport_barrier_eigvec_eV": depth.get("transport_barrier_eigvec_eV"),
@@ -333,6 +409,12 @@ def main() -> None:
             # status flags for sweep filtering
             "physical_min_ok": physical_min_ok,
             "strong_modes_ok": strong_modes_ok,
+            # Hessian validity: "valid" | "borderline_numeric" | "invalid_saddle"
+            # "borderline_numeric" means a tiny negative eigenvalue within the
+            # numerical-noise tolerance (|λ_neg|/max(λ_pos) < 1e-3); results are
+            # accepted but flagged.  "invalid_saddle" never appears here because
+            # compute_post_r0_metrics raises RuntimeError before reaching this code.
+            "hessian_status": hessian_status,
             "success": True,
             "notes": None,
             # sweep parameters for traceability

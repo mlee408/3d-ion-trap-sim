@@ -213,7 +213,33 @@ def compute_post_r0_metrics(
 
     r0 = np.asarray(r0, dtype=np.float64)
 
-    # ── Consistency diagnostics (temporary — remove after validation) ────────
+    # ── 0. Mesh scale + extra local refinement ───────────────────────────────
+    # A second refinement pass (finer step than find_minimum_cg1's default
+    # 5-round, 0.4×h_mesh pass) reduces gradient residual before the Hessian.
+    # Uses 8 halving rounds starting at 0.2×h_mesh (final step ≈ 0.00078×h_mesh).
+    _h_mesh = metrics._estimate_cell_h(Psi.function_space.mesh)
+    _psi_r0_before = float(metrics.eval_function_at_points(
+        Psi, np.array([r0], dtype=np.float64), comm=comm
+    )[0])
+    _r0_extra, _psi_r0_after = metrics.refine_minimum(
+        Psi, r0, comm=comm, h=_h_mesh * 0.2, n_rounds=8,
+    )
+    if np.isfinite(_psi_r0_after) and _psi_r0_after < _psi_r0_before:
+        r0 = _r0_extra
+        _refine_msg = (f"Ψ improved {_psi_r0_before:.4e} → {_psi_r0_after:.4e}"
+                       f"  (Δ={_psi_r0_after - _psi_r0_before:.2e})  r0 updated")
+    else:
+        _refine_msg = f"already at local minimum ({_psi_r0_before:.4e}); r0 unchanged"
+    if comm.rank == 0:
+        print(f"[r0 refine] extra pass (h={_h_mesh*0.2:.3e}, 8 rounds): {_refine_msg}")
+
+    # Dedicated Hessian step: cap at 2×h_mesh.
+    # Callers supply a coarse step (typically 3×h_mesh) for broad search; the
+    # final curvature estimate needs a tighter local step to stay in the
+    # quadratic regime of Ψ near the RF null.
+    _h_hessian = min(float(h), _h_mesh * 2.0)
+
+    # ── Consistency diagnostics ───────────────────────────────────────────────
     if comm.rank == 0:
         try:
             _elem = Psi.function_space.ufl_element()
@@ -225,46 +251,129 @@ def compute_post_r0_metrics(
         print(f"[consistency] vrf            = {vrf!r} V")
         print(f"[consistency] coord_unit     = {coord_unit:.4e} m/mesh_unit")
         print(f"[consistency] m_kg           = {m_kg:.6e} kg")
-        print(f"[consistency] h (Hessian)    = {h:.4e} mesh units")
+        print(f"[consistency] h (caller)     = {h:.4e} mesh units")
+        print(f"[consistency] h_hessian      = {_h_hessian:.4e} mesh units  "
+              f"(min(caller, 2×h_mesh={_h_mesh*2:.3e}))")
         print(f"[consistency] ray_length     = {ray_length:.4e} mesh units")
 
     # ── 1. Secular frequencies on UNCLIPPED Psi ─────────────────────────────
     sec = metrics.secular_frequencies_from_pseudopotential(
-        Psi, m_kg=m_kg, r0=r0, h=h, comm=comm,
+        Psi, m_kg=m_kg, r0=r0, h=_h_hessian, comm=comm,
         coord_scale=coord_unit, v_rf=vrf,
     )
-
     eigvals = sec["eigvals"]   # list (from SecularFrequencies.to_jsonable)
+    _h_used = float(sec["h"])  # actual step used after numerical_hessian auto-scale
 
-    # ── 2. Eigenvalue validation ─────────────────────────────────────────────
+    # ── 2. Gradient + Hessian debug output ───────────────────────────────────
+    # Gradient at r0 (central differences, same step as Hessian).
+    # Should be near zero at a true stationary point.
+    # All ranks must call eval_function_at_points (MPI Allreduce inside).
+    _gdim = int(r0.shape[0])
+    _grad = np.zeros(_gdim)
+    for _i in range(_gdim):
+        _ei = np.zeros(_gdim); _ei[_i] = 1.0
+        _fp = float(metrics.eval_function_at_points(
+            Psi, np.array([r0 + _h_used * _ei], dtype=np.float64), comm=comm
+        )[0])
+        _fm = float(metrics.eval_function_at_points(
+            Psi, np.array([r0 - _h_used * _ei], dtype=np.float64), comm=comm
+        )[0])
+        _grad[_i] = (_fp - _fm) / (2.0 * _h_used)
+    _grad_norm = float(np.linalg.norm(_grad))
+    _H = np.array(sec["hessian"])
+    _H_frob = float(np.linalg.norm(_H, "fro"))
+    # Relative gradient: |∇Ψ| / (|H|_F × h).  < 0.1 → near stationary point.
+    _grad_rel = _grad_norm / (_H_frob * _h_used + 1e-300)
+
+    if comm.rank == 0:
+        print(f"[hessian] h_used={_h_used:.3e} mesh units")
+        print("[hessian] Hessian matrix (J/mesh_unit²):")
+        for _row in _H:
+            print(f"  {np.array2string(_row, precision=4, suppress_small=True)}")
+        print(f"[hessian] eigenvalues (J/mesh_unit²): "
+              f"{[f'{ev:.4e}' for ev in eigvals]}")
+        print(f"[hessian] frequencies (MHz): "
+              f"{[f'{f/1e6:.4f}' for f in sec['freq_hz']]}")
+        print(f"[gradient] ∇Ψ at r0 (J/mesh_unit): "
+              f"{np.array2string(_grad, precision=3, suppress_small=True)}")
+        print(f"[gradient] |∇Ψ|={_grad_norm:.3e}  |H|_F={_H_frob:.3e}  "
+              f"rel=|∇Ψ|/(|H|·h)={_grad_rel:.3e}  (< 0.1 → near stationary)")
+
+    # ── 3. Eigenvalue validation with relative-magnitude tolerance ───────────
+    # Classification logic:
+    #   valid            — all eigenvalues ≥ 0
+    #   borderline_numeric — some negative but |λ_neg|/max(λ_pos) < _REL_TOL
+    #                        (numerical noise in near-zero axial mode; accepted)
+    #   invalid_saddle   — |λ_neg|/max(λ_pos) ≥ _REL_TOL (true saddle point)
+    #
+    # Physical basis: in a linear Paul trap with no DC axial voltage, the RF
+    # pseudopotential has near-zero curvature along x (the trap axis).  FEM
+    # discretisation noise (machine-ε × FEM condition number) can make this
+    # tiny eigenvalue go slightly negative.  The ratio |λ_neg|/max(λ_pos) for
+    # this noise is typically < 10⁻³; genuine saddle points have ratios > 0.1.
+    _REL_TOL = 1e-3   # 0.1 % of dominant positive eigenvalue
     n_neg = sum(1 for ev in eigvals if ev < 0)
-    if n_neg > 0 and comm.rank == 0:
-        _w.warn(
-            f"[secular] Hessian has {n_neg} negative eigenvalue(s): {eigvals}. "
-            "r0 is not a true local Ψ minimum (it may be a saddle point or an "
-            "electrode-adjacent artifact). "
-            "Tighten --r0-z-min / --r0-z-max / --r0-x-min / --r0-x-max so the "
-            "search stays inside the physical trapping corridor. "
-            f"Current r0={r0.tolist()} (mesh units).",
-            RuntimeWarning,
-            stacklevel=3,
-        )
+    hessian_status = "valid"
 
-    if all(ev < 0 for ev in eigvals):
-        raise RuntimeError(
-            "[secular] All Hessian eigenvalues are negative — r0 is not a local "
-            "minimum at all.  Re-run with tighter search bounds, e.g.: "
-            f"--r0-z-min 0.02 --r0-z-max 0.12  (current r0.z = "
-            f"{float(r0[2]) if r0.shape[0] >= 3 else 'N/A':.4g})"
-        )
+    if n_neg > 0:
+        _max_pos = max((ev for ev in eigvals if ev > 0), default=0.0)
+        _neg_evs = [ev for ev in eigvals if ev < 0]
+        _rel_mags = [
+            abs(ev) / _max_pos if _max_pos > 0 else float("inf")
+            for ev in _neg_evs
+        ]
+        _n_phys_neg = sum(1 for rm in _rel_mags if rm >= _REL_TOL)
 
-    # ── 3. Transport direction from weakest secular mode ─────────────────────
+        if comm.rank == 0:
+            print(f"[hessian] negative eigenvalues: {[f'{ev:.4e}' for ev in _neg_evs]}")
+            print(f"[hessian] |λ_neg|/max(λ_pos):   {[f'{rm:.3e}' for rm in _rel_mags]}"
+                  f"  (threshold {_REL_TOL:.0e})")
+
+        if _n_phys_neg > 0:
+            hessian_status = "invalid_saddle"
+            _r0z = f"{float(r0[2]):.4g}" if r0.shape[0] >= 3 else "N/A"
+            raise RuntimeError(
+                f"[secular] {_n_phys_neg} physically significant negative eigenvalue(s):\n"
+                f"  eigenvalues:           {[f'{ev:.4e}' for ev in eigvals]}\n"
+                f"  |λ_neg|/max(λ_pos):   {[f'{rm:.3e}' for rm in _rel_mags if rm >= _REL_TOL]}"
+                f" ≥ {_REL_TOL:.0e}\n"
+                f"  r0={r0.tolist()} mesh units  (r0.z={_r0z})\n"
+                "r0 is a saddle point or electrode-adjacent artifact.  "
+                "Tighten search bounds (--r0-z-max / --r0-z-min) so the search "
+                "stays inside the physical trapping corridor."
+            )
+        else:
+            hessian_status = "borderline_numeric"
+            if comm.rank == 0:
+                _w.warn(
+                    f"[secular] {n_neg} negative eigenvalue(s) within numerical tolerance:\n"
+                    f"  eigenvalues:         {[f'{ev:.4e}' for ev in eigvals]}\n"
+                    f"  |λ_neg|/max(λ_pos): {[f'{rm:.3e}' for rm in _rel_mags]}"
+                    f" < {_REL_TOL:.0e}\n"
+                    f"  gradient residual:  |∇Ψ|={_grad_norm:.2e}  rel={_grad_rel:.2e}\n"
+                    "  Likely FEM discretisation noise in the near-zero axial mode of a\n"
+                    "  linear trap (RF pseudopotential has zero axial curvature without DC).\n"
+                    "  Accepted as valid minimum; clipped eigenvalues max(λ,0) used for\n"
+                    "  frequency computation.  Mark 'hessian_status=borderline_numeric'.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+
+    if comm.rank == 0:
+        _cls_labels = {
+            "valid":              "valid local minimum ✓",
+            "borderline_numeric": "borderline — numerical noise, accepted with warning",
+            "invalid_saddle":     "INVALID — saddle point, results discarded",
+        }
+        print(f"[hessian] classification: {_cls_labels.get(hessian_status, hessian_status)}")
+
+    # ── 4. Transport direction from weakest secular mode ─────────────────────
     eigvals_arr = np.array(eigvals)
     eigvecs_arr = np.array(sec["eigvecs"])
     weak_idx = int(np.argmin(eigvals_arr))
     transport_eigvec = eigvecs_arr[:, weak_idx]
 
-    # ── 4. Clipped Psi (non-negative) for depth rays and XDMF ───────────────
+    # ── 5. Clipped Psi (non-negative) for depth rays and XDMF ───────────────
     Psi_clipped = fem.Function(Psi.function_space)
     Psi_clipped.x.array[:] = np.maximum(Psi.x.array, 0.0)
     Psi_clipped.name = "Psi_rf"
@@ -272,14 +381,12 @@ def compute_post_r0_metrics(
         print(f"[consistency] Psi_clipped (depth input): type={type(Psi_clipped).__name__}  "
               f"name={Psi_clipped.name!r}  same_space={Psi_clipped.function_space is Psi.function_space}")
 
-    # ── 5. Ψ₀ from the CLIPPED field at r0 ──────────────────────────────────
-    # Using the clipped field ensures trap_min.Psi_min_J and depth.Psi0_J are
-    # consistent (both from the same Psi_clipped, without Gibbs-ringing ambiguity).
+    # ── 6. Ψ₀ from the CLIPPED field at r0 ──────────────────────────────────
     psi_min_clipped = float(metrics.eval_function_at_points(
         Psi_clipped, np.array([r0], dtype=np.float64), comm=comm
     )[0])
 
-    # ── 6. Depth metrics ─────────────────────────────────────────────────────
+    # ── 7. Depth metrics ─────────────────────────────────────────────────────
     depth = None
     if compute_depth:
         depth = metrics.estimate_trap_depth_by_rays(
@@ -295,6 +402,13 @@ def compute_post_r0_metrics(
         "Psi_clipped": Psi_clipped,
         "transport_eigvec": transport_eigvec,
         "psi_min_clipped": psi_min_clipped,
+        # Hessian validity classification:
+        #   "valid"              — all eigenvalues ≥ 0
+        #   "borderline_numeric" — tiny negative eigenvalue(s), within _REL_TOL
+        #   "invalid_saddle"     — significant negative eigenvalue (never reached,
+        #                          function raises RuntimeError before this return)
+        "hessian_status": hessian_status,
+        "r0_refined": r0.tolist(),   # r0 after extra local refinement
     }
 
 
@@ -348,15 +462,13 @@ def main():
     )
     ap.add_argument(
         "--r0-search-margin", type=float, default=5.0e-5,
-        help="Physical margin (metres) added above the RF electrode top when "
-             "auto-setting --r0-z-max (default 5.0e-5 m = 50 µm). "
-             "For 3D pillar traps the ion sits BELOW the RF pillar tops, so "
-             "this margin is intentionally small to exclude the Neumann far-field "
-             "vacuum region above the pillars, which contains many near-zero Ψ "
-             "DOFs that would otherwise drag the cluster centroid away from the "
-             "true RF null.  If the auto-detected minimum looks wrong, override "
-             "with --r0-z-max directly (e.g. --r0-z-max 0.12 for a mm-unit mesh "
-             "with ~82 µm trap height)."
+        help="Physical margin in metres for z_max auto-detect (default 5e-5 m = 50 µm). "
+             "For 3D blade/rail traps (electrode top > this margin in metres): margin is "
+             "SUBTRACTED from electrode top to exclude the electrode-tip saddle-point "
+             "artifact region (where |∇φ|→0 at the geometry transition). "
+             "For surface traps (electrode top ≈ 0): margin is added above the electrode. "
+             "Override entirely with explicit --r0-z-max (e.g. --r0-z-max 0.12 for "
+             "mm-unit mesh with ~82 µm expected trap height)."
     )
     # ── Lateral (x/y) search bounds ─────────────────────────────────────────
     # For multi-junction meshes the RF null is diffuse across the entire array.
@@ -586,10 +698,25 @@ def main():
             )
             z_electrode_top = float(domain.geometry.x[rf_nodes, 2].max())
             margin_mesh = args.r0_search_margin / coord_unit   # metres → mesh units
-            r0_z_max = z_electrode_top + margin_mesh
+            # 3D blade/rail traps: ion is trapped INSIDE the electrode structure
+            # (ion height << electrode_top).  The electrode-tip region just below
+            # the blade top has a saddle-point artifact where |∇φ|→0 from the
+            # geometry transition.  Adding margin above pushes z_max further into
+            # this artifact zone.  For 3D traps we must SUBTRACT the margin to
+            # restrict the search below the electrode top.
+            # Surface traps: electrode near z=0, ion above → add margin.
+            # Heuristic: electrode_top in metres > r0_search_margin → 3D trap.
+            _elec_top_m = z_electrode_top * coord_unit  # physical metres
+            if _elec_top_m > args.r0_search_margin:
+                r0_z_max = z_electrode_top - margin_mesh  # 3D trap: exclude tip artifact
+                _margin_dir = "below electrode top"
+            else:
+                r0_z_max = z_electrode_top + margin_mesh  # surface trap: above electrode
+                _margin_dir = "above electrode top"
             if rank == 0:
-                print(f"[r0 search] z_electrode_top={z_electrode_top:.4g} mesh units, "
-                      f"margin={margin_mesh:.4g} → z_max={r0_z_max:.4g}")
+                print(f"[r0 search] z_electrode_top={z_electrode_top:.4g} mesh units "
+                      f"({_elec_top_m*1e6:.1f} µm)  margin={margin_mesh:.4g} ({_margin_dir})"
+                      f"  → z_max={r0_z_max:.4g} mesh units")
         except Exception as _e:
             if rank == 0:
                 print(f"[r0 search] z_max auto-detect failed ({_e}); no z bound applied.")
