@@ -968,7 +968,49 @@ def estimate_trap_depth_by_rays(
     else:
         tb_xscan_eV = None; tb_xscan_int = False
 
-    # 3. CTC-like height-following scan (full mode only)
+    # 3. Pure z-scan (+z / -z) — reports regardless of electrode-hit classification
+    if gdim >= 3:
+        _zd = np.zeros(gdim); _zd[2] = 1.0
+        _zp, _zip, _, _ = _scan_barrier_1d(_zd)
+        _zn, _zin, _, _ = _scan_barrier_1d(-_zd)
+        _zp_eV: Optional[float] = float(_zp * phys_scale / _E_CHARGE) if np.isfinite(_zp) else None
+        _zn_eV: Optional[float] = float(_zn * phys_scale / _E_CHARGE) if np.isfinite(_zn) else None
+        _z_finite = [(b, bi) for b, bi in ((_zp, _zip), (_zn, _zin)) if np.isfinite(b)]
+        if _z_finite:
+            _z_FEM, _z_int = min(_z_finite, key=lambda x: x[0])
+            depth_z_eV: Optional[float] = float(_z_FEM * phys_scale / _E_CHARGE)
+            depth_z_interior: bool = bool(_z_int)
+        else:
+            depth_z_eV = None; depth_z_interior = False
+        print(f"[depth] z-axis: +z={(_zp_eV if _zp_eV is not None else float('nan')):.4f} eV "
+              f"(interior={_zip})  "
+              f"-z={(_zn_eV if _zn_eV is not None else float('nan')):.4f} eV "
+              f"(interior={_zin})  → depth_z={depth_z_eV} eV  *** paper-comparable ***")
+    else:
+        _zp_eV = None; _zn_eV = None; depth_z_eV = None; depth_z_interior = False
+
+    # 4. Pure y-scan (+y / -y) — reports regardless of electrode-hit classification
+    if gdim >= 2:
+        _yd = np.zeros(gdim); _yd[1] = 1.0
+        _yp, _yip, _, _ = _scan_barrier_1d(_yd)
+        _yn, _yin, _, _ = _scan_barrier_1d(-_yd)
+        _yp_eV: Optional[float] = float(_yp * phys_scale / _E_CHARGE) if np.isfinite(_yp) else None
+        _yn_eV: Optional[float] = float(_yn * phys_scale / _E_CHARGE) if np.isfinite(_yn) else None
+        _y_finite = [(b, bi) for b, bi in ((_yp, _yip), (_yn, _yin)) if np.isfinite(b)]
+        if _y_finite:
+            _y_FEM, _y_int = min(_y_finite, key=lambda x: x[0])
+            depth_y_eV: Optional[float] = float(_y_FEM * phys_scale / _E_CHARGE)
+            depth_y_interior: bool = bool(_y_int)
+        else:
+            depth_y_eV = None; depth_y_interior = False
+        print(f"[depth] y-axis: +y={(_yp_eV if _yp_eV is not None else float('nan')):.4f} eV "
+              f"(interior={_yip})  "
+              f"-y={(_yn_eV if _yn_eV is not None else float('nan')):.4f} eV "
+              f"(interior={_yin})  → depth_y={depth_y_eV} eV")
+    else:
+        _yp_eV = None; _yn_eV = None; depth_y_eV = None; depth_y_interior = False
+
+    # 5. CTC-like height-following scan (full mode only)
     if transport_mode == "full":
         print("[depth] ── CTC-like path scan (height-following) ──")
         _cp, _cip, _cpd, _cpai = _ctc_scan(+1)
@@ -1051,6 +1093,15 @@ def estimate_trap_depth_by_rays(
     return {
         "r0_m": r0.tolist(),
         "Psi0_J": float(psi0_phys_J),
+        # ── Axis-specific depth (paper-comparable) ──
+        "depth_z_eV": depth_z_eV,
+        "depth_z_plus_eV": _zp_eV,
+        "depth_z_minus_eV": _zn_eV,
+        "depth_z_interior": depth_z_interior,
+        "depth_y_eV": depth_y_eV,
+        "depth_y_plus_eV": _yp_eV,
+        "depth_y_minus_eV": _yn_eV,
+        "depth_y_interior": depth_y_interior,
         # ── Paper-comparison metrics ──
         "radial_depth_core_eV": core_med_eV,
         "radial_depth_core_min_eV": core_min_eV,

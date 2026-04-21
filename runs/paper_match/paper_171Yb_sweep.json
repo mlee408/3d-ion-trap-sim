@@ -1,0 +1,41 @@
+{
+  "mesh": "meshes/base/trap_2j.msh",
+  "prefix": "paper_171Yb",
+  "r0_x_m": 0.0003136386006197445,
+  "r0_y_m": -1.9348785787114034e-06,
+  "r0_z_m": 8.267998194084949e-05,
+  "freq1_hz": 0.0,
+  "freq2_hz": 2225095.9230949273,
+  "freq3_hz": 2438098.074351159,
+  "strong_freq_min_hz": 2225095.9230949273,
+  "strong_freq_max_hz": 2438098.074351159,
+  "radial_depth_core_eV": 0.6067532645560032,
+  "transport_barrier_xscan_eV": 0.0693144924418456,
+  "transport_barrier_eigvec_eV": 0.06976046639973649,
+  "h_used": 0.03297873664090514,
+  "physical_min_ok": true,
+  "strong_modes_ok": true,
+  "hessian_status": "borderline_numeric",
+  "success": true,
+  "notes": null,
+  "rf_freq_Hz": 44300000.0,
+  "vrf_V": 190.0,
+  "mass_amu": 171.0,
+  "charge_e": 1.0,
+  "degree": 2,
+  "coord_unit_m_per_mesh": 0.001,
+  "r0_search_bounds_mesh": {
+    "x": [
+      null,
+      null
+    ],
+    "y": [
+      null,
+      null
+    ],
+    "z": [
+      0.0,
+      0.12
+    ]
+  }
+}
