@@ -99,11 +99,11 @@ def build_rf_cell(
 
     # ── derived dimensions (µm) ──────────────────────────────────────────────
     half_sp = SUPPORT_SPACING_UM / 2.0               # 300 µm from origin to corner
-    s_half  = SUPPORT_SIDE_UM / 2.0                  # 28 µm half-side of support
 
     dh = LATTICE_DH_BASE_UM * rf_thickness           # scaled horizontal diagonal
     dv = LATTICE_DV_BASE_UM * rf_thickness           # scaled vertical diagonal
     half_l = LATTICE_LENGTH_UM / 2.0                 # 328 µm half-length of lattice beam
+    s_half  = dh / 2.0   # pillar half-width = rail width (keeps pillar == rail)
 
     # z coordinates of the lattice beam diamond cross-section
     z_top    = rf_height          # top vertex (= top of support beam)
@@ -153,7 +153,7 @@ def build_rf_cell(
     for cx_um, cy_um in corners:
         tag = occ.addBox(
             um(cx_um - s_half), um(cy_um - s_half), um(0.0),
-            um(SUPPORT_SIDE_UM), um(SUPPORT_SIDE_UM), um(rf_height),
+            um(dh), um(dh), um(rf_height),
         )
         solids.append((3, tag))
 
