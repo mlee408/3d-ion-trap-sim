@@ -195,15 +195,23 @@ def main() -> None:
             # Heuristic: electrode_top in metres > r0_search_margin → 3D trap.
             _elec_top_m = z_electrode_top * coord_unit  # physical metres
             if _elec_top_m > args.r0_search_margin:
-                r0_z_max = z_electrode_top - margin_mesh  # 3D trap: exclude tip artifact
-                _margin_dir = "below electrode top"
+                # 3D blade/rail trap: apply same two-constraint heuristic as run_case.py.
+                # (a) margin below electrode top to exclude electrode-tip saddle artifact.
+                # (b) cap at 55% of electrode height to stay in the physical trapping
+                #     corridor (ion at ~30-40% of electrode height; 55% ≈ 1.5× headroom).
+                _z_margin = z_electrode_top - margin_mesh
+                _z_frac   = z_electrode_top * 0.55
+                r0_z_max  = min(_z_margin, _z_frac)
+                _which    = "55%-cap" if _z_frac <= _z_margin else "margin-below-top"
+                _margin_dir = (f"below electrode top — {_which} "
+                               f"(z_margin={_z_margin:.4g}, z_55pct={_z_frac:.4g})")
             else:
                 r0_z_max = z_electrode_top + margin_mesh  # surface trap: above electrode
                 _margin_dir = "above electrode top"
             if rank == 0:
                 print(f"[r0 search] z_electrode_top={z_electrode_top:.4g} mesh units "
                       f"({_elec_top_m*1e6:.1f} µm)  margin={margin_mesh:.4g} ({_margin_dir})"
-                      f"  → z_max={r0_z_max:.4g} mesh units")
+                      f"  → z_max={r0_z_max:.4g} mesh units ({r0_z_max*coord_unit*1e6:.1f} µm)")
         except Exception as _e:
             if rank == 0:
                 print(f"[r0 search] z_max auto-detect failed ({_e}); no z bound applied.")
@@ -282,8 +290,9 @@ def main() -> None:
                 print(f"  z percentiles [5,25,50,75,95] = "
                       f"{[f'{v:.4g}' for v in _pct]} mesh units")
                 print(f"  → in µm: {[f'{v*coord_unit*1e6:.1f}' for v in _pct]}")
-                print(f"  (target: cluster near expected trap height "
-                      f"~{82:.0f} µm = {82e-6/coord_unit:.4g} mesh units)")
+                _target_mu = (r0_z_max * coord_unit * 1e6 * 0.6) if r0_z_max is not None else float("nan")
+                print(f"  (target: cluster should sit well below z_max; "
+                      f"~60%% of z_max = {_target_mu:.0f} µm ≈ {_target_mu*1e-6/coord_unit:.4g} mesh units)")
         except Exception as _de:
             print(f"[r0 debug] z-distribution check failed: {_de}")
 
@@ -370,13 +379,16 @@ def main() -> None:
             and hessian_status in ("valid", "borderline_numeric")
         )
 
+        _grad_rel = post.get("grad_rel_at_r0", float("nan"))
         print(f"[sweep] h_used={sec['h']:.3e}  all_freq_hz={[f'{f:.4e}' for f in freqs]}")
-        print(f"[sweep result]  r0.z={z_um:.2f} µm  "
-              f"strong_freqs=[{strong_fmin/1e6:.3f}, {strong_fmax/1e6:.3f}] MHz  "
-              f"radial_depth={depth.get('radial_depth_core_eV')} eV  "
-              f"depth_z={depth.get('depth_z_eV')} eV (paper-comparable)  "
-              f"depth_y={depth.get('depth_y_eV')} eV  "
-              f"xscan_barrier={depth.get('transport_barrier_xscan_eV')} eV")
+        print(f"[sweep result] r0.z={z_um:.2f} µm  hessian={hessian_status}  "
+              f"grad_rel={_grad_rel:.3e}")
+        print(f"[sweep | local secular MHz]       strong_freq=[{strong_fmin/1e6:.3f}, {strong_fmax/1e6:.3f}]")
+        print(f"[sweep | local confinement eV]    radial_depth_core={depth.get('radial_depth_core_eV')}")
+        print(f"[sweep | paper-comparison eV]     depth_z={depth.get('depth_z_eV')}  "
+              f"depth_y={depth.get('depth_y_eV')}")
+        print(f"[sweep | transport barriers eV]   xscan={depth.get('transport_barrier_xscan_eV')}  "
+              f"eigvec={depth.get('transport_barrier_eigvec_eV')}")
 
     # ── Build compact JSON record ────────────────────────────────────────────
     if rank == 0:
@@ -415,8 +427,25 @@ def main() -> None:
             # accepted but flagged.  "invalid_saddle" never appears here because
             # compute_post_r0_metrics raises RuntimeError before reaching this code.
             "hessian_status": hessian_status,
+            # grad_rel = |∇Ψ|/(|H|_F × h); < 0.1 near-stationary, < 0.5 borderline ok
+            "grad_rel_at_r0": post.get("grad_rel_at_r0"),
             "success": True,
             "notes": None,
+            # Metric category map — use these keys to avoid mixing unlike quantities:
+            #   local_secular_hz       — all 3 eigenmode frequencies (includes weak axial)
+            #   strong_secular_hz      — top-2 radial confinement modes only
+            #   local_confinement_eV   — Fibonacci-sphere radial depth (electrode-hit excluded)
+            #   paper_comparison_eV    — axis scans (no electrode-hit filter; comparable to
+            #                             published trap-depth values for z and y axes)
+            #   transport_barriers_eV  — x-axis and eigvec-direction escape barriers
+            "_metric_categories": {
+                "local_secular_hz": ["freq1_hz", "freq2_hz", "freq3_hz"],
+                "strong_secular_hz": ["strong_freq_min_hz", "strong_freq_max_hz"],
+                "local_confinement_eV": ["radial_depth_core_eV"],
+                "paper_comparison_eV": ["depth_z_eV", "depth_y_eV"],
+                "transport_barriers_eV": ["transport_barrier_xscan_eV",
+                                          "transport_barrier_eigvec_eV"],
+            },
             # sweep parameters for traceability
             "rf_freq_Hz": args.rf_freq,
             "vrf_V": args.vrf,

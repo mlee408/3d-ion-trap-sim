@@ -300,20 +300,29 @@ def compute_post_r0_metrics(
               f"rel=|∇Ψ|/(|H|·h)={_grad_rel:.3e}  (< 0.1 → near stationary)")
 
     # ── 3. Eigenvalue validation with relative-magnitude tolerance ───────────
-    # Classification logic:
+    # Classification logic (both conditions required for borderline_numeric):
     #   valid            — all eigenvalues ≥ 0
-    #   borderline_numeric — some negative but |λ_neg|/max(λ_pos) < _REL_TOL
-    #                        (numerical noise in near-zero axial mode; accepted)
-    #   invalid_saddle   — |λ_neg|/max(λ_pos) ≥ _REL_TOL (true saddle point)
+    #   borderline_numeric — BOTH: (a) |λ_neg|/max(λ_pos) < _REL_TOL  AND
+    #                               (b) grad_rel < _GRAD_REL_TOL (near-stationary)
+    #   invalid_saddle   — (a) fails (true saddle) OR (b) fails (off the RF null)
     #
     # Physical basis: in a linear Paul trap with no DC axial voltage, the RF
     # pseudopotential has near-zero curvature along x (the trap axis).  FEM
     # discretisation noise (machine-ε × FEM condition number) can make this
     # tiny eigenvalue go slightly negative.  The ratio |λ_neg|/max(λ_pos) for
     # this noise is typically < 10⁻³; genuine saddle points have ratios > 0.1.
-    _REL_TOL = 1e-3   # 0.1 % of dominant positive eigenvalue
+    # Even when the ratio is small, a large gradient residual indicates the
+    # point is not at the true RF null — the negative eigenvalue may then be a
+    # genuine saddle rather than FEM noise.
+    _REL_TOL      = 1e-3   # 0.1% of dominant positive eigenvalue (eigenvalue check)
+    _GRAD_REL_TOL = 0.5    # |∇Ψ|/(|H|_F·h) threshold (stationarity check)
     n_neg = sum(1 for ev in eigvals if ev < 0)
     hessian_status = "valid"
+
+    if comm.rank == 0:
+        print(f"[hessian] acceptance thresholds: "
+              f"eigenvalue |λ_neg|/max(λ_pos) < {_REL_TOL:.0e}  AND  "
+              f"grad_rel < {_GRAD_REL_TOL:.2f}  (both required for borderline_numeric)")
 
     if n_neg > 0:
         _max_pos = max((ev for ev in eigvals if ev > 0), default=0.0)
@@ -336,25 +345,47 @@ def compute_post_r0_metrics(
                 f"[secular] {_n_phys_neg} physically significant negative eigenvalue(s):\n"
                 f"  eigenvalues:           {[f'{ev:.4e}' for ev in eigvals]}\n"
                 f"  |λ_neg|/max(λ_pos):   {[f'{rm:.3e}' for rm in _rel_mags if rm >= _REL_TOL]}"
-                f" ≥ {_REL_TOL:.0e}\n"
+                f" ≥ {_REL_TOL:.0e}  (eigenvalue check failed)\n"
                 f"  r0={r0.tolist()} mesh units  (r0.z={_r0z})\n"
                 "r0 is a saddle point or electrode-adjacent artifact.  "
                 "Tighten search bounds (--r0-z-max / --r0-z-min) so the search "
                 "stays inside the physical trapping corridor."
             )
         else:
+            # Eigenvalue magnitude check passed — now require near-stationarity.
+            # A large gradient despite small eigenvalues means the point is off
+            # the true RF null; the tiny negative eigenvalue may be a real saddle.
+            if comm.rank == 0:
+                _grad_pass = _grad_rel < _GRAD_REL_TOL
+                print(f"[hessian] grad_rel={_grad_rel:.3e}  threshold={_GRAD_REL_TOL:.2f}  "
+                      f"{'PASS — near-stationary' if _grad_pass else 'FAIL — not near-stationary'}")
+            if _grad_rel >= _GRAD_REL_TOL:
+                hessian_status = "invalid_saddle"
+                raise RuntimeError(
+                    f"[secular] small negative eigenvalue(s) but gradient residual is too large:\n"
+                    f"  eigenvalues:         {[f'{ev:.4e}' for ev in eigvals]}\n"
+                    f"  |λ_neg|/max(λ_pos): {[f'{rm:.3e}' for rm in _rel_mags]}"
+                    f" < {_REL_TOL:.0e}  (eigenvalue check passed)\n"
+                    f"  grad_rel:            {_grad_rel:.3e} ≥ {_GRAD_REL_TOL:.2f}  "
+                    f"(stationarity check FAILED)\n"
+                    f"  |∇Ψ|={_grad_norm:.3e}  |H|_F={_H_frob:.3e}  h={_h_used:.3e}\n"
+                    f"  r0={r0.tolist()} mesh units\n"
+                    "Point is not near-stationary — likely off the true RF null.  "
+                    "Tighten search bounds or increase refinement so r0 converges."
+                )
             hessian_status = "borderline_numeric"
             if comm.rank == 0:
                 _w.warn(
-                    f"[secular] {n_neg} negative eigenvalue(s) within numerical tolerance:\n"
+                    f"[secular] {n_neg} negative eigenvalue(s) within numerical tolerance "
+                    f"AND point is near-stationary:\n"
                     f"  eigenvalues:         {[f'{ev:.4e}' for ev in eigvals]}\n"
                     f"  |λ_neg|/max(λ_pos): {[f'{rm:.3e}' for rm in _rel_mags]}"
-                    f" < {_REL_TOL:.0e}\n"
-                    f"  gradient residual:  |∇Ψ|={_grad_norm:.2e}  rel={_grad_rel:.2e}\n"
+                    f" < {_REL_TOL:.0e}  ✓\n"
+                    f"  grad_rel:            {_grad_rel:.3e} < {_GRAD_REL_TOL:.2f}  ✓\n"
                     "  Likely FEM discretisation noise in the near-zero axial mode of a\n"
                     "  linear trap (RF pseudopotential has zero axial curvature without DC).\n"
                     "  Accepted as valid minimum; clipped eigenvalues max(λ,0) used for\n"
-                    "  frequency computation.  Mark 'hessian_status=borderline_numeric'.",
+                    "  frequency computation.  Marked 'hessian_status=borderline_numeric'.",
                     RuntimeWarning,
                     stacklevel=3,
                 )
@@ -409,6 +440,9 @@ def compute_post_r0_metrics(
         #                          function raises RuntimeError before this return)
         "hessian_status": hessian_status,
         "r0_refined": r0.tolist(),   # r0 after extra local refinement
+        # Gradient stationarity diagnostic: |∇Ψ|/(|H|_F × h).
+        # < 0.1 → well near-stationary; < 0.5 → accepted for borderline_numeric.
+        "grad_rel_at_r0": float(_grad_rel),
     }
 
 
@@ -708,15 +742,26 @@ def main():
             # Heuristic: electrode_top in metres > r0_search_margin → 3D trap.
             _elec_top_m = z_electrode_top * coord_unit  # physical metres
             if _elec_top_m > args.r0_search_margin:
-                r0_z_max = z_electrode_top - margin_mesh  # 3D trap: exclude tip artifact
-                _margin_dir = "below electrode top"
+                # 3D blade/rail trap: ion sits well below the electrode tip (~30-40% of
+                # electrode height in linear-region runs).  Apply two constraints:
+                # (a) subtract margin to exclude electrode-tip saddle artifact
+                # (b) cap at 55% of electrode height to exclude the upper half where
+                #     |∇φ|→0 from the geometry transition produces spurious low-Ψ DOFs.
+                # For a 247 µm electrode: (a) → 197 µm, (b) → 136 µm; min → 136 µm,
+                # which is ~1.65× the 82 µm expected trap height.
+                _z_margin = z_electrode_top - margin_mesh
+                _z_frac   = z_electrode_top * 0.55
+                r0_z_max  = min(_z_margin, _z_frac)
+                _which    = "55%-cap" if _z_frac <= _z_margin else "margin-below-top"
+                _margin_dir = (f"below electrode top — {_which} "
+                               f"(z_margin={_z_margin:.4g}, z_55pct={_z_frac:.4g})")
             else:
                 r0_z_max = z_electrode_top + margin_mesh  # surface trap: above electrode
                 _margin_dir = "above electrode top"
             if rank == 0:
                 print(f"[r0 search] z_electrode_top={z_electrode_top:.4g} mesh units "
                       f"({_elec_top_m*1e6:.1f} µm)  margin={margin_mesh:.4g} ({_margin_dir})"
-                      f"  → z_max={r0_z_max:.4g} mesh units")
+                      f"  → z_max={r0_z_max:.4g} mesh units ({r0_z_max*coord_unit*1e6:.1f} µm)")
         except Exception as _e:
             if rank == 0:
                 print(f"[r0 search] z_max auto-detect failed ({_e}); no z bound applied.")
@@ -869,10 +914,16 @@ def main():
               f"eigvec={transport_eigvec.round(4).tolist()}")
 
     if depth is not None and rank == 0:
-        print("[depth summary] ── Sweep metrics ──")
+        print("[depth summary] ── local confinement ──")
         print(f"[depth summary]   r0.z              = {float(mininfo.r_min[2]) * coord_unit * 1e6:.2f} µm")
         print(f"[depth summary]   radial_depth_core = {depth.get('radial_depth_core_eV')} eV  "
-              f"({depth.get('n_core_radial_rays')} rays)")
+              f"({depth.get('n_core_radial_rays')} rays)  [Fibonacci-sphere median, electrode-hit excluded]")
+        print("[depth summary] ── paper-comparison (axis scans, no electrode-hit filter) ──")
+        print(f"[depth summary]   depth_z           = {depth.get('depth_z_eV')} eV  "
+              f"(+z={depth.get('depth_z_plus_eV')}, -z={depth.get('depth_z_minus_eV')})")
+        print(f"[depth summary]   depth_y           = {depth.get('depth_y_eV')} eV  "
+              f"(+y={depth.get('depth_y_plus_eV')}, -y={depth.get('depth_y_minus_eV')})")
+        print("[depth summary] ── transport barriers ──")
         print(f"[depth summary]   transport_xscan   = {depth.get('transport_barrier_xscan_eV')} eV  "
               f"interior={depth.get('transport_barrier_xscan_interior')}")
         print(f"[depth summary]   eigvec-scan       = {depth.get('transport_barrier_eigvec_eV')} eV  "

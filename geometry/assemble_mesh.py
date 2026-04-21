@@ -470,14 +470,30 @@ def main():
     trap_centers = []   # list of (xyz, radius) tuples
     if not args.no_center_ball:
         rf_bbox = union_bbox([(2, s) for s in rf_surfs])
-        rf_x_min, rf_y_min, _, rf_x_max, rf_y_max, _rf_z_top = rf_bbox  # _rf_z_top unused
+        rf_x_min, rf_y_min, _, rf_x_max, rf_y_max, rf_z_top = rf_bbox
         rf_x_mid = (rf_x_min + rf_x_max) / 2.0
         rf_y_mid = (rf_y_min + rf_y_max) / 2.0
 
-        # Ball z positions are substrate-referenced (z = 0 = DC/ground plane), NOT
+        # Ball z positions are SUBSTRATE-REFERENCED (z = 0 = DC/ground plane), NOT
         # relative to the RF electrode top.  --trap-center-z-offset is the expected
         # trap height above the substrate in mm (≈ 0.082 mm = 82 µm from paper).
+        # rf_z_top (from the STEP geometry bbox) is in the same substrate-relative
+        # coordinate system; it should be larger than z_ball_primary.
         z_ball_primary = args.trap_center_z_offset
+        # Sanity: trap-centre Ball should be well below the RF electrode top.
+        # For a 247 µm electrode the ion sits at ~82 µm = ~33% of electrode height.
+        if z_ball_primary >= rf_z_top:
+            print(f"WARNING [ball] trap-centre z={z_ball_primary:.4f} mm ≥ RF top "
+                  f"z={rf_z_top:.4f} mm — Ball field is inside the electrode. "
+                  "Check --trap-center-z-offset.")
+        elif z_ball_primary > 0.65 * rf_z_top:
+            print(f"WARNING [ball] trap-centre z={z_ball_primary:.4f} mm is above 65%% "
+                  f"of RF top z={rf_z_top:.4f} mm ({z_ball_primary/rf_z_top*100:.0f}%%). "
+                  "Physical ion height is typically 30-40%% of electrode height; "
+                  "check --trap-center-z-offset.")
+        else:
+            print(f"[ball] trap-centre z={z_ball_primary:.4f} mm  "
+                  f"({z_ball_primary/rf_z_top*100:.0f}%% of RF top {rf_z_top:.4f} mm)  ✓")
         # Outer-arm balls use the same substrate-relative convention.
         z_ball_arm     = args.trap_center_z_offset_junction
         # Per-arm ball radius (default: same as primary)

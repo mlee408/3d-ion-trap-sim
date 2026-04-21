@@ -135,6 +135,13 @@ def main() -> None:
     )
 
     # ── call build_rf_cell directly ───────────────────────────────────────────
+    # Coordinate system after the call:
+    #   rf_surface.step occupies z ∈ [−0.020, 0] mm (substrate plane at z = 0).
+    #   rf_cell_gen internally translates the lattice cell by −0.02 mm so it
+    #   meets the base plate flush at z = −0.020 mm.
+    #   Combined electrode tip: z_tip = (rf_height_um − 20) µm.
+    #   The assemble_mesh.py Ball field uses this tip height as the electrode-top
+    #   reference; --trap-center-z-offset is substrate-relative, NOT tip-relative.
     sys.path.insert(0, str(HERE))
     from rf_cell_gen import build_rf_cell
 

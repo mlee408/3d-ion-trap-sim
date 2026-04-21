@@ -233,6 +233,12 @@ def build_rf_cell(
     else:
         fused = solids
 
+    # Shift the entire cell down 20 µm (−0.02 mm) so the parametric cell's base
+    # aligns with rf_surface.step which occupies z ∈ [−0.02, 0] mm.
+    # CRITICAL: after this translate, z_tip = (rf_height − 20) µm — NOT rf_height µm.
+    # make_rf_step.py documents this as  z_top = rf_height/1000 − 0.020 mm.
+    # assemble_mesh.py's --trap-center-z-offset is substrate-relative (z=0 = DC plane)
+    # and must use (rf_height − 20) µm as the electrode-top reference, not rf_height.
     occ.translate(fused, 0.0, 0.0, -0.02)
     occ.synchronize()
 
