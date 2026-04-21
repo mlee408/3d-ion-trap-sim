@@ -74,6 +74,7 @@ def build_rf_cell(
     out_mesh: bool = False,
     gui: bool = False,
     base_step_path: Optional[str] = None,
+    out_step_path: Optional[str] = None,
 ) -> None:
     """
     Build one RF lattice cell and export requested file formats.
@@ -87,6 +88,9 @@ def build_rf_cell(
                      with X-shaped cutout at z=[-0.01, 0]).  When provided it
                      is imported and fused with the parametric cell so the
                      complete RF electrode matches the original footprint.
+    out_step_path  : optional explicit output path for the STEP file.  When
+                     provided, overrides the default stem-based filename written
+                     to the current directory.  Implies out_step=True.
     """
     import gmsh
 
@@ -272,8 +276,8 @@ def build_rf_cell(
         gmsh.write(fname)
         print(f"  Wrote  {fname}")
 
-    if out_step:
-        fname = stem + ".step"
+    if out_step or out_step_path:
+        fname = out_step_path if out_step_path else stem + ".step"
         gmsh.write(fname)
         print(f"  Wrote  {fname}")
 
@@ -341,6 +345,12 @@ def main() -> None:
         help="Path to rf_base.step (original RF base plate with X-shaped cutout). "
              "When provided, fused with the parametric cell for a complete RF electrode.",
     )
+    parser.add_argument(
+        "--out-step", type=str, default=None,
+        dest="out_step_path",
+        help="Explicit output path for the STEP file (overrides the default "
+             "stem-based filename in the current directory). Implies --step.",
+    )
     args = parser.parse_args()
 
     _eff_thickness = (args.rf_width_um / LATTICE_DH_BASE_UM
@@ -367,6 +377,7 @@ def main() -> None:
             out_mesh       = args.mesh,
             gui            = args.gui,
             base_step_path = args.base_step,
+            out_step_path  = args.out_step_path,
         )
     except ValueError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)

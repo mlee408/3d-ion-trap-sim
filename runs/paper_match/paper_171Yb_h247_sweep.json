@@ -1,0 +1,49 @@
+{
+  "mesh": "meshes/base/trap_2j_h247.msh",
+  "prefix": "paper_171Yb_h247",
+  "r0_x_m": 0.00030095740542732856,
+  "r0_y_m": 1.0930399506345041e-07,
+  "r0_z_m": 7.148819520042557e-05,
+  "freq1_hz": 17444.29924472571,
+  "freq2_hz": 2807308.191884608,
+  "freq3_hz": 2967506.247883305,
+  "strong_freq_min_hz": 2807308.191884608,
+  "strong_freq_max_hz": 2967506.247883305,
+  "depth_z_eV": 1.348866247072219,
+  "depth_z_plus_eV": 1.348866247072219,
+  "depth_z_minus_eV": 27.58687255924464,
+  "depth_z_interior": true,
+  "depth_y_eV": 6.19743936744998,
+  "depth_y_plus_eV": 6.217927361346439,
+  "depth_y_minus_eV": 6.19743936744998,
+  "depth_y_interior": true,
+  "radial_depth_core_eV": 0.975947975964301,
+  "transport_barrier_xscan_eV": 0.12020383589002687,
+  "transport_barrier_eigvec_eV": 0.1200612815154497,
+  "h_used": 0.03292837568312638,
+  "physical_min_ok": true,
+  "strong_modes_ok": true,
+  "hessian_status": "valid",
+  "success": true,
+  "notes": null,
+  "rf_freq_Hz": 44300000.0,
+  "vrf_V": 190.0,
+  "mass_amu": 171.0,
+  "charge_e": 1.0,
+  "degree": 2,
+  "coord_unit_m_per_mesh": 0.001,
+  "r0_search_bounds_mesh": {
+    "x": [
+      null,
+      null
+    ],
+    "y": [
+      null,
+      null
+    ],
+    "z": [
+      0.0,
+      0.12
+    ]
+  }
+}

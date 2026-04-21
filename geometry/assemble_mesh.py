@@ -251,18 +251,19 @@ def main():
                          "Adds one Ball refinement field at this point. "
                          "Default: auto-detected from RF surface geometry (see below).")
     ap.add_argument("--trap-center-z-offset", type=float, default=0.082,
-                    help="Z offset above the RF electrode top surface used when "
-                         "auto-estimating the trap centre for the PRIMARY (inter-junction "
-                         "or single-junction) ball field (mm, default 0.082 ≈ paper "
-                         "linear-region trap height of 82.3 µm).")
+                    help="Z coordinate (mm, above the substrate surface z = 0) of the "
+                         "primary trap-centre Ball refinement field.  This is an absolute "
+                         "substrate-referenced height, NOT an offset above the RF electrode "
+                         "top.  Default 0.082 mm = 82 µm ≈ paper linear-region trap height "
+                         "of 82.3 µm above the DC/ground plane.")
     ap.add_argument("--trap-center-z-offset-junction", type=float, default=0.082,
-                    help="Z offset used for the automatically-added outer-arm Ball fields "
-                         "in multi-junction meshes (mm, default 0.082 ≈ paper linear-region "
-                         "trap height of 82.3 µm).  The outer arms of a multi-junction array "
-                         "have the same electrode cross-section as the single-junction linear "
-                         "region, so 0.082 is the correct default.  The inter-junction arm "
-                         "(primary ball, --trap-center-z-offset) has a lower trap height "
-                         "(~45 µm observed) but is covered by the primary ball + z-offset.")
+                    help="Z coordinate (mm, substrate-referenced, z = 0 = DC plane) for "
+                         "the auto-added outer-arm Ball fields in multi-junction meshes. "
+                         "Default 0.082 mm = 82 µm.  The outer arms have the same electrode "
+                         "cross-section as the single-junction linear region, so 0.082 is "
+                         "the correct default.  The inter-junction arm (primary ball, "
+                         "--trap-center-z-offset) has a lower trap height (~45 µm observed) "
+                         "but is covered by the primary ball radius.")
     ap.add_argument("--center-radius-junction", type=float, default=0.070,
                     help="Ball radius for the auto-added outer-arm Ball fields in "
                          "multi-junction meshes (mm, default 0.070).  Larger than the "
@@ -276,8 +277,9 @@ def main():
                     help="One or more x-coordinates (mm) of linear-region trap centres "
                          "for extra Ball refinement.  Useful for multi-junction meshes "
                          "where you want fine mesh at each linear arm midpoint AND each "
-                         "junction crossing.  Y is set to 0; Z is RF-top + "
-                         "--trap-center-z-offset. "
+                         "junction crossing.  Y is set to 0; Z is set to "
+                         "--trap-center-z-offset (substrate-referenced, same as the "
+                         "primary ball). "
                          "Example for 2-junction 0.6 mm pitch: "
                          "--linear-region-x -0.15 0.30 0.75  "
                          "(left arm, inter-junction midpoint, right arm).")
@@ -459,22 +461,25 @@ def main():
     # 6) mesh size fields
     # Build the list of (centre, radius) pairs for Ball refinement fields.
     # For multi-junction meshes this includes:
-    #   • primary ball at the inter-junction midpoint (z-offset = trap height there)
-    #   • arm balls at each outer arm (z-offset = outer-arm trap height)
-    # Using separate z-offsets for inter-junction vs outer-arm positions ensures
-    # the fine-mesh region is actually centred on the expected trap minimum in
-    # each location, not 30–40 µm above it.
+    #   • primary ball at the inter-junction/linear-arm midpoint
+    #   • arm balls at each outer arm of the multi-junction array
+    # Ball z positions are SUBSTRATE-REFERENCED (z = 0 = DC/ground plane).
+    # --trap-center-z-offset is the expected trap height above the substrate in mm,
+    # not an offset above the RF electrode top.  Default 0.082 mm matches the
+    # paper's linear-region trap height of 82.3 µm.
     trap_centers = []   # list of (xyz, radius) tuples
     if not args.no_center_ball:
         rf_bbox = union_bbox([(2, s) for s in rf_surfs])
-        rf_x_min, rf_y_min, _, rf_x_max, rf_y_max, rf_z_top = rf_bbox
+        rf_x_min, rf_y_min, _, rf_x_max, rf_y_max, _rf_z_top = rf_bbox  # _rf_z_top unused
         rf_x_mid = (rf_x_min + rf_x_max) / 2.0
         rf_y_mid = (rf_y_min + rf_y_max) / 2.0
 
-        # Primary z-offset: inter-junction arm height or single-junction height
-        z_ball_primary = rf_z_top + args.trap_center_z_offset
-        # Outer-arm z-offset (may differ — outer arm has different RF geometry)
-        z_ball_arm     = rf_z_top + args.trap_center_z_offset_junction
+        # Ball z positions are substrate-referenced (z = 0 = DC/ground plane), NOT
+        # relative to the RF electrode top.  --trap-center-z-offset is the expected
+        # trap height above the substrate in mm (≈ 0.082 mm = 82 µm from paper).
+        z_ball_primary = args.trap_center_z_offset
+        # Outer-arm balls use the same substrate-relative convention.
+        z_ball_arm     = args.trap_center_z_offset_junction
         # Per-arm ball radius (default: same as primary)
         r_arm = args.center_radius_junction if args.center_radius_junction is not None \
                 else args.center_radius
