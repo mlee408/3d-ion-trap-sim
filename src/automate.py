@@ -126,6 +126,9 @@ class CaseResult:
     max_freq_hz: Optional[float]
     mode_spread_hz: Optional[float]
     center_offset_m: Optional[float]
+    physical_min_ok: Optional[bool]
+    hessian_status: Optional[str]
+    grad_rel_at_r0: Optional[float]
     report_path: Optional[str]
     stderr_path: Optional[str]
     stdout_path: Optional[str]
@@ -226,39 +229,59 @@ def sample_random_params(specs: Sequence[ParamSpec], rng: random.Random) -> Dict
 # -----------------------------------------------------------------------------
 
 
-def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Optional[float]]:
+def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
     """Extract the subset of metrics that the scorer needs.
 
     Handles both report formats:
       - run_case.py      : keys 'depth.depth_eV', 'secular.freq_hz', 'r0_SI_m'
       - run_sweep_metrics.py : keys 'radial_depth_core_eV', 'strong_freq_min_hz',
                                'strong_freq_max_hz', 'r0_x_m'/'r0_y_m'/'r0_z_m'
+
+    Validity fields (run_sweep_metrics.py only):
+      physical_min_ok  — bool: r0.z > 0, r0.z < 0.85*z_max, hessian valid/borderline
+      hessian_status   — str: "valid" | "borderline_numeric" | None
+      grad_rel_at_r0   — float: |∇Ψ|/(|H|_F × h); < 0.1 near-stationary
+
+    center_offset_m is the lateral (x, y) displacement only — z (trap height) is
+    intentionally excluded because trap height is a geometric consequence of electrode
+    dimensions and must not dominate the confinement score.
     """
     depth_eV = None
     min_freq_hz = None
     max_freq_hz = None
     mode_spread_hz = None
     center_offset_m = None
+    physical_min_ok = None
+    hessian_status = None
+    grad_rel_at_r0 = None
 
     # ── run_sweep_metrics.py format (flat keys) ───────────────────────────
     if "radial_depth_core_eV" in report or "strong_freq_min_hz" in report:
-        depth_eV   = safe_float(report.get("radial_depth_core_eV"))
+        depth_eV    = safe_float(report.get("radial_depth_core_eV"))
         min_freq_hz = safe_float(report.get("strong_freq_min_hz"))
         max_freq_hz = safe_float(report.get("strong_freq_max_hz"))
         if min_freq_hz is not None and max_freq_hz is not None:
             mode_spread_hz = max_freq_hz - min_freq_hz
+        # lateral offset only — z excluded to avoid penalising trap height
         x = safe_float(report.get("r0_x_m"))
         y = safe_float(report.get("r0_y_m"))
-        z = safe_float(report.get("r0_z_m"))
-        vals = [v for v in (x, y, z) if v is not None]
-        if vals:
-            center_offset_m = math.sqrt(sum(v * v for v in vals))
+        lateral = [v for v in (x, y) if v is not None]
+        if lateral:
+            center_offset_m = math.sqrt(sum(v * v for v in lateral))
+        # validity fields
+        _pmo = report.get("physical_min_ok")
+        physical_min_ok = bool(_pmo) if _pmo is not None else None
+        hessian_status  = report.get("hessian_status")
+        grad_rel_at_r0  = safe_float(report.get("grad_rel_at_r0"))
         return {
             "depth_eV": depth_eV,
             "min_freq_hz": min_freq_hz,
             "max_freq_hz": max_freq_hz,
             "mode_spread_hz": mode_spread_hz,
             "center_offset_m": center_offset_m,
+            "physical_min_ok": physical_min_ok,
+            "hessian_status": hessian_status,
+            "grad_rel_at_r0": grad_rel_at_r0,
         }
 
     # ── run_case.py format (nested keys) ─────────────────────────────────
@@ -277,12 +300,13 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Optional[fl
                 max_freq_hz = max(freq_vals)
                 mode_spread_hz = max_freq_hz - min_freq_hz
 
+    # lateral offset from first two SI components (x, y); exclude z (trap height)
     r0_si = report.get("r0_SI_m")
-    if isinstance(r0_si, list) and r0_si:
-        vals = [safe_float(x) for x in r0_si]
-        vals = [x for x in vals if x is not None]
-        if vals:
-            center_offset_m = math.sqrt(sum(x * x for x in vals))
+    if isinstance(r0_si, list) and len(r0_si) >= 2:
+        lateral = [safe_float(v) for v in r0_si[:2]]
+        lateral = [v for v in lateral if v is not None]
+        if lateral:
+            center_offset_m = math.sqrt(sum(v * v for v in lateral))
 
     return {
         "depth_eV": depth_eV,
@@ -290,37 +314,49 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Optional[fl
         "max_freq_hz": max_freq_hz,
         "mode_spread_hz": mode_spread_hz,
         "center_offset_m": center_offset_m,
+        "physical_min_ok": None,   # not available from run_case.py format
+        "hessian_status": None,
+        "grad_rel_at_r0": None,
     }
 
 
 
-def score_case_metrics(metrics: Dict[str, Optional[float]]) -> Optional[float]:
-    """Simple first-pass scalar objective.
+def score_case_metrics(metrics: Dict[str, Any]) -> Optional[float]:
+    """Scalar objective for local RF confinement quality.
 
-    Current intent:
-    - reward deeper traps,
-    - reward stronger weakest-mode confinement,
-    - penalize mode asymmetry,
-    - penalize large center offsets.
+    Hard rejects (return None, treated as failed by the surrogate):
+      - physical_min_ok == False  (invalid/far-field minimum)
+      - depth_eV or min_freq_hz missing/NaN
 
-    Tune these weights after you inspect a few dozen runs.
+    Soft penalty (score × 0.85):
+      - hessian_status == "borderline_numeric"
+
+    Score terms (all ~O(1) for typical Ca+ geometries at 40 MHz, 150 V):
+      +5.0  × depth_eV          radial_depth_core_eV: local confinement depth
+      +1e-6 × min_freq_hz       weaker of top-2 radial modes (axial excluded)
+      -1e-6 × mode_spread_hz    penalise radial mode asymmetry
     """
-    depth_eV = metrics.get("depth_eV")
-    min_freq_hz = metrics.get("min_freq_hz")
+    # Hard reject: invalid minimum detected by run_sweep_metrics.py
+    if metrics.get("physical_min_ok") is False:
+        return None
+
+    depth_eV       = metrics.get("depth_eV")
+    min_freq_hz    = metrics.get("min_freq_hz")
     mode_spread_hz = metrics.get("mode_spread_hz")
-    center_offset_m = metrics.get("center_offset_m")
 
     if depth_eV is None or min_freq_hz is None:
         return None
 
     score = 0.0
-    score += 5.0 * depth_eV
+    score += 5.0  * depth_eV
     score += 1e-6 * min_freq_hz
 
     if mode_spread_hz is not None:
-        score -= 2e-6 * mode_spread_hz
-    if center_offset_m is not None:
-        score -= 1e6 * center_offset_m
+        score -= 1e-6 * mode_spread_hz
+
+    # Soft penalty for numerically borderline Hessian
+    if metrics.get("hessian_status") == "borderline_numeric":
+        score *= 0.85
 
     return score
 
@@ -520,6 +556,9 @@ def evaluate_case(
             max_freq_hz=metrics.get("max_freq_hz"),
             mode_spread_hz=metrics.get("mode_spread_hz"),
             center_offset_m=metrics.get("center_offset_m"),
+            physical_min_ok=metrics.get("physical_min_ok"),
+            hessian_status=metrics.get("hessian_status"),
+            grad_rel_at_r0=metrics.get("grad_rel_at_r0"),
             report_path=str(report_path),
             stderr_path=str(stderr_path),
             stdout_path=str(stdout_path),
@@ -540,6 +579,9 @@ def evaluate_case(
             max_freq_hz=None,
             mode_spread_hz=None,
             center_offset_m=None,
+            physical_min_ok=None,
+            hessian_status=None,
+            grad_rel_at_r0=None,
             report_path=None,
             stderr_path=str(stderr_path),
             stdout_path=str(stdout_path),
@@ -563,6 +605,9 @@ def _result_row(result: CaseResult) -> Dict[str, Any]:
         "max_freq_hz": result.max_freq_hz,
         "mode_spread_hz": result.mode_spread_hz,
         "center_offset_m": result.center_offset_m,
+        "physical_min_ok": result.physical_min_ok,
+        "hessian_status": result.hessian_status,
+        "grad_rel_at_r0": result.grad_rel_at_r0,
         "mesh_path": result.mesh_path,
         "case_dir": result.case_dir,
         "report_path": result.report_path,
