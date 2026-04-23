@@ -20,8 +20,8 @@ Typical usage
 3. Run a random search over parameter bounds.
 4. Collect JSON reports and a CSV summary.
 
-Example (run from src/ directory)
--------
+Example 1 — single-junction sweep (run from src/ directory)
+-----------------------------------------------------------
 python automate.py \
   --run-case ./run_case.py \
   --mesh-template "python ../meshes/run_case.py \
@@ -50,6 +50,67 @@ python automate.py \
   --coord-unit 1e-3 \
   --n-cases 20 \
   --seed 42
+
+Example 2 — 2-junction sweep via assemble_mesh.py (preferred)
+-------------------------------------------------------------
+python automate.py \
+  --run-case ./run_sweep_metrics.py \
+  --mesh-template "python ../geometry/assemble_mesh.py \
+    --rf ../geometry/rf.step \
+    --dc ../geometry/dc.step \
+    --ground ../geometry/ground.step \
+    --njunctions 2 \
+    --junction-pitch 0.600 \
+    --lc-electrode {lc_electrode} \
+    --lc-center {lc_center} \
+    --lc-far {lc_far} \
+    --pad-z-top {pad_z_top} \
+    --nopopup \
+    --out {mesh_path}" \
+  --workdir ./sweep_2junc \
+  --rf-tags 1 --ground-tags 3 --outer-tags 4 \
+  --param lc_electrode:0.002:0.006 \
+  --param lc_center:0.003:0.008 \
+  --param lc_far:0.020:0.050 \
+  --param pad_z_top:0.400:0.800 \
+  --degree 2 --mass-amu 40.0 --rf-freq 40e6 --vrf 150 \
+  --coord-unit 1e-3 --r0-x-auto --n-cases 20 --seed 42
+
+Example 3 — 2-junction sweep via junction_assemble_gmsh.py
+----------------------------------------------------------
+Pre-assemble STEP geometry, then mesh with assemble_mesh.py in one
+template command. Use this when you need junction_assemble_gmsh.py's
+fragment-based assembly (e.g., custom STEP inputs or junction spacing).
+
+python automate.py \
+  --run-case ./run_sweep_metrics.py \
+  --mesh-template "python ../geometry/junction_assemble_gmsh.py \
+    --rf ../geometry/rf.step \
+    --dc ../geometry/dc.step \
+    --ground ../geometry/ground.step \
+    --out {case_dir}/combined.step \
+    --spacing {junction_spacing} \
+    --no-brep --quiet \
+    && python ../geometry/assemble_mesh.py \
+    --rf {case_dir}/combined.step \
+    --dc /dev/null --ground /dev/null \
+    --lc-electrode {lc_electrode} \
+    --lc-center {lc_center} \
+    --lc-far {lc_far} \
+    --nopopup \
+    --out {mesh_path}" \
+  --workdir ./sweep_2junc_assembled \
+  --rf-tags 1 --ground-tags 3 --outer-tags 4 \
+  --param junction_spacing:0.500:0.700 \
+  --param lc_electrode:0.002:0.006 \
+  --param lc_center:0.003:0.008 \
+  --param lc_far:0.020:0.050 \
+  --degree 2 --mass-amu 40.0 --rf-freq 40e6 --vrf 150 \
+  --coord-unit 1e-3 --r0-x-auto --n-cases 20 --seed 42
+
+Note: Example 2 (assemble_mesh.py --njunctions 2) is simpler and
+preferred for most sweeps. Example 3 is for cases where you need
+junction_assemble_gmsh.py's separate STEP assembly step.
 """
 
 import argparse
@@ -135,6 +196,8 @@ class CaseResult:
     stdout_path: Optional[str]
     error_message: Optional[str]
     elapsed_s: float
+    rejection_reason: Optional[str] = None
+    paper_comparison: Optional[Dict[str, Any]] = None
 
 
 # -----------------------------------------------------------------------------
@@ -182,19 +245,14 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def load_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text())
-
-def find_paths(obj, prefix="root"):
-    if isinstance(obj, Path):
-        print(prefix, "->", obj)
-    elif isinstance(obj, dict):
-        for k, v in obj.items():
-            find_paths(v, f"{prefix}.{k}")
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            find_paths(v, f"{prefix}[{i}]")
-
-
+    text = path.read_text()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Corrupt or partial JSON in {path} "
+            f"(size={len(text)} bytes, first 200 chars: {text[:200]!r}): {e}"
+        ) from e
 
 def render_template(template: str, mapping: Dict[str, Any]) -> str:
     try:
@@ -322,6 +380,31 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+def classify_rejection(metrics: Dict[str, Any], status: str,
+                       error_message: Optional[str] = None) -> Optional[str]:
+    """Return a short rejection-reason tag, or None if the case is scorable.
+
+    Rejection reasons (mutually exclusive, checked in order):
+      "subprocess_crash" — run_case.py / mesh gen returned non-zero or threw
+      "corrupt_json"     — JSON report could not be parsed
+      "no_report"        — JSON report file was not found
+      "invalid_physical" — physical_min_ok == False (far-field / electrode minimum)
+      "missing_metrics"  — depth_eV or min_freq_hz is None
+      None               — case is scorable
+    """
+    if status == "failed":
+        if error_message and "Could not locate" in error_message:
+            return "no_report"
+        if error_message and ("JSON" in error_message or "json" in error_message.lower()):
+            return "corrupt_json"
+        return "subprocess_crash"
+    if metrics.get("physical_min_ok") is False:
+        return "invalid_physical"
+    if metrics.get("depth_eV") is None or metrics.get("min_freq_hz") is None:
+        return "missing_metrics"
+    return None
+
+
 def score_case_metrics(metrics: Dict[str, Any]) -> Optional[float]:
     """Scalar objective for local RF confinement quality.
 
@@ -386,6 +469,298 @@ def score_case_metrics(metrics: Dict[str, Any]) -> Optional[float]:
 
 
 # -----------------------------------------------------------------------------
+# Paper benchmark comparison
+# -----------------------------------------------------------------------------
+
+# Reference values from published 3D-printed micro ion trap papers.
+#
+# Sources:
+#   Paper 1: "3D-Printed Micro Ion Trap Technology for Scalable Quantum
+#             Information Processing"
+#     - Ion: Ca-40
+#     - RF: 51.6 MHz (experiment); comparison simulation: 80 MHz, 150 V
+#     - Trap geometry: opposing RF electrode separation 200 µm,
+#       ion-to-RF distance 100 µm, RF pillar height 300 µm
+#     - Experimental radial frequency range: 2.09–24.15 MHz
+#
+#   Paper 2: "Feasibility Study of 3D-Printed Micro Junction Array for
+#             Ion Trap Quantum Processor"
+#     - Ion: Yb-171  (mass 171 amu)
+#     - RF: 44.3 MHz, 190 V
+#     - Geometry: RF electrode width 120 µm, height 247 µm,
+#       RF cross-section 56 µm × 82 µm, junction spacing 600 µm
+#     - LINEAR REGION: trap height 82.3 µm, freq 2.32 MHz,
+#       q_z = 0.15, depth 2.3 eV
+#
+# IMPORTANT: Paper 2 uses Yb-171 at 44.3 MHz / 190 V.  Our sweeps
+# typically use Ca-40 at 40 MHz / ~150 V.  Geometry-only metrics
+# (trap height) are directly comparable; frequency and depth scale
+# with ion mass and operating conditions.  The comparison notes
+# when operating conditions differ.
+#
+# Pseudopotential scaling:
+#   Ψ ∝ q²|∇φ|² / (4 m ω²)  →  depth ∝ V_rf² / (m × f_rf²)
+#   freq ∝ V_rf / (m × f_rf × coord_scale²)^(1/2)
+# For Ca-40 at 40 MHz / 150 V vs Yb-171 at 44.3 MHz / 190 V
+# on the same geometry, the Ca-40 case has ~3.3× deeper well
+# and ~1.8× higher secular frequencies due to lighter mass.
+
+PAPER_BENCHMARKS: Dict[str, Dict[str, Any]] = {
+    # ── Paper 2: Junction array linear region (primary reference) ────────
+    # This is the main reference for our n=3/n=4 geometry sweeps.
+    # Values are from the paper directly (Yb-171, 44.3 MHz, 190 V).
+    "paper2_linear_yb171": {
+        "description": "Paper 2 junction array, linear region (Yb-171, 44.3 MHz, 190 V)",
+        "ion": "Yb-171",
+        "mass_amu": 171.0,
+        "rf_freq_mhz": 44.3,
+        "vrf_V": 190.0,
+        "trap_height_um": 82.3,
+        "trap_height_tolerance_um": 15.0,
+        "radial_freq_mhz": 2.32,       # single reported radial freq
+        "q_z": 0.15,
+        "depth_eV": 2.3,               # total trap depth (3D design)
+        "depth_surface_trap_eV": 0.074, # comparison: surface trap = 74 meV
+        "transport_barrier_eV": 0.007,  # pseudopotential barrier along CTC < 7 meV
+        "junction_trap_height_um": 40.0,  # trap height near junction centre
+        "notes": (
+            "Paper values for Yb-171 at 44.3 MHz / 190 V.  For Ca-40 at "
+            "40 MHz / 150 V on the same geometry, expect ~3.3× deeper well "
+            "and ~1.8× higher secular frequencies due to lighter mass."
+        ),
+    },
+    # ── Paper 2 scaled to Ca-40 / 40 MHz / 150 V (our typical sweep) ────
+    # Approximate scaled values for direct comparison with our sweep output.
+    # Trap height is geometry-only (no scaling needed).
+    # Freq scales as: f_Ca ≈ f_Yb × sqrt(m_Yb/m_Ca) × (V_Ca/V_Yb) / (f_rf_Ca/f_rf_Yb)
+    #   = 2.32 × sqrt(171/40) × (150/190) × (44.3/40) ≈ 2.32 × 2.07 × 0.789 × 1.108 ≈ 4.2 MHz
+    # Depth scales as: D_Ca ≈ D_Yb × (V_Ca/V_Yb)² × (m_Yb/m_Ca) × (f_rf_Yb/f_rf_Ca)²
+    #   = 2.3 × 0.623 × 4.275 × 1.226 ≈ 7.5 eV  (but capped by finite mesh domain)
+    "paper2_linear_ca40_scaled": {
+        "description": "Paper 2 linear region, scaled to Ca-40, 40 MHz, 150 V (approximate)",
+        "ion": "Ca-40",
+        "mass_amu": 40.0,
+        "rf_freq_mhz": 40.0,
+        "vrf_V": 150.0,
+        "trap_height_um": 82.3,
+        "trap_height_tolerance_um": 15.0,
+        "strong_freq_min_mhz": 4.0,    # approximate scaled radial frequency
+        "strong_freq_max_mhz": None,    # only one radial freq reported in paper
+        "depth_z_eV": None,             # not directly available from scaling
+        "radial_depth_core_eV": None,   # not directly available from scaling
+        "depth_eV_approximate": 7.5,    # very approximate; depends on mesh extent
+        "notes": (
+            "Approximately scaled from Paper 2 Yb-171 values.  Trap height is "
+            "geometry-only and directly comparable.  Frequency and depth scalings "
+            "are approximate — actual values depend on mesh resolution, boundary "
+            "conditions, and the exact electrode geometry used in the sweep."
+        ),
+    },
+    # ── Paper 1: Single-junction 3D-printed trap (Ca-40) ─────────────────
+    "paper1_ca40_experiment": {
+        "description": "Paper 1 3D-printed single trap (Ca-40, 51.6 MHz experimental)",
+        "ion": "Ca-40",
+        "mass_amu": 40.0,
+        "rf_freq_mhz": 51.6,
+        "vrf_V": 160.0,     # max explored experimentally
+        "ion_height_above_dc_um": 130.0,
+        "rf_pillar_height_um": 300.0,
+        "opposing_rf_separation_um": 200.0,
+        "ion_to_rf_distance_um": 100.0,
+        "radial_freq_range_mhz": [2.09, 24.15],
+        "highest_radial_freq_mhz": 24.15,
+        "q_at_highest": 0.903,
+        "notes": (
+            "Paper 1 experimental values.  Different geometry (single junction, "
+            "taller RF pillars, wider RF separation) — not directly comparable "
+            "to the 5-wire junction array geometry."
+        ),
+    },
+}
+
+
+def compare_to_paper_benchmarks(
+    report: Dict[str, Any],
+    metrics: Dict[str, Any],
+    *,
+    benchmark_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Compare case metrics to paper benchmark values.
+
+    Returns a dict with per-metric signed differences, relative differences,
+    per-metric verdicts, and an overall verdict label.  Returns None if
+    insufficient metrics are available for any meaningful comparison.
+
+    Default benchmark: "paper2_linear_ca40_scaled" (Paper 2 junction array,
+    linear region, approximately scaled to Ca-40 / 40 MHz / 150 V).
+
+    For raw paper values (Yb-171), use benchmark_key="paper2_linear_yb171".
+
+    Parameters
+    ----------
+    report        : full JSON report from run_case.py or run_sweep_metrics.py
+    metrics       : extracted metrics dict from extract_metrics_from_report()
+    benchmark_key : explicit benchmark key from PAPER_BENCHMARKS
+    """
+    # ── Select benchmark ─────────────────────────────────────────────────────
+    if benchmark_key and benchmark_key in PAPER_BENCHMARKS:
+        bench = PAPER_BENCHMARKS[benchmark_key]
+    else:
+        # Default: use Ca-40 scaled version of Paper 2 linear region.
+        bench = PAPER_BENCHMARKS["paper2_linear_ca40_scaled"]
+    bench_key = benchmark_key or "paper2_linear_ca40_scaled"
+
+    # Check whether case and benchmark operating conditions match
+    _case_ion_mass = safe_float(report.get("mass_amu"))
+    _case_rf_freq = safe_float(report.get("rf_freq_Hz"))
+    _case_vrf = safe_float(report.get("vrf_V"))
+    _bench_mass = bench.get("mass_amu")
+    _bench_rf = bench.get("rf_freq_mhz")
+    _bench_vrf = bench.get("vrf_V")
+    operating_match = True
+    mismatch_notes: List[str] = []
+    if _case_ion_mass and _bench_mass and abs(_case_ion_mass - _bench_mass) > 0.5:
+        operating_match = False
+        mismatch_notes.append(f"ion mass: case={_case_ion_mass} vs bench={_bench_mass} amu")
+    if _case_rf_freq and _bench_rf:
+        _case_rf_mhz = _case_rf_freq / 1e6
+        if abs(_case_rf_mhz - _bench_rf) / _bench_rf > 0.05:
+            operating_match = False
+            mismatch_notes.append(f"RF freq: case={_case_rf_mhz:.1f} vs bench={_bench_rf} MHz")
+    if _case_vrf and _bench_vrf and abs(_case_vrf - _bench_vrf) / _bench_vrf > 0.1:
+        operating_match = False
+        mismatch_notes.append(f"V_RF: case={_case_vrf} vs bench={_bench_vrf} V")
+
+    # ── Gather case values ───────────────────────────────────────────────────
+    r0_z_m = None
+    if "r0_z_m" in report:
+        r0_z_m = safe_float(report["r0_z_m"])
+    elif isinstance(report.get("r0_SI_m"), list) and len(report["r0_SI_m"]) >= 3:
+        r0_z_m = safe_float(report["r0_SI_m"][2])
+    trap_height_um = r0_z_m * 1e6 if r0_z_m is not None else None
+
+    min_freq_mhz = metrics["min_freq_hz"] / 1e6 if metrics.get("min_freq_hz") else None
+    max_freq_mhz = metrics["max_freq_hz"] / 1e6 if metrics.get("max_freq_hz") else None
+
+    depth_z_eV = safe_float(report.get("depth_z_eV"))
+    radial_depth_core_eV = safe_float(report.get("radial_depth_core_eV"))
+    if radial_depth_core_eV is None:
+        radial_depth_core_eV = metrics.get("depth_eV")
+
+    # Also check for transport barrier if available
+    transport_barrier_eV = safe_float(report.get("transport_barrier_xscan_eV"))
+
+    # ── Per-metric comparison ────────────────────────────────────────────────
+    comparisons: List[Dict[str, Any]] = []
+
+    def _compare(name: str, case_val: Optional[float], paper_val: Optional[float],
+                 higher_is_better: bool = True, unit: str = "",
+                 tolerance_frac: float = 0.0) -> None:
+        if case_val is None or paper_val is None:
+            return
+        diff = case_val - paper_val
+        rel_diff = diff / abs(paper_val) if abs(paper_val) > 1e-30 else float("inf")
+        if abs(rel_diff) <= tolerance_frac:
+            verdict = "comparable"
+        elif (diff > 0) == higher_is_better:
+            verdict = "better"
+        else:
+            verdict = "worse"
+        comparisons.append({
+            "metric": name,
+            "case_value": round(case_val, 6),
+            "paper_value": round(paper_val, 6),
+            "difference": round(diff, 6),
+            "relative_diff_pct": round(rel_diff * 100, 1),
+            "verdict": verdict,
+            "unit": unit,
+        })
+
+    # Trap height — geometry-only, always directly comparable
+    if trap_height_um is not None and bench.get("trap_height_um") is not None:
+        _paper_h = bench["trap_height_um"]
+        _tol = bench.get("trap_height_tolerance_um", 15.0)
+        _diff = trap_height_um - _paper_h
+        _rel = _diff / _paper_h if _paper_h > 0 else 0
+        if abs(_diff) <= _tol:
+            _h_verdict = "comparable"
+        else:
+            _h_verdict = "higher" if _diff > 0 else "lower"
+        comparisons.append({
+            "metric": "trap_height",
+            "case_value": round(trap_height_um, 2),
+            "paper_value": round(_paper_h, 2),
+            "difference": round(_diff, 2),
+            "relative_diff_pct": round(_rel * 100, 1),
+            "verdict": _h_verdict,
+            "unit": "µm",
+        })
+
+    # Secular frequencies — the benchmark may have a single "radial_freq_mhz"
+    # (Paper 2 reports one frequency) or separate strong_freq_min/max.
+    _bench_freq = bench.get("strong_freq_min_mhz") or bench.get("radial_freq_mhz")
+    _compare("strong_freq_min", min_freq_mhz, _bench_freq,
+             higher_is_better=True, unit="MHz", tolerance_frac=0.10)
+    _compare("strong_freq_max", max_freq_mhz, bench.get("strong_freq_max_mhz"),
+             higher_is_better=True, unit="MHz", tolerance_frac=0.10)
+
+    # Depths — higher is better
+    _bench_depth = bench.get("depth_z_eV") or bench.get("depth_eV")
+    _compare("depth_z", depth_z_eV, _bench_depth,
+             higher_is_better=True, unit="eV", tolerance_frac=0.15)
+    _compare("radial_depth_core", radial_depth_core_eV, bench.get("radial_depth_core_eV"),
+             higher_is_better=True, unit="eV", tolerance_frac=0.15)
+
+    # Transport barrier — lower is better (easier ion shuttling)
+    _bench_transport = bench.get("transport_barrier_eV")
+    if transport_barrier_eV is not None and _bench_transport is not None:
+        _compare("transport_barrier", transport_barrier_eV, _bench_transport,
+                 higher_is_better=False, unit="eV", tolerance_frac=0.20)
+
+    if not comparisons:
+        return None
+
+    # ── Overall verdict ──────────────────────────────────────────────────────
+    confinement_metrics = [c for c in comparisons if c["metric"] != "trap_height"]
+    conf_verdicts = [c["verdict"] for c in confinement_metrics]
+    conf_better = conf_verdicts.count("better")
+    conf_worse = conf_verdicts.count("worse")
+
+    if conf_worse == 0 and conf_better > 0:
+        overall = "better"
+    elif conf_better == 0 and conf_worse > 0:
+        overall = "worse"
+    elif conf_better > 0 and conf_worse > 0:
+        better_names = [c["metric"] for c in confinement_metrics if c["verdict"] == "better"]
+        worse_names = [c["metric"] for c in confinement_metrics if c["verdict"] == "worse"]
+        overall = f"mixed: better on {','.join(better_names)}; worse on {','.join(worse_names)}"
+    else:
+        overall = "comparable"
+
+    if not operating_match:
+        overall += f" (operating conditions differ: {'; '.join(mismatch_notes)})"
+
+    # Summary one-liner for logs
+    parts = []
+    for c in comparisons:
+        sign = "+" if c["difference"] >= 0 else ""
+        parts.append(f"{c['metric']}={c['case_value']}{c['unit']} "
+                     f"({sign}{c['relative_diff_pct']}% vs paper)")
+    summary_line = "; ".join(parts)
+
+    return {
+        "benchmark_used": bench.get("description", "unknown"),
+        "benchmark_key": bench_key,
+        "operating_conditions_match": operating_match,
+        "operating_mismatch": mismatch_notes if mismatch_notes else None,
+        "comparisons": comparisons,
+        "verdict": overall,
+        "summary": summary_line,
+        "caveat": bench.get("notes", ""),
+    }
+
+
+# -----------------------------------------------------------------------------
 # External execution
 # -----------------------------------------------------------------------------
 
@@ -412,9 +787,17 @@ def generate_mesh(
     """Run the user-provided mesh-generation command template.
 
     The template may reference:
-    - all parameter names, e.g. {rf_height}
-    - {case_dir}
-    - {mesh_path}
+    - all parameter names, e.g. {rf_height}, {junction_spacing}
+    - {case_dir}  — resolved absolute path to the case working directory
+    - {mesh_path} — resolved absolute path to the expected output mesh file
+
+    Multi-step commands:
+      If the template contains shell operators (&&, ||, ;, |) the command is
+      executed via ``sh -c "..."`` instead of direct exec.  This allows
+      chained pipelines such as::
+
+          python junction_assemble_gmsh.py ... --out {case_dir}/combined.step && \
+          python assemble_mesh.py --rf {case_dir}/combined.step ... --out {mesh_path}
     """
     mesh_path = (case_dir / "mesh.msh").resolve()
     mapping: Dict[str, Any] = dict(params)
@@ -422,11 +805,29 @@ def generate_mesh(
     mapping["mesh_path"] = str(mesh_path)
 
     command_str = render_template(mesh_template, mapping)
-    cmd = shlex.split(command_str)
+
+    # Detect shell operators that require sh -c invocation
+    _shell_ops = ("&&", "||", "|", ";")
+    needs_shell = any(op in command_str for op in _shell_ops)
+
+    if needs_shell:
+        cmd: Any = command_str   # will be passed as string with shell=True
+    else:
+        cmd = shlex.split(command_str)
 
     gen_stdout = case_dir / "meshgen.stdout.txt"
     gen_stderr = case_dir / "meshgen.stderr.txt"
-    rc = run_subprocess(cmd, cwd=None, stdout_path=gen_stdout, stderr_path=gen_stderr)
+    with gen_stdout.open("w") as fout, gen_stderr.open("w") as ferr:
+        proc = subprocess.run(
+            cmd,
+            cwd=None,
+            stdout=fout,
+            stderr=ferr,
+            text=True,
+            shell=needs_shell,
+        )
+    rc = int(proc.returncode)
+
     if rc != 0:
         raise RuntimeError(
             f"Mesh generation failed with exit code {rc}. See {gen_stderr}"
@@ -566,6 +967,8 @@ def evaluate_case(
         report = load_json(report_path)
         metrics = extract_metrics_from_report(report)
         score = score_case_metrics(metrics)
+        rejection = classify_rejection(metrics, "ok")
+        paper_cmp = compare_to_paper_benchmarks(report, metrics)
 
         elapsed = time.time() - start
         return CaseResult(
@@ -589,9 +992,13 @@ def evaluate_case(
             stdout_path=str(stdout_path),
             error_message=None,
             elapsed_s=elapsed,
+            rejection_reason=rejection,
+            paper_comparison=paper_cmp,
         )
     except Exception as e:
         elapsed = time.time() - start
+        err_msg = str(e)
+        rejection = classify_rejection({}, "failed", error_message=err_msg)
         return CaseResult(
             case_id=case_id,
             params=params,
@@ -611,8 +1018,9 @@ def evaluate_case(
             report_path=None,
             stderr_path=str(stderr_path),
             stdout_path=str(stdout_path),
-            error_message=str(e),
+            error_message=err_msg,
             elapsed_s=elapsed,
+            rejection_reason=rejection,
         )
 
 
@@ -622,10 +1030,11 @@ def evaluate_case(
 
 
 def _result_row(result: CaseResult) -> Dict[str, Any]:
-    return {
+    row = {
         "case_id": result.case_id,
         "status": result.status,
         "score": result.score,
+        "rejection_reason": result.rejection_reason,
         "depth_eV": result.depth_eV,
         "min_freq_hz": result.min_freq_hz,
         "max_freq_hz": result.max_freq_hz,
@@ -643,6 +1052,11 @@ def _result_row(result: CaseResult) -> Dict[str, Any]:
         "elapsed_s": result.elapsed_s,
         **{f"param_{k}": v for k, v in result.params.items()},
     }
+    # Include paper comparison fields inline if available
+    if result.paper_comparison:
+        row["paper_verdict"] = result.paper_comparison.get("verdict")
+        row["paper_summary"] = result.paper_comparison.get("summary")
+    return row
 
 
 def _load_existing_results(summary_csv: Path) -> Dict[str, Dict[str, Any]]:
@@ -716,24 +1130,37 @@ def run_bayesian_search(
         case_counter[0] += 1
         return idx
 
+    # Track rejection reasons across the sweep for health summaries
+    rejection_counts: Dict[str, int] = {}
+
     def record(result: CaseResult) -> None:
         results.append(result)
         row = _result_row(result)
         append_csv_row(summary_csv, row)
         with all_jsonl.open("a") as f:
-            f.write(json.dumps(row) + "\n")
+            f.write(json.dumps(row, default=str) + "\n")
+        # Track rejection reasons
+        if result.rejection_reason:
+            rejection_counts[result.rejection_reason] = (
+                rejection_counts.get(result.rejection_reason, 0) + 1
+            )
         _bd = result.score_breakdown or {}
-        _bd_str = (
-            f"  depth={_bd.get('term_depth', '?'):.3g}"
-            f"  freq={_bd.get('term_freq', '?'):.3g}"
-            f"  spread_pen={_bd.get('term_spread_pen', '?'):.3g}"
-            f"  (excess={_bd.get('spread_excess_mhz', '?'):.2g} MHz)"
-            if _bd else ""
-        )
+        _bd_str = ""
+        if _bd:
+            _bd_str = (
+                f"  depth={_bd.get('term_depth', 0):.3g}"
+                f"  freq={_bd.get('term_freq', 0):.3g}"
+                f"  spread_pen={_bd.get('term_spread_pen', 0):.3g}"
+                f"  (excess={_bd.get('spread_excess_mhz', 0):.2g} MHz)"
+            )
+        _rej_str = f"  REJECT={result.rejection_reason}" if result.rejection_reason else ""
+        _paper_str = ""
+        if result.paper_comparison and result.paper_comparison.get("verdict"):
+            _paper_str = f"  paper={result.paper_comparison['verdict']}"
         print(
             f"[{result.case_id}] {result.status} | score={result.score} "
             f"| hessian={result.hessian_status} phys_ok={result.physical_min_ok}"
-            f"{_bd_str}"
+            f"{_bd_str}{_rej_str}{_paper_str}"
             f" | elapsed={result.elapsed_s:.1f}s"
         )
 
@@ -793,8 +1220,14 @@ def run_bayesian_search(
 
     # Feed existing results into the optimizer so it starts warm.
     if all_x:
-        pen = failure_penalty([r for r in results])
-        y_feed = [(-y if y is not None else -pen) for y in all_y]
+        # Compute penalty from existing scores (results list is empty during
+        # resume — use the loaded all_y values instead).
+        _valid_existing = [y for y in all_y if y is not None]
+        if _valid_existing:
+            pen_warm = min(_valid_existing) - abs(min(_valid_existing)) * 0.1
+        else:
+            pen_warm = -1e6
+        y_feed = [(-y if y is not None else -pen_warm) for y in all_y]
         # skopt minimizes, so negate the score (we want to maximize).
         opt.tell(all_x, y_feed)
         print(f"[bayes] Warm-started optimizer with {len(all_x)} existing points.")
@@ -825,8 +1258,11 @@ def run_bayesian_search(
             remaining -= len(batch_results)
             total_done += len(batch_results)
 
-            # Print current best.
+            # Print current best + sweep health summary.
             valid = [r for r in results if r.score is not None]
+            n_total = len(results)
+            n_valid = len(valid)
+            yield_pct = 100.0 * n_valid / n_total if n_total > 0 else 0.0
             if valid:
                 best = max(valid, key=lambda r: r.score)  # type: ignore[arg-type]
                 print(
@@ -834,6 +1270,10 @@ def run_bayesian_search(
                     f"best so far: {best.case_id} score={best.score:.4g} "
                     f"params={best.params}"
                 )
+            print(
+                f"[sweep health] {n_valid}/{n_total} valid ({yield_pct:.0f}% yield)"
+                + (f"  rejections: {rejection_counts}" if rejection_counts else "")
+            )
 
     return results
 
@@ -848,6 +1288,25 @@ def print_best(results: Sequence[CaseResult], *, top_k: int = 5) -> None:
     valid = [r for r in results if r.status == "ok" and r.score is not None]
     valid.sort(key=lambda r: r.score if r.score is not None else -1e99, reverse=True)
 
+    # ── Sweep health summary ─────────────────────────────────────────────────
+    n_total = len(results)
+    n_valid = len(valid)
+    n_failed = sum(1 for r in results if r.status == "failed")
+    n_rejected = sum(1 for r in results if r.status == "ok" and r.score is None)
+    rej_reasons: Dict[str, int] = {}
+    for r in results:
+        if r.rejection_reason:
+            rej_reasons[r.rejection_reason] = rej_reasons.get(r.rejection_reason, 0) + 1
+
+    print("\nSweep health summary")
+    print("====================")
+    print(f"  Total cases:      {n_total}")
+    print(f"  Valid (scored):    {n_valid}  ({100*n_valid/n_total:.0f}% yield)" if n_total else "")
+    print(f"  Failed (crash):   {n_failed}")
+    print(f"  Rejected (no score): {n_rejected}")
+    if rej_reasons:
+        print(f"  Rejection breakdown: {rej_reasons}")
+
     print("\nTop results")
     print("===========")
     if not valid:
@@ -855,10 +1314,13 @@ def print_best(results: Sequence[CaseResult], *, top_k: int = 5) -> None:
         return
 
     for r in valid[:top_k]:
+        _paper = ""
+        if r.paper_comparison and r.paper_comparison.get("verdict"):
+            _paper = f", paper={r.paper_comparison['verdict']}"
         print(
             f"{r.case_id}: score={r.score:.6g}, depth_eV={r.depth_eV}, "
-            f"min_freq_hz={r.min_freq_hz}, mode_spread_hz={r.mode_spread_hz}, "
-            f"case_dir={r.case_dir}"
+            f"min_freq_hz={r.min_freq_hz}, mode_spread_hz={r.mode_spread_hz}"
+            f"{_paper}, case_dir={r.case_dir}"
         )
 
 
@@ -971,7 +1433,6 @@ def main() -> None:
         "n_cases": args.n_cases,
         "seed": args.seed,
     }
-    find_paths(config_dump)
     write_json(cfg.workdir / "automation_config.json", config_dump)
 
     results = run_bayesian_search(

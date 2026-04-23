@@ -2,22 +2,28 @@
 """
 Assemble two identical X-junction STEP models using gmsh OCC.
 
-Inputs expected in the same directory as this script:
-    rf.step
-    dc.step
-    ground.step
+Default inputs (in the same directory as this script):
+    rf.step, dc.step, ground.step
 
 Behavior:
 - imports rf.step, dc.step, ground.step
 - duplicates each imported volume set
-- translates the duplicate by 0.6 mm (600 um) center-to-center
+- translates the duplicate by --spacing mm center-to-center (default 0.6 mm)
 - performs OCC fragment/fuse-style cleanup so overlaps are accounted for
 - groups resulting volumes by source class (RF/DC/GROUND)
-- exports the combined geometry to connected_xjunction.step
-- optionally also writes connected_xjunction.brep for robustness/debugging
+- exports the combined geometry to connected_xjunction.step (or --out)
+- optionally also writes .brep for debugging
 
-Run:
+Run (standalone):
     python junction_assemble_gmsh.py
+
+Run with explicit paths (for use in automate.py mesh templates):
+    python junction_assemble_gmsh.py \\
+        --rf path/to/rf.step \\
+        --dc path/to/dc.step \\
+        --ground path/to/ground.step \\
+        --out {case_dir}/combined.step \\
+        --spacing 0.6
 
 Requirements:
     pip install gmsh
@@ -25,6 +31,7 @@ or a local gmsh Python install.
 """
 
 from __future__ import annotations
+import argparse
 from pathlib import Path
 import sys
 import math
@@ -120,22 +127,53 @@ def classify_by_seed(all_vols: list[tuple[int, int]],
     return rf, dc, gnd, unknown
 
 
-def main() -> int:
+def build_argparser() -> argparse.ArgumentParser:
     here = Path(__file__).resolve().parent
-    rf_path = here / "rf.step"
-    dc_path = here / "dc.step"
-    gnd_path = here / "ground.step"
-    out_step = here / "connected_xjunction.step"
-    out_brep = here / "connected_xjunction.brep"
+    ap = argparse.ArgumentParser(
+        description="Assemble two identical X-junction STEP models using gmsh OCC."
+    )
+    ap.add_argument("--rf", type=Path, default=here / "rf.step",
+                    help="RF electrode STEP file (default: rf.step in script dir)")
+    ap.add_argument("--dc", type=Path, default=here / "dc.step",
+                    help="DC electrode STEP file (default: dc.step in script dir)")
+    ap.add_argument("--ground", type=Path, default=here / "ground.step",
+                    help="Ground electrode STEP file (default: ground.step in script dir)")
+    ap.add_argument("--out", type=Path, default=here / "connected_xjunction.step",
+                    help="Output combined STEP file (default: connected_xjunction.step)")
+    ap.add_argument("--spacing", type=float, default=CENTER_TO_CENTER_MM,
+                    help=f"Junction center-to-center spacing in mm (default: {CENTER_TO_CENTER_MM})")
+    ap.add_argument("--axis", type=str, default=TRANSLATION_AXIS, choices=["x", "y", "z"],
+                    help=f"Translation axis (default: {TRANSLATION_AXIS})")
+    ap.add_argument("--no-brep", action="store_true",
+                    help="Skip writing .brep companion file")
+    ap.add_argument("--quiet", action="store_true",
+                    help="Suppress progress output")
+    return ap
+
+
+def main() -> int:
+    ap = build_argparser()
+    args = ap.parse_args()
+
+    rf_path = args.rf
+    dc_path = args.dc
+    gnd_path = args.ground
+    out_step = args.out
+    out_brep = out_step.with_suffix(".brep")
+    write_brep = not args.no_brep
+
+    global VERBOSE
+    VERBOSE = not args.quiet
 
     for p in (rf_path, dc_path, gnd_path):
         if not p.exists():
             raise FileNotFoundError(f"Missing input file: {p}")
 
-    dx, dy, dz = axis_vector(CENTER_TO_CENTER_MM, TRANSLATION_AXIS)
+    dx, dy, dz = axis_vector(args.spacing, args.axis)
 
-    gmsh.initialize(sys.argv)
-    gmsh.option.setNumber("General.Terminal", 1)
+    # Pass only program name to gmsh.initialize so argparse owns the rest
+    gmsh.initialize([sys.argv[0]])
+    gmsh.option.setNumber("General.Terminal", 1 if VERBOSE else 0)
     gmsh.model.add("connected_xjunction")
 
     try:
@@ -204,7 +242,7 @@ def main() -> int:
         log(f"DC classified volumes    : {len(dc_vols)}")
         log(f"GROUND classified volumes: {len(gnd_vols)}")
 
-        if WRITE_BREP:
+        if write_brep:
             gmsh.write(str(out_brep))
             log(f"Wrote: {out_brep}")
 
