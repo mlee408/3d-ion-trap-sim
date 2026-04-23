@@ -56,9 +56,9 @@ Example 2 — 2-junction sweep via assemble_mesh.py (preferred)
 python automate.py \
   --run-case ./run_sweep_metrics.py \
   --mesh-template "python ../geometry/assemble_mesh.py \
-    --rf ../cad/base/rf.step \
-    --dc ../cad/base/dc.step \
-    --ground ../cad/base/ground.step \
+    --rf ../geometry/rf.step \
+    --dc ../geometry/dc.step \
+    --ground ../geometry/ground.step \
     --njunctions 2 \
     --junction-pitch 0.600 \
     --lc-electrode {lc_electrode} \
@@ -85,9 +85,9 @@ fragment-based assembly (e.g., custom STEP inputs or junction spacing).
 python automate.py \
   --run-case ./run_sweep_metrics.py \
   --mesh-template "python ../geometry/junction_assemble_gmsh.py \
-    --rf ../cad/base/rf.step \
-    --dc ../cad/base/dc.step \
-    --ground ../cad/base/ground.step \
+    --rf ../geometry/rf.step \
+    --dc ../geometry/dc.step \
+    --ground ../geometry/ground.step \
     --out {case_dir}/combined.step \
     --spacing {junction_spacing} \
     --no-brep --quiet \
