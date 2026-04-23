@@ -7,22 +7,39 @@ User-facing parameters are in micrometres; the script converts internally.
 
 Elementary structures
 ---------------------
-  1. Support beam   – rectangular prism, 56 µm × 56 µm × rf_height
+  1. Support beam   – rectangular prism, 56 µm × 56 µm cross-section; height spans
+                      from the surface RF top (z = 0 in the final assembled mesh) up
+                      to the top vertex of the lattice beam diamond cross-section.
   2. Lattice beam   – prism with diamond cross section, length 656 µm
                       diamond: 56 µm horizontal × 82 µm vertical (baseline)
+
+rf_height convention
+--------------------
+  rf_height is the vertical distance [µm] from the TOP of the surface RF electrode
+  to the CENTROID (centre) of the 3D RF beam diamond cross-section.
+
+  In the final assembled mesh (z = 0 at the surface RF electrode top):
+    z_top_surface_rf = 0                       (reference plane)
+    z_center_beam    = z_top_surface_rf + rf_height
+    z_bottom_beam    = z_center_beam - beam_height / 2   (beam_height = dv)
+    z_top_beam       = z_center_beam + beam_height / 2
+
+  Do NOT interpret rf_height as total beam height, bottom-of-beam to substrate,
+  or bottom-of-beam to surface RF top.
 
 Geometry layout
 ---------------
   • Four support beams at corners, centre-to-centre spacing = 600 µm in x and y.
   • (window_n + 1) lattice ribs in each direction, creating window_n × window_n windows.
   • Outer rib positions coincide with support beam centres (±300 µm from origin).
-  • Top of every lattice beam = top of support beam = z = rf_height.
+  • Top of every lattice beam = top of support beam = z_top_beam (in final mesh coords).
 
 Usage
 -----
   python rf_cell_gen.py [options]
 
-  --rf_height    H   support beam height [µm]  (default 290)
+  --rf_height    H   vertical distance from surface RF top to beam cross-section
+                     centre [µm]  (default 290)
   --rf_thickness T   scale factor for lattice beam cross-section (default 1.0)
   --window_n     N   windows per side (default 2 → 2×2 = 4 windows)
   --step             also write .step
@@ -82,7 +99,13 @@ def build_rf_cell(
 
     Parameters
     ----------
-    rf_height      : support beam height, also sets top-of-lattice z [µm]
+    rf_height      : vertical distance [µm] from the TOP of the surface RF electrode
+                     (z = 0 in the final assembled mesh) to the CENTROID of the 3D RF
+                     beam diamond cross-section.  This is NOT total beam height, NOT
+                     bottom-of-beam to substrate, and NOT bottom-of-beam to surface RF.
+                     The beam cross-section then spans:
+                       z_bottom_beam = z_top_surface_rf + rf_height - dv/2
+                       z_top_beam    = z_top_surface_rf + rf_height + dv/2
     rf_thickness   : uniform scale factor applied to lattice beam cross-section
     window_n       : number of windows per side (total windows = window_n²)
     base_step_path : optional path to rf_base.step (the original RF base plate
@@ -107,17 +130,52 @@ def build_rf_cell(
     half_l = LATTICE_LENGTH_UM / 2.0                 # 328 µm half-length of lattice beam
     s_half  = dh / 2.0   # pillar half-width = rail width (keeps pillar == rail)
 
-    # z coordinates of the lattice beam diamond cross-section
-    z_top    = rf_height          # top vertex (= top of support beam)
-    z_centre = rf_height - dv / 2.0
-    z_bot    = rf_height - dv
+    # ── z coordinates of the lattice beam diamond cross-section ─────────────────
+    #
+    # Convention: rf_height = vertical distance from TOP of the surface RF electrode
+    # to the CENTROID of the 3D RF beam cross-section (in final assembled mesh coords,
+    # where z = 0 is the surface RF top).
+    #
+    # Implementation note: rf_cell_gen.py applies occ.translate(fused, 0, 0, -0.02 mm)
+    # after building.  This shifts everything down by 20 µm so the support beam
+    # bottoms align with the surface RF plate (z ∈ [−0.02, 0] mm in final mesh).
+    # The build ("pre-translation") coordinate system therefore sits 20 µm ABOVE the
+    # final mesh coordinate system.  All Gmsh addPoint/addBox calls below use
+    # pre-translation values.
+    #
+    # Final-mesh z values (z = 0 at surface RF top):
+    _TRANSLATE_DOWN_MM  = 0.02          # must match occ.translate below — do not change
+    _TRANSLATE_OFFSET_UM = _TRANSLATE_DOWN_MM * 1e3   # 20.0 µm
 
-    if z_bot < 0.0:
+    z_top_surface_rf = 0.0                          # final mesh: surface RF electrode top
+    z_center_beam    = z_top_surface_rf + rf_height # final mesh: center of beam cross-section
+    z_bottom_beam    = z_center_beam - dv / 2.0     # final mesh: bottom vertex of diamond
+    z_top_beam       = z_center_beam + dv / 2.0     # final mesh: top vertex of diamond
+
+    # Debug output: show all key z positions in final-mesh coordinates.
+    print(
+        f"  [z-layout] z_top_surface_rf = {z_top_surface_rf:.1f} µm  "
+        f"(reference: top of surface RF, z=0 in assembled mesh)\n"
+        f"  [z-layout] z_center_beam    = {z_center_beam:.1f} µm  "
+        f"(= z_top_surface_rf + rf_height = {rf_height:.1f})\n"
+        f"  [z-layout] z_bottom_beam    = {z_bottom_beam:.1f} µm  "
+        f"(= z_center_beam - dv/2 = {z_center_beam:.1f} - {dv/2:.1f})\n"
+        f"  [z-layout] z_top_beam       = {z_top_beam:.1f} µm  "
+        f"(= z_center_beam + dv/2 = {z_center_beam:.1f} + {dv/2:.1f})"
+    )
+
+    if z_bottom_beam < 0.0:
         print(
-            f"WARNING: lattice beam bottom vertex z = {z_bot:.1f} µm < 0. "
+            f"WARNING: lattice beam bottom vertex is {abs(z_bottom_beam):.1f} µm BELOW "
+            "the surface RF electrode top (z = 0 in assembled mesh). "
             "Increase rf_height or reduce rf_thickness.",
             file=sys.stderr,
         )
+
+    # Pre-translation build coordinates (add _TRANSLATE_OFFSET_UM to all final-mesh z):
+    z_top    = z_top_beam    + _TRANSLATE_OFFSET_UM  # pre-translation diamond top vertex
+    z_centre = z_center_beam + _TRANSLATE_OFFSET_UM  # pre-translation diamond centroid
+    z_bot    = z_bottom_beam + _TRANSLATE_OFFSET_UM  # pre-translation diamond bottom vertex
 
     # ── rib positions along x and y (µm from origin) ────────────────────────
     if window_n < 1:
@@ -144,8 +202,13 @@ def build_rf_cell(
 
     solids: list[tuple[int, int]] = []   # (dim=3, tag) collected before fuse
 
-    # ── 1. Support beams ─────────────────────────────────────────────────────
+    # ── 1. Support beams (pedestals) ────────────────────────────────────────
     # Four rectangular prisms at the corners of the 600 µm × 600 µm square.
+    # Each pedestal spans from z=0 (pre-translation build coords) up to the top
+    # vertex of the diamond beam (z_top, pre-translation), so the pedestal provides
+    # a continuous conductive path from the surface RF plate up through the full
+    # height of the diamond cross-section.
+    # In final-mesh coordinates the pedestal top is at z_top_beam = rf_height + dv/2.
     corners = [
         (-half_sp, -half_sp),
         ( half_sp, -half_sp),
@@ -155,7 +218,7 @@ def build_rf_cell(
     for cx_um, cy_um in corners:
         tag = occ.addBox(
             um(cx_um - s_half), um(cy_um - s_half), um(0.0),
-            um(dh), um(dh), um(rf_height),
+            um(dh), um(dh), um(z_top),   # z_top is pre-translation diamond top vertex
         )
         solids.append((3, tag))
 
@@ -249,7 +312,12 @@ def build_rf_cell(
         )
         print(f"  Tiled {njunctions} junctions at pitch {junction_pitch_um} µm")
 
-    occ.translate(fused, 0.0, 0.0, -0.02)
+    # Shift the entire RF structure down by _TRANSLATE_DOWN_MM so the support beam
+    # bottoms (currently at z=0 in build coords) land at z=-_TRANSLATE_DOWN_MM in the
+    # final assembled mesh, aligning with the bottom of the surface RF plate.
+    # After this translation: z=0 in the final mesh = z=_TRANSLATE_OFFSET_UM in build coords
+    # = top of the surface RF electrode.  This must match _TRANSLATE_DOWN_MM above.
+    occ.translate(fused, 0.0, 0.0, -_TRANSLATE_DOWN_MM)
     occ.synchronize()
 
     # ── 3b. Import and fuse RF base plate ────────────────────────────────────
@@ -323,7 +391,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--rf_height", type=float, default=290.0,
-        help="Support beam height / top-of-lattice z [µm]",
+        help="Vertical distance from the TOP of the surface RF electrode to the "
+             "CENTROID of the 3D RF beam diamond cross-section [µm]. "
+             "The beam spans ±(dv/2) around this centre in z, where dv = "
+             "rf_thickness × 82 µm (baseline vertical diamond diagonal). "
+             "Do NOT interpret as total beam height or as a substrate-referenced "
+             "top-of-beam coordinate.",
     )
     parser.add_argument(
         "--rf_thickness", type=float, default=1.0,
@@ -375,14 +448,20 @@ def main() -> None:
     _eff_thickness = (args.rf_width_um / LATTICE_DH_BASE_UM
                       if args.rf_width_um is not None else args.rf_thickness)
     _eff_width_um  = args.rf_width_um if args.rf_width_um is not None                      else args.rf_thickness * LATTICE_DH_BASE_UM
+    _dv_eff = 82.0 * _eff_thickness   # effective vertical diamond diagonal [µm]
     print(
         f"\nRF lattice cell\n"
-        f"  rf_height    = {args.rf_height} µm\n"
+        f"  rf_height (beam-centre above surface RF top) = {args.rf_height} µm\n"
         f"  rf_width_um  = {_eff_width_um:.1f} µm  "
         f"(rf_thickness = {_eff_thickness:.4f})\n"
         f"  window_n     = {args.window_n}  "
         f"({args.window_n}×{args.window_n} = {args.window_n**2} windows, "
         f"{args.window_n + 1} ribs/side)\n"
+        f"  beam z-layout (in assembled mesh, z=0 at surface RF top):\n"
+        f"    z_top_surface_rf = 0.0 µm\n"
+        f"    z_center_beam    = {args.rf_height:.1f} µm\n"
+        f"    z_bottom_beam    = {args.rf_height - _dv_eff/2:.1f} µm\n"
+        f"    z_top_beam       = {args.rf_height + _dv_eff/2:.1f} µm\n"
     )
 
     try:

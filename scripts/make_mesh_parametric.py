@@ -12,7 +12,9 @@ rf_cell_gen.py and assemble_mesh.py must be in geometry/.
 Parameters swept by automate.py:
     {rf_width_um}  -- electrode width in um (min 10, step 5)
                       controls BOTH rail and pillar thickness equally
-    {rf_height}    -- support beam height in um
+    {rf_height}    -- vertical distance from surface RF electrode top to
+                      the centroid of the 3D RF beam cross-section [µm]
+                      (NOT total beam height; NOT bottom-of-beam to substrate)
 
 window_n is fixed per sweep run (passed as $N in the bash for-loop).
 
@@ -50,7 +52,9 @@ def main() -> int:
                     help="Electrode width in um (min 10, step 5). "
                          "Controls both rail and pillar thickness equally.")
     ap.add_argument("--rf-height",   type=float, default=290.0,
-                    help="Support beam height in um")
+                    help="Vertical distance from surface RF electrode top to "
+                         "RF beam cross-section centroid [µm]. "
+                         "Beam spans ±(dv/2) around this centre in z.")
 
     # Mesh quality
     ap.add_argument("--lc-electrode",  type=float, default=OPT_LC_ELECTRODE)
@@ -74,7 +78,7 @@ def main() -> int:
     case_dir = out_path.parent
 
     print(f"[make_mesh] window_n={window_n}  rf_width={rf_width}um  "
-          f"rf_height={rf_height}um", flush=True)
+          f"rf_height={rf_height}um (beam-centre above surface RF top)", flush=True)
 
     # ── Step 1: generate parametric RF cell STEP via rf_cell_gen.py ──────
     # rf_cell_gen.py writes to cwd, so run it from case_dir.
