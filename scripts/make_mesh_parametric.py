@@ -19,6 +19,29 @@ Parameters swept by automate.py:
 window_n is fixed per sweep run (passed as $N in the bash for-loop).
 
 Update OPT_* with best values from your mesh quality sweep.
+for N in 2; do
+  python -u src/automate.py \
+    --run-case ./src/run_sweep_metrics.py \
+    --mesh-template "python ./scripts/make_mesh_parametric.py \
+        --window-n $N \
+        --rf-width-um {rf_width_um} \
+        --rf-height {rf_height} \
+        --out {mesh_path}" \
+    --workdir ./sweeps/sweep_geom_n${N}\
+    --rf-tags 1 --ground-tags 2 3 --outer-tags 4 \
+    --param rf_width_um:45:70 \
+    --param rf_height:200:300 \
+    --n-cases 4 --n-random-start 8 \
+    --max-workers 4 --seed 42\
+    --degree 2 --mass-amu 171.0 --charge-e 1.0 \
+    --rf-freq 44.3e6 --vrf 190 --coord-unit 1e-3 \
+    --r0-x-min -0.15 --r0-x-max 0.45 \
+    --r0-y-min -0.18 --r0-y-max 0.18 \
+    --r0-z-min -0.03 --r0-z-max 0.12 \
+    --prefix sweep_n2_yb2025 \
+    --fast-metrics \
+    --paper-benchmark paper2_linear_yb171
+done
 """
 
 from __future__ import annotations
