@@ -129,6 +129,7 @@ class CaseResult:
     physical_min_ok: Optional[bool]
     hessian_status: Optional[str]
     grad_rel_at_r0: Optional[float]
+    score_breakdown: Optional[Dict[str, Any]]
     report_path: Optional[str]
     stderr_path: Optional[str]
     stdout_path: Optional[str]
@@ -324,19 +325,29 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
 def score_case_metrics(metrics: Dict[str, Any]) -> Optional[float]:
     """Scalar objective for local RF confinement quality.
 
-    Hard rejects (return None, treated as failed by the surrogate):
-      - physical_min_ok == False  (invalid/far-field minimum)
+    Hard rejects (return None — treated as failures by the Bayesian surrogate):
+      - physical_min_ok == False  (far-field or electrode-adjacent minimum)
       - depth_eV or min_freq_hz missing/NaN
 
-    Soft penalty (score × 0.85):
-      - hessian_status == "borderline_numeric"
+    Score terms (all ~O(1–5) for typical Ca+ geometries at 40 MHz, 150 V):
+      +5.0    × depth_eV          radial_depth_core_eV — local confinement depth
+      +1e-6   × min_freq_hz       weaker of top-2 radial modes (axial excluded)
+      −0.3e-6 × spread_excess_hz  excess radial mode spread beyond 5 MHz target band
 
-    Score terms (all ~O(1) for typical Ca+ geometries at 40 MHz, 150 V):
-      +5.0  × depth_eV          radial_depth_core_eV: local confinement depth
-      +1e-6 × min_freq_hz       weaker of top-2 radial modes (axial excluded)
-      -1e-6 × mode_spread_hz    penalise radial mode asymmetry
+    Mode-spread policy:
+      Spread below SPREAD_TARGET_HZ (5 MHz) is free — some asymmetry is expected
+      in non-square window patterns (e.g. n=3).  Only the excess is penalised, and
+      at 0.3e-6 the penalty grows slowly enough that a 10 MHz excess costs ~3 points
+      (comparable to the depth term) rather than swamping it.  Observed n=3 sweeps
+      had ~16 MHz spread, which would have cost 16 under the old raw-spread policy
+      but costs only ~3.3 here, keeping the score meaningful.
+
+    Soft multiplier (score × 0.85) for borderline_numeric Hessian:
+      Applied after all additive terms so it scales the full score down uniformly.
+      Ensures numerically uncertain cases rank below clearly valid ones with similar
+      depth/frequency, without hard-rejecting them entirely.
     """
-    # Hard reject: invalid minimum detected by run_sweep_metrics.py
+    # ── Hard reject ──────────────────────────────────────────────────────────
     if metrics.get("physical_min_ok") is False:
         return None
 
@@ -347,16 +358,29 @@ def score_case_metrics(metrics: Dict[str, Any]) -> Optional[float]:
     if depth_eV is None or min_freq_hz is None:
         return None
 
-    score = 0.0
-    score += 5.0  * depth_eV
-    score += 1e-6 * min_freq_hz
+    # ── Additive terms ───────────────────────────────────────────────────────
+    term_depth = 5.0  * depth_eV
+    term_freq  = 1e-6 * min_freq_hz
 
-    if mode_spread_hz is not None:
-        score -= 1e-6 * mode_spread_hz
+    # Excess-only spread penalty: free up to 5 MHz, then 0.3 pts per MHz beyond.
+    _SPREAD_TARGET_HZ  = 5e6
+    _SPREAD_COEFF      = 0.3e-6
+    spread_excess_hz   = max(0.0, mode_spread_hz) - _SPREAD_TARGET_HZ if mode_spread_hz is not None else 0.0
+    term_spread_pen    = _SPREAD_COEFF * max(0.0, spread_excess_hz)
 
-    # Soft penalty for numerically borderline Hessian
+    score = term_depth + term_freq - term_spread_pen
+
+    # ── Soft multiplier for borderline Hessian ───────────────────────────────
     if metrics.get("hessian_status") == "borderline_numeric":
         score *= 0.85
+
+    # Store breakdown for the caller to log (does not affect the score value).
+    metrics["_score_breakdown"] = {
+        "term_depth": round(term_depth, 4),
+        "term_freq": round(term_freq, 4),
+        "term_spread_pen": round(-term_spread_pen, 4),
+        "spread_excess_mhz": round(max(0.0, spread_excess_hz) / 1e6, 3),
+    }
 
     return score
 
@@ -559,6 +583,7 @@ def evaluate_case(
             physical_min_ok=metrics.get("physical_min_ok"),
             hessian_status=metrics.get("hessian_status"),
             grad_rel_at_r0=metrics.get("grad_rel_at_r0"),
+            score_breakdown=metrics.get("_score_breakdown"),
             report_path=str(report_path),
             stderr_path=str(stderr_path),
             stdout_path=str(stdout_path),
@@ -582,6 +607,7 @@ def evaluate_case(
             physical_min_ok=None,
             hessian_status=None,
             grad_rel_at_r0=None,
+            score_breakdown=None,
             report_path=None,
             stderr_path=str(stderr_path),
             stdout_path=str(stdout_path),
@@ -696,9 +722,19 @@ def run_bayesian_search(
         append_csv_row(summary_csv, row)
         with all_jsonl.open("a") as f:
             f.write(json.dumps(row) + "\n")
+        _bd = result.score_breakdown or {}
+        _bd_str = (
+            f"  depth={_bd.get('term_depth', '?'):.3g}"
+            f"  freq={_bd.get('term_freq', '?'):.3g}"
+            f"  spread_pen={_bd.get('term_spread_pen', '?'):.3g}"
+            f"  (excess={_bd.get('spread_excess_mhz', '?'):.2g} MHz)"
+            if _bd else ""
+        )
         print(
             f"[{result.case_id}] {result.status} | score={result.score} "
-            f"| elapsed={result.elapsed_s:.1f}s | {result.case_dir}"
+            f"| hessian={result.hessian_status} phys_ok={result.physical_min_ok}"
+            f"{_bd_str}"
+            f" | elapsed={result.elapsed_s:.1f}s"
         )
 
     def submit_batch(executor, param_list: List[Dict[str, float]]) -> List[CaseResult]:
