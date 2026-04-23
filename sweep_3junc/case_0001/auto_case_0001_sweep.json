@@ -1,0 +1,72 @@
+{
+  "mesh": "/Users/michaelee408/Documents/trap_sim/sweep_3junc/case_0001/mesh.msh",
+  "prefix": "auto_case_0001",
+  "r0_x_m": 0.0006080550270467572,
+  "r0_y_m": -3.0471719503361335e-06,
+  "r0_z_m": 6.811516555507576e-05,
+  "freq1_hz": 1036203.5350865147,
+  "freq2_hz": 1251373.0054417348,
+  "freq3_hz": 3995449.5474727065,
+  "strong_freq_min_hz": 1251373.0054417348,
+  "strong_freq_max_hz": 3995449.5474727065,
+  "depth_z_eV": 0.9413572293797536,
+  "depth_z_plus_eV": 0.9413572293797536,
+  "depth_z_minus_eV": 33.15294784276896,
+  "depth_z_interior": true,
+  "depth_y_eV": 0.09941074394569176,
+  "depth_y_plus_eV": 0.09941074394569176,
+  "depth_y_minus_eV": 0.10264908870780601,
+  "depth_y_interior": true,
+  "radial_depth_core_eV": 0.4755267328748828,
+  "transport_barrier_xscan_eV": 0.12428534022338722,
+  "transport_barrier_eigvec_eV": 0.7347897681818475,
+  "h_used": 0.044120349505184016,
+  "physical_min_ok": true,
+  "strong_modes_ok": true,
+  "hessian_status": "valid",
+  "grad_rel_at_r0": 0.3415410495625893,
+  "success": true,
+  "notes": null,
+  "_metric_categories": {
+    "local_secular_hz": [
+      "freq1_hz",
+      "freq2_hz",
+      "freq3_hz"
+    ],
+    "strong_secular_hz": [
+      "strong_freq_min_hz",
+      "strong_freq_max_hz"
+    ],
+    "local_confinement_eV": [
+      "radial_depth_core_eV"
+    ],
+    "paper_comparison_eV": [
+      "depth_z_eV",
+      "depth_y_eV"
+    ],
+    "transport_barriers_eV": [
+      "transport_barrier_xscan_eV",
+      "transport_barrier_eigvec_eV"
+    ]
+  },
+  "rf_freq_Hz": 40000000.0,
+  "vrf_V": 150.0,
+  "mass_amu": 40.0,
+  "charge_e": 1.0,
+  "degree": 2,
+  "coord_unit_m_per_mesh": 0.001,
+  "r0_search_bounds_mesh": {
+    "x": [
+      0.14999999403949998,
+      1.0500000059605
+    ],
+    "y": [
+      null,
+      null
+    ],
+    "z": [
+      0.0,
+      0.15839999318110004
+    ]
+  }
+}

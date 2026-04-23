@@ -1,0 +1,6 @@
+usage: rf_cell_gen.py [-h] [--rf_height RF_HEIGHT]
+                      [--rf_thickness RF_THICKNESS] [--window_n WINDOW_N]
+                      [--rf_width_um RF_WIDTH_UM] [--no-brep] [--step]
+                      [--mesh] [--gui] [--base-step BASE_STEP]
+                      [--out-step OUT_STEP_PATH]
+rf_cell_gen.py: error: unrecognized arguments: --rf-width-um 12.459991272862771 --rf-height 220.85173693594757 --window-n 3

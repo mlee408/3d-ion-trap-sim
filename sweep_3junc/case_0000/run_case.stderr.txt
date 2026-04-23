@@ -1,0 +1,21 @@
+Traceback (most recent call last):
+  File "/Users/michaelee408/Documents/trap_sim/src/run_sweep_metrics.py", line 470, in <module>
+    main()
+  File "/Users/michaelee408/Documents/trap_sim/src/run_sweep_metrics.py", line 339, in main
+    post = compute_post_r0_metrics(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/michaelee408/Documents/trap_sim/src/run_case.py", line 224, in compute_post_r0_metrics
+    _r0_extra, _psi_r0_after = metrics.refine_minimum(
+                               ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/michaelee408/Documents/trap_sim/src/metrics.py", line 233, in refine_minimum
+    f_m = psi_at(r_m)
+          ^^^^^^^^^^^
+  File "/Users/michaelee408/Documents/trap_sim/src/metrics.py", line 222, in psi_at
+    v = eval_function_at_points(Psi, np.array([pt], dtype=np.float64), comm=comm)[0]
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/michaelee408/Documents/trap_sim/src/metrics.py", line 112, in eval_function_at_points
+    tree = geometry.bb_tree(domain, domain.topology.dim)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/michaelee408/Downloads/ENTER/envs/fenicsx/lib/python3.11/site-packages/dolfinx/geometry.py", line 148, in bb_tree
+    _cpp.geometry.BoundingBoxTree_float64(mesh._cpp_object, dim, padding, entities)
+KeyboardInterrupt
