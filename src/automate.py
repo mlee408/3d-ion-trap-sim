@@ -520,16 +520,36 @@ PAPER_BENCHMARKS: Dict[str, Dict[str, Any]] = {
         "mass_amu": 171.0,
         "rf_freq_mhz": 44.3,
         "vrf_V": 190.0,
-        "trap_height_um": 82.3,
-        "trap_height_tolerance_um": 15.0,
-        "radial_freq_mhz": 2.32,       # single reported radial freq
-        "q_z": 0.15,
-        "depth_eV": 2.3,               # total trap depth (3D design)
-        "depth_surface_trap_eV": 0.074, # comparison: surface trap = 74 meV
-        "transport_barrier_eV": 0.007,  # pseudopotential barrier along CTC < 7 meV
-        "junction_trap_height_um": 40.0,  # trap height near junction centre
+        # ── Electrode geometry ────────────────────────────────────────────
+        "rf_electrode_width_um": 120.0,         # RF electrode width
+        "rf_height_above_surface_um": 247.0,    # 3D RF electrode height above surface
+        "rf_cross_section_um": [56.0, 82.0],    # RF beam cross-section [width, height]
+        "support_pedestal_um": 56.0,            # support pedestal size (square)
+        "junction_spacing_um": 600.0,           # centre-to-centre junction pitch
+        "junction_footprint_um": [600.0, 600.0],# single X-junction footprint
+        # ── Linear-region trap performance ───────────────────────────────
+        "trap_height_um": 82.3,                 # ion height above surface in linear region
+        "radial_freq_mhz": 2.32,               # trap frequency (3D design, linear region)
+        "q_z": 0.15,                            # stability parameter
+        "depth_eV": 2.3,                        # trap depth (3D design)
+        # ── Surface trap comparison (same drive conditions) ───────────────
+        "surface_trap_freq_mhz": 1.98,          # surface trap frequency at same conditions
+        "surface_trap_depth_eV": 0.074,         # surface trap depth (74 meV)
+        "freq_improvement_pct": 17.0,           # 3D vs surface trap frequency improvement
+        "depth_improvement_factor": 31.0,       # 3D vs surface trap depth improvement
+        "y_depth_improvement_factor": 5.0,      # y-direction depth improvement
+        # ── Junction performance ──────────────────────────────────────────
+        "junction_trap_height_um": 40.0,        # trap height near junction centre
+        "junction_confinement_fraction": 0.5,   # confinement retained at junction (~1/2)
+        "transport_barrier_eV": 0.007,          # pseudopotential barrier along CTC (< 7 meV)
+        # ── Residual micromotion ──────────────────────────────────────────
+        "residual_pseudopotential_eV": 5e-5,    # over 20 µm span
+        "micromotion_amplitude_nm": 38.0,
+        # ── Heating / transport ───────────────────────────────────────────
+        "max_rf_noise_heating_quanta_per_s": 16.0,  # near junction
+        "transport_excitation_per_round_trip_quanta": 0.00019,
         "notes": (
-            "Paper values for Yb-171 at 44.3 MHz / 190 V.  For Ca-40 at "
+            "Paper 2 direct values for Yb-171 at 44.3 MHz / 190 V.  For Ca-40 at "
             "40 MHz / 150 V on the same geometry, expect ~3.3× deeper well "
             "and ~1.8× higher secular frequencies due to lighter mass."
         ),
