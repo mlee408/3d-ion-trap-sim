@@ -69,12 +69,13 @@ def build_rf_cell(
     rf_thickness: float,
     window_n: int,
     rf_width_um: Optional[float] = None,
+    njunctions: int = 2,
+    junction_pitch_um: float = 600.0,
     out_brep: bool = True,
     out_step: bool = False,
     out_mesh: bool = False,
     gui: bool = False,
     base_step_path: Optional[str] = None,
-    out_step_path: Optional[str] = None,
 ) -> None:
     """
     Build one RF lattice cell and export requested file formats.
@@ -88,9 +89,6 @@ def build_rf_cell(
                      with X-shaped cutout at z=[-0.01, 0]).  When provided it
                      is imported and fused with the parametric cell so the
                      complete RF electrode matches the original footprint.
-    out_step_path  : optional explicit output path for the STEP file.  When
-                     provided, overrides the default stem-based filename written
-                     to the current directory.  Implies out_step=True.
     """
     import gmsh
 
@@ -233,12 +231,24 @@ def build_rf_cell(
     else:
         fused = solids
 
-    # Shift the entire cell down 20 µm (−0.02 mm) so the parametric cell's base
-    # aligns with rf_surface.step which occupies z ∈ [−0.02, 0] mm.
-    # CRITICAL: after this translate, z_tip = (rf_height − 20) µm — NOT rf_height µm.
-    # make_rf_step.py documents this as  z_top = rf_height/1000 − 0.020 mm.
-    # assemble_mesh.py's --trap-center-z-offset is substrate-relative (z=0 = DC plane)
-    # and must use (rf_height − 20) µm as the electrode-top reference, not rf_height.
+    # ── Tile junctions along x ───────────────────────────────────────────────
+    # For njunctions > 1, copy and translate the single-cell fused solid
+    # by junction_pitch_um in x for each additional junction, then fuse.
+    # This creates the linear region between junctions where ions are stored.
+    if njunctions > 1:
+        occ.synchronize()
+        all_junctions = list(fused)
+        for i in range(1, njunctions):
+            copies = occ.copy(fused)
+            occ.translate(copies, um(junction_pitch_um * i), 0.0, 0.0)
+            all_junctions.extend(copies)
+        occ.synchronize()
+        fused, _ = occ.fuse(
+            [all_junctions[0]], all_junctions[1:],
+            removeObject=True, removeTool=True,
+        )
+        print(f"  Tiled {njunctions} junctions at pitch {junction_pitch_um} µm")
+
     occ.translate(fused, 0.0, 0.0, -0.02)
     occ.synchronize()
 
@@ -275,15 +285,15 @@ def build_rf_cell(
 
     # ── 4. Export ─────────────────────────────────────────────────────────────
     t_int = int(round(rf_thickness * 100))
-    stem  = f"rfcell_h{int(rf_height)}_t{t_int:03d}_n{window_n}"
+    stem  = f"rfcell_h{int(rf_height)}_t{t_int:03d}_n{window_n}_j{njunctions}"
 
     if out_brep:
         fname = stem + ".brep"
         gmsh.write(fname)
         print(f"  Wrote  {fname}")
 
-    if out_step or out_step_path:
-        fname = out_step_path if out_step_path else stem + ".step"
+    if out_step:
+        fname = stem + ".step"
         gmsh.write(fname)
         print(f"  Wrote  {fname}")
 
@@ -324,6 +334,15 @@ def main() -> None:
         help="Number of windows per side (total = window_n²)",
     )
     parser.add_argument(
+        "--njunctions", type=int, default=2,
+        help="Number of junctions to tile end-to-end (default 2). "
+             "Use 2 for the standard two-junction assembly with linear region.",
+    )
+    parser.add_argument(
+        "--junction_pitch_um", type=float, default=600.0,
+        help="Centre-to-centre junction pitch in µm (default 600).",
+    )
+    parser.add_argument(
         "--rf_width_um", type=float, default=None,
         help="Electrode width in µm (sets horizontal diamond diagonal directly). "
              "When provided, overrides --rf_thickness. "
@@ -351,12 +370,6 @@ def main() -> None:
         help="Path to rf_base.step (original RF base plate with X-shaped cutout). "
              "When provided, fused with the parametric cell for a complete RF electrode.",
     )
-    parser.add_argument(
-        "--out-step", type=str, default=None,
-        dest="out_step_path",
-        help="Explicit output path for the STEP file (overrides the default "
-             "stem-based filename in the current directory). Implies --step.",
-    )
     args = parser.parse_args()
 
     _eff_thickness = (args.rf_width_um / LATTICE_DH_BASE_UM
@@ -374,16 +387,17 @@ def main() -> None:
 
     try:
         build_rf_cell(
-            rf_height      = args.rf_height,
-            rf_thickness   = args.rf_thickness,
-            window_n       = args.window_n,
-            rf_width_um    = args.rf_width_um,
-            out_brep       = args.brep,
-            out_step       = args.step,
-            out_mesh       = args.mesh,
-            gui            = args.gui,
-            base_step_path = args.base_step,
-            out_step_path  = args.out_step_path,
+            rf_height         = args.rf_height,
+            rf_thickness      = args.rf_thickness,
+            window_n          = args.window_n,
+            rf_width_um       = args.rf_width_um,
+            njunctions        = args.njunctions,
+            junction_pitch_um = args.junction_pitch_um,
+            out_brep          = args.brep,
+            out_step          = args.step,
+            out_mesh          = args.mesh,
+            gui               = args.gui,
+            base_step_path    = args.base_step,
         )
     except ValueError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
