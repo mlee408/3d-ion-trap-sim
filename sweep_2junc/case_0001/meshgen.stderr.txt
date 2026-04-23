@@ -1,0 +1,13 @@
+Error   : File './geometry/rf.step' does not exist
+Traceback (most recent call last):
+  File "/Users/michaelee408/Documents/trap_sim/./geometry/assemble_mesh.py", line 556, in <module>
+    main()
+  File "/Users/michaelee408/Documents/trap_sim/./geometry/assemble_mesh.py", line 322, in main
+    rf_in = import_step_volumes(args.rf)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/michaelee408/Documents/trap_sim/./geometry/assemble_mesh.py", line 40, in import_step_volumes
+    ents = gmsh.model.occ.importShapes(path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/michaelee408/Downloads/ENTER/envs/fenicsx/lib/python3.11/site-packages/gmsh.py", line 8948, in importShapes
+    raise Exception(logger.getLastError())
+Exception: File './geometry/rf.step' does not exist
