@@ -1,0 +1,93 @@
+{
+  "mesh": "meshes/paper_n2_w56_h247.msh",
+  "prefix": "paper_metrics_n2_yb2025",
+  "r0_x_m": 0.00016383846957475253,
+  "r0_y_m": 1.930085587710004e-06,
+  "r0_z_m": 8.260218593141528e-05,
+  "freq1_hz": 516749.48808200273,
+  "freq2_hz": 2143732.818065171,
+  "freq3_hz": 2454825.471972403,
+  "strong_freq_min_hz": 2143732.818065171,
+  "strong_freq_max_hz": 2454825.471972403,
+  "depth_z_eV": 1.4257915945649242,
+  "depth_z_plus_eV": 1.4257915945649242,
+  "depth_z_minus_eV": 2.0862476708937794,
+  "depth_z_interior": true,
+  "depth_y_eV": null,
+  "depth_y_plus_eV": null,
+  "depth_y_minus_eV": null,
+  "depth_y_interior": false,
+  "radial_depth_core_eV": 0.3636138363163897,
+  "transport_barrier_xscan_eV": null,
+  "transport_barrier_eigvec_eV": null,
+  "h_used": 0.03406115644557886,
+  "physical_min_ok": true,
+  "strong_modes_ok": true,
+  "hessian_status": "valid",
+  "grad_rel_at_r0": 0.1966859707849727,
+  "success": true,
+  "notes": null,
+  "fast_metrics": true,
+  "depth_nrays_used": 12,
+  "refine_rounds_requested": 4,
+  "refine_rounds_used": 4,
+  "skipped_metrics": [
+    "transport_barrier_xscan_eV",
+    "transport_barrier_eigvec_eV",
+    "depth_y_eV",
+    "depth_y_plus_eV",
+    "depth_y_minus_eV",
+    "depth_y_interior"
+  ],
+  "timings_s": {
+    "mesh_load_s": 16.879,
+    "laplace_solve_s": 21.202,
+    "r0_search_s": 61.316,
+    "refinement_s": 22.783,
+    "hessian_grad_s": 40.145,
+    "depth_scan_s": 24.155,
+    "total_s": 188.078
+  },
+  "_metric_categories": {
+    "local_secular_hz": [
+      "freq1_hz",
+      "freq2_hz",
+      "freq3_hz"
+    ],
+    "strong_secular_hz": [
+      "strong_freq_min_hz",
+      "strong_freq_max_hz"
+    ],
+    "local_confinement_eV": [
+      "radial_depth_core_eV"
+    ],
+    "paper_comparison_eV": [
+      "depth_z_eV",
+      "depth_y_eV"
+    ],
+    "transport_barriers_eV": [
+      "transport_barrier_xscan_eV",
+      "transport_barrier_eigvec_eV"
+    ]
+  },
+  "rf_freq_Hz": 44300000.0,
+  "vrf_V": 190.0,
+  "mass_amu": 171.0,
+  "charge_e": 1.0,
+  "degree": 2,
+  "coord_unit_m_per_mesh": 0.001,
+  "r0_search_bounds_mesh": {
+    "x": [
+      -0.15,
+      0.45
+    ],
+    "y": [
+      -0.18,
+      0.18
+    ],
+    "z": [
+      0.03,
+      0.12
+    ]
+  }
+}
