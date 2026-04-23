@@ -172,6 +172,11 @@ class RunConfig:
     r0_x_auto: bool
     # Outer (far-field / Neumann) boundary tags — do NOT include in ground_tags
     outer_tags: List[int]
+    # Fast-metrics / skip flags forwarded to run_sweep_metrics.py
+    fast_metrics: bool
+    refine_rounds: Optional[int]
+    skip_depth_y: bool
+    skip_transport_scan: bool
 
 
 @dataclass
@@ -895,6 +900,17 @@ def build_run_case_command(cfg: RunConfig, mesh_path: Path, case_dir: Path, case
     if cfg.r0_x_auto:
         cmd.append("--r0-x-auto")
 
+    # Fast-metrics / skip flags (run_sweep_metrics.py only)
+    if is_sweep:
+        if cfg.fast_metrics:
+            cmd.append("--fast-metrics")
+        if cfg.refine_rounds is not None:
+            cmd.extend(["--refine-rounds", str(cfg.refine_rounds)])
+        if cfg.skip_depth_y:
+            cmd.append("--skip-depth-y")
+        if cfg.skip_transport_scan:
+            cmd.append("--skip-transport-scan")
+
     cmd.append("--rf-tags")
     cmd.extend(str(t) for t in cfg.rf_tags)
 
@@ -1386,6 +1402,18 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Facet tags for the outer Neumann boundary (default: [4]). "
                          "Must match --outer-tags in run_case.py.")
 
+    # Fast-metrics / skip flags (forwarded to run_sweep_metrics.py only)
+    ap.add_argument("--fast-metrics", action="store_true",
+                    help="Enable fast-metrics mode in run_sweep_metrics.py "
+                         "(fewer rays, fewer refinement rounds, skip transport scan and depth-y).")
+    ap.add_argument("--refine-rounds", type=int, default=None,
+                    help="Override number of coordinate-descent refinement rounds "
+                         "(run_sweep_metrics.py only; default: 8, or 4 in --fast-metrics mode).")
+    ap.add_argument("--skip-depth-y", action="store_true",
+                    help="Skip y-direction trap depth scan (run_sweep_metrics.py only).")
+    ap.add_argument("--skip-transport-scan", action="store_true",
+                    help="Skip transport barrier scan (run_sweep_metrics.py only).")
+
     return ap
 
 
@@ -1425,6 +1453,10 @@ def main() -> None:
         r0_search_margin=args.r0_search_margin,
         r0_x_auto=args.r0_x_auto,
         outer_tags=list(args.outer_tags) if args.outer_tags else [],
+        fast_metrics=args.fast_metrics,
+        refine_rounds=args.refine_rounds,
+        skip_depth_y=args.skip_depth_y,
+        skip_transport_scan=args.skip_transport_scan,
     )
 
     config_dump = {
