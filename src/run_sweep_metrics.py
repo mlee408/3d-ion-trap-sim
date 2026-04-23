@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 import warnings
 from pathlib import Path
 from typing import Dict
@@ -27,6 +28,7 @@ from run_case import load_case_mesh, solve_laplace_tagged, compute_post_r0_metri
 
 
 def main() -> None:
+    t_start = time.perf_counter()
     ap = argparse.ArgumentParser(
         description="Sweep-mode trap metrics — fast transport, compact JSON output."
     )
@@ -48,7 +50,32 @@ def main() -> None:
     ap.add_argument("--charge-e", type=float, default=1.0)
     ap.add_argument("--vrf", type=float, default=1.0,
                     help="RF voltage amplitude in volts (default 1 = normalised).")
-    ap.add_argument("--depth-nrays", type=int, default=48)
+    ap.add_argument("--depth-nrays", type=int, default=None,
+                    help="Fibonacci-sphere ray count for depth estimation "
+                         "(default: 48 in normal mode, 12 in --fast-metrics mode).")
+    # ── Fast/dev mode flags ──────────────────────────────────────────────────
+    ap.add_argument(
+        "--fast-metrics", action="store_true",
+        help="Enable fast/dev mode: 12 rays (vs 48), 4 refinement rounds (vs 8), "
+             "skip transport scans, skip y-axis depth scan. "
+             "Skipped metrics appear as null in JSON with a 'skipped_metrics' key. "
+             "Use --depth-nrays / --refine-rounds / --skip-* to override individual defaults.",
+    )
+    ap.add_argument(
+        "--refine-rounds", type=int, default=None,
+        help="Extra refinement rounds before Hessian (default: 8 in normal mode, "
+             "4 in --fast-metrics mode). Adaptive early stopping may exit sooner.",
+    )
+    ap.add_argument(
+        "--skip-transport-scan", action="store_true",
+        help="Skip eigvec and x-axis transport barrier scans (~800 fewer Psi evals). "
+             "transport_barrier_* keys will be null in JSON output.",
+    )
+    ap.add_argument(
+        "--skip-depth-y", action="store_true",
+        help="Skip y-axis depth scan (~400 fewer Psi evals). "
+             "depth_y_* keys will be null in JSON output.",
+    )
     # ── r0 search bounds (same semantics as run_case.py) ────────────────────
     ap.add_argument("--r0-x-min", type=float, default=None)
     ap.add_argument("--r0-x-max", type=float, default=None)
@@ -76,6 +103,26 @@ def main() -> None:
         help="Mesh coordinate unit in metres, e.g. 1e-3 for mm (default: auto-detect).",
     )
     args = ap.parse_args()
+
+    # ── Resolve fast-mode defaults ───────────────────────────────────────────
+    # Explicit user values always win; --fast-metrics only fills in when unset.
+    depth_nrays = args.depth_nrays if args.depth_nrays is not None else (
+        12 if args.fast_metrics else 48
+    )
+    refine_rounds = args.refine_rounds if args.refine_rounds is not None else (
+        4 if args.fast_metrics else 8
+    )
+    # --fast-metrics implies skip flags; individual flags also work in normal mode.
+    skip_transport = args.skip_transport_scan or args.fast_metrics
+    skip_depth_y   = args.skip_depth_y        or args.fast_metrics
+
+    # Build skipped_metrics list for JSON schema (written even if empty).
+    skipped_metrics: list = []
+    if skip_transport:
+        skipped_metrics += ["transport_barrier_xscan_eV", "transport_barrier_eigvec_eV"]
+    if skip_depth_y:
+        skipped_metrics += ["depth_y_eV", "depth_y_plus_eV", "depth_y_minus_eV",
+                            "depth_y_interior"]
 
     # ── Load mesh ────────────────────────────────────────────────────────────
     domain, facet_tags, _cell_tags = load_case_mesh(args.mesh)
@@ -119,9 +166,19 @@ def main() -> None:
         else:
             coord_unit = 1.0
 
+    t_mesh = time.perf_counter()
+
     if rank == 0:
         print(f"[sweep] mesh={args.mesh.name}  coord_unit={coord_unit:.0e}  "
               f"h={h:.3e}  ray_length={ray_length:.3e}  h_mesh={h_mesh:.3e}")
+        if args.fast_metrics:
+            print(f"[fast-metrics] ENABLED  nrays={depth_nrays}  "
+                  f"refine_rounds={refine_rounds}  "
+                  f"skip_transport={skip_transport}  skip_depth_y={skip_depth_y}")
+        else:
+            print(f"[sweep] mode=normal  nrays={depth_nrays}  "
+                  f"refine_rounds={refine_rounds}  "
+                  f"skip_transport={skip_transport}  skip_depth_y={skip_depth_y}")
 
     # ── Boundary conditions ──────────────────────────────────────────────────
     outer_tags = set(args.outer_tags) if args.outer_tags else set()
@@ -150,6 +207,7 @@ def main() -> None:
         degree=args.degree, petsc_prefix=f"{args.prefix}_rf_",
     )
     phi_rf.name = "phi_rf"
+    t_solve = time.perf_counter()
 
     # ── RF pseudopotential (unclipped — same as run_case.py) ─────────────────
     e_charge = 1.602176634e-19
@@ -279,6 +337,12 @@ def main() -> None:
                 & (_z_all >= (r0_z_min if r0_z_min is not None else -np.inf))
                 & (_z_all <= (r0_z_max if r0_z_max is not None else np.inf))
             )
+            _n_before = int((_vals >= 0).sum())
+            _n_after  = int(_zmask.sum())
+            print(f"[r0 debug] candidate DOFs: {_n_before} non-negative → "
+                  f"{_n_after} in z-window [{r0_z_min},{r0_z_max}] "
+                  f"({100*_n_after/_n_before:.1f}% retained)" if _n_before > 0
+                  else "[r0 debug] candidate DOFs: 0 non-negative")
             if _zmask.any():
                 _z_cand = _z_all[_zmask]
                 _v_cand = _vals[_zmask]
@@ -303,6 +367,7 @@ def main() -> None:
         y_min=r0_y_min, y_max=r0_y_max,
         z_min=r0_z_min, z_max=r0_z_max,
     )
+    t_r0 = time.perf_counter()
 
     _r0_SI_coarse = np.array(mininfo.r_min) * coord_unit
 
@@ -339,11 +404,15 @@ def main() -> None:
     post = compute_post_r0_metrics(
         Psi, m_kg=m, r0=mininfo.r_min, h=h,
         coord_unit=coord_unit, vrf=args.vrf,
-        ray_length=ray_length, nrays=args.depth_nrays,
+        ray_length=ray_length, nrays=depth_nrays,
         transport_mode="fast",
         compute_depth=True,
         comm=comm,
+        refine_rounds=refine_rounds,
+        skip_depth_y=skip_depth_y,
+        skip_transport_scan=skip_transport,
     )
+    t_post = time.perf_counter()
     sec   = post["sec"]
     depth = post["depth"]
     hessian_status = post.get("hessian_status", "unknown")
@@ -390,6 +459,23 @@ def main() -> None:
         print(f"[sweep | transport barriers eV]   xscan={depth.get('transport_barrier_xscan_eV')}  "
               f"eigvec={depth.get('transport_barrier_eigvec_eV')}")
 
+    # ── Assemble stage timings ───────────────────────────────────────────────
+    _sub = post.get("timings_s", {})
+    timings_s = {
+        "mesh_load_s":      round(t_mesh  - t_start, 3),
+        "laplace_solve_s":  round(t_solve - t_mesh,  3),
+        "r0_search_s":      round(t_r0    - t_solve, 3),
+        "refinement_s":     round(_sub.get("refinement", 0.0), 3),
+        "hessian_grad_s":   round(_sub.get("hessian_and_grad", 0.0), 3),
+        "depth_scan_s":     round(_sub.get("depth_scan", 0.0), 3),
+        "total_s":          round(t_post  - t_start, 3),
+    }
+
+    if rank == 0:
+        print("[timings]")
+        for _k, _v in timings_s.items():
+            print(f"  {_k:<20s}: {_v:.2f} s")
+
     # ── Build compact JSON record ────────────────────────────────────────────
     if rank == 0:
         record = {
@@ -409,14 +495,14 @@ def main() -> None:
             "depth_z_plus_eV": depth.get("depth_z_plus_eV"),
             "depth_z_minus_eV": depth.get("depth_z_minus_eV"),
             "depth_z_interior": depth.get("depth_z_interior"),
-            "depth_y_eV": depth.get("depth_y_eV"),          # min(+y, -y) barrier
+            "depth_y_eV": depth.get("depth_y_eV"),          # min(+y, -y) barrier; null if skipped
             "depth_y_plus_eV": depth.get("depth_y_plus_eV"),
             "depth_y_minus_eV": depth.get("depth_y_minus_eV"),
             "depth_y_interior": depth.get("depth_y_interior"),
             # ── Fibonacci-sphere radial depth (electrode-hit rays excluded) ──
             "radial_depth_core_eV": depth.get("radial_depth_core_eV"),
-            "transport_barrier_xscan_eV": depth.get("transport_barrier_xscan_eV"),
-            "transport_barrier_eigvec_eV": depth.get("transport_barrier_eigvec_eV"),
+            "transport_barrier_xscan_eV": depth.get("transport_barrier_xscan_eV"),   # null if skipped
+            "transport_barrier_eigvec_eV": depth.get("transport_barrier_eigvec_eV"), # null if skipped
             "h_used": float(sec["h"]),
             # status flags for sweep filtering
             "physical_min_ok": physical_min_ok,
@@ -431,6 +517,15 @@ def main() -> None:
             "grad_rel_at_r0": post.get("grad_rel_at_r0"),
             "success": True,
             "notes": None,
+            # ── Run-mode metadata ──
+            "fast_metrics": bool(args.fast_metrics),
+            "depth_nrays_used": int(depth_nrays),
+            "refine_rounds_requested": int(refine_rounds),
+            "refine_rounds_used": post.get("refine_rounds_used", refine_rounds),
+            # skipped_metrics: explicit list of JSON keys intentionally set to null.
+            # Empty list means all metrics were computed normally.
+            "skipped_metrics": skipped_metrics,
+            "timings_s": timings_s,
             # Metric category map — use these keys to avoid mixing unlike quantities:
             #   local_secular_hz       — all 3 eigenmode frequencies (includes weak axial)
             #   strong_secular_hz      — top-2 radial confinement modes only

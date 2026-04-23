@@ -195,6 +195,7 @@ def refine_minimum(
     comm: MPI.Comm | None = None,
     h: Optional[float] = None,
     n_rounds: int = 5,
+    tol_rel: float = 1e-5,
 ) -> Tuple[np.ndarray, float]:
     """Coordinate-descent polishing of an initial Ψ minimum estimate.
 
@@ -223,8 +224,11 @@ def refine_minimum(
         return float(v) if np.isfinite(v) else np.inf
 
     f_cur = psi_at(r)
+    _stagnant = 0
+    _stop_reason = "max_rounds"
 
     for _round in range(n_rounds):
+        f_before_round = f_cur
         for i in range(gdim):
             e = np.zeros(gdim); e[i] = 1.0
             r_p = np.clip(r + h * e, lo, hi)
@@ -236,6 +240,21 @@ def refine_minimum(
             elif f_m < f_cur:
                 r = r_m; f_cur = f_m
         h *= 0.5
+        # Adaptive early stopping: stop if per-round improvement is negligible.
+        # tol_rel=1e-5 is conservative — won't trigger unless already converged.
+        _improvement = f_before_round - f_cur
+        if abs(f_cur) > 0 and _improvement < tol_rel * abs(f_cur):
+            _stagnant += 1
+        else:
+            _stagnant = 0
+        if _stagnant >= 2:
+            _stop_reason = "tiny_improvement"
+            break
+
+    _eff_comm = comm if comm is not None else Psi.function_space.mesh.comm
+    if _eff_comm.rank == 0 and _stop_reason != "max_rounds":
+        print(f"[refine] early stop ({_stop_reason}) after {_round + 1}/{n_rounds} rounds  "
+              f"f_cur={f_cur:.4e}")
 
     return r, f_cur
 
@@ -660,6 +679,8 @@ def estimate_trap_depth_by_rays(
     v_rf: float = 1.0,
     transport_dir: Optional[np.ndarray] = None,
     transport_mode: str = "fast",
+    skip_depth_y: bool = False,
+    skip_transport_scan: bool = False,
 ) -> Dict:
     """Estimate radial trap depth and transport barrier as separate metrics.
 
@@ -945,27 +966,33 @@ def estimate_trap_depth_by_rays(
         _print_rays("electrode-hit", elec_rays)
 
     # ── Transport barriers ────────────────────────────────────────────────────
-    # 1. Eigvec scan
-    _ev_p, _ev_ip, _, _ = _scan_barrier_1d(t_dir)
-    _ev_n, _ev_in, _, _ = _scan_barrier_1d(-t_dir)
-    _ev_c = [(b, bi) for b, bi in ((_ev_p, _ev_ip), (_ev_n, _ev_in)) if np.isfinite(b)]
-    if _ev_c:
-        _ev_FEM, _ev_int = min(_ev_c, key=lambda x: x[0])
-        tb_eigvec_eV: Optional[float] = float(_ev_FEM * phys_scale / _E_CHARGE)
-        tb_eigvec_int: bool = bool(_ev_int)
+    # skip_transport_scan=True omits these 4 line scans (~800 Psi evals saved)
+    # and writes null into the JSON output for traceability.
+    if not skip_transport_scan:
+        # 1. Eigvec scan
+        _ev_p, _ev_ip, _, _ = _scan_barrier_1d(t_dir)
+        _ev_n, _ev_in, _, _ = _scan_barrier_1d(-t_dir)
+        _ev_c = [(b, bi) for b, bi in ((_ev_p, _ev_ip), (_ev_n, _ev_in)) if np.isfinite(b)]
+        if _ev_c:
+            _ev_FEM, _ev_int = min(_ev_c, key=lambda x: x[0])
+            tb_eigvec_eV: Optional[float] = float(_ev_FEM * phys_scale / _E_CHARGE)
+            tb_eigvec_int: bool = bool(_ev_int)
+        else:
+            tb_eigvec_eV = None; tb_eigvec_int = False
+
+        # 2. Pure x-scan
+        _xd = np.zeros(gdim); _xd[0] = 1.0
+        _xp, _xip, _, _ = _scan_barrier_1d(_xd)
+        _xn, _xin, _, _ = _scan_barrier_1d(-_xd)
+        _x_c = [(b, bi) for b, bi in ((_xp, _xip), (_xn, _xin)) if np.isfinite(b)]
+        if _x_c:
+            _x_FEM, _x_int = min(_x_c, key=lambda x: x[0])
+            tb_xscan_eV: Optional[float] = float(_x_FEM * phys_scale / _E_CHARGE)
+            tb_xscan_int: bool = bool(_x_int)
+        else:
+            tb_xscan_eV = None; tb_xscan_int = False
     else:
         tb_eigvec_eV = None; tb_eigvec_int = False
-
-    # 2. Pure x-scan
-    _xd = np.zeros(gdim); _xd[0] = 1.0
-    _xp, _xip, _, _ = _scan_barrier_1d(_xd)
-    _xn, _xin, _, _ = _scan_barrier_1d(-_xd)
-    _x_c = [(b, bi) for b, bi in ((_xp, _xip), (_xn, _xin)) if np.isfinite(b)]
-    if _x_c:
-        _x_FEM, _x_int = min(_x_c, key=lambda x: x[0])
-        tb_xscan_eV: Optional[float] = float(_x_FEM * phys_scale / _E_CHARGE)
-        tb_xscan_int: bool = bool(_x_int)
-    else:
         tb_xscan_eV = None; tb_xscan_int = False
 
     # 3. Pure z-scan (+z / -z) — reports regardless of electrode-hit classification
@@ -989,8 +1016,9 @@ def estimate_trap_depth_by_rays(
     else:
         _zp_eV = None; _zn_eV = None; depth_z_eV = None; depth_z_interior = False
 
-    # 4. Pure y-scan (+y / -y) — reports regardless of electrode-hit classification
-    if gdim >= 2:
+    # 4. Pure y-scan (+y / -y) — paper-comparable; skip with skip_depth_y=True
+    # skip_depth_y saves ~400 Psi evals; result is null in JSON for traceability.
+    if gdim >= 2 and not skip_depth_y:
         _yd = np.zeros(gdim); _yd[1] = 1.0
         _yp, _yip, _, _ = _scan_barrier_1d(_yd)
         _yn, _yin, _, _ = _scan_barrier_1d(-_yd)
@@ -1009,6 +1037,8 @@ def estimate_trap_depth_by_rays(
               f"(interior={_yin})  → depth_y={depth_y_eV} eV")
     else:
         _yp_eV = None; _yn_eV = None; depth_y_eV = None; depth_y_interior = False
+        if skip_depth_y:
+            print("[depth] y-axis: skipped (skip_depth_y=True)")
 
     # 5. CTC-like height-following scan (full mode only)
     if transport_mode == "full":
@@ -1037,14 +1067,17 @@ def estimate_trap_depth_by_rays(
     def _fmt_tb(label: str, eV: Optional[float], interior: bool) -> str:
         return f"  {label}: n/a" if eV is None else f"  {label}: {eV:.6f} eV  interior={interior}"
 
-    print(f"[depth] transport axis = {t_dir.round(3).tolist()} (source: {t_dir_source})")
-    print("[depth] ── Transport barrier summary ──")
-    print(_fmt_tb("eigvec-scan ", tb_eigvec_eV, tb_eigvec_int))
-    print(_fmt_tb("x-scan      ", tb_xscan_eV,  tb_xscan_int))
-    if transport_mode == "full":
-        print(_fmt_tb("ctc-like    ", tb_ctc_eV,    tb_ctc_int))
-        if _ctc_bx is not None:
-            print(f"  ctc barrier at: x={_ctc_bx:.4f}  z={_ctc_bz:.4f} (mesh units)")
+    if not skip_transport_scan:
+        print(f"[depth] transport axis = {t_dir.round(3).tolist()} (source: {t_dir_source})")
+        print("[depth] ── Transport barrier summary ──")
+        print(_fmt_tb("eigvec-scan ", tb_eigvec_eV, tb_eigvec_int))
+        print(_fmt_tb("x-scan      ", tb_xscan_eV,  tb_xscan_int))
+        if transport_mode == "full":
+            print(_fmt_tb("ctc-like    ", tb_ctc_eV,    tb_ctc_int))
+            if _ctc_bx is not None:
+                print(f"  ctc barrier at: x={_ctc_bx:.4f}  z={_ctc_bz:.4f} (mesh units)")
+    else:
+        print("[depth] transport scan: skipped (skip_transport_scan=True)")
 
     # ── Radial depth statistics ───────────────────────────────────────────────
     def _ray_stats(rays: list, label: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:

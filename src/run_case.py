@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -172,6 +173,9 @@ def compute_post_r0_metrics(
     transport_mode: str = "fast",
     compute_depth: bool = True,
     comm=None,
+    refine_rounds: int = 8,
+    skip_depth_y: bool = False,
+    skip_transport_scan: bool = False,
 ) -> dict:
     """Canonical post-r0 physics pipeline shared by run_case.py and run_sweep_metrics.py.
 
@@ -216,13 +220,15 @@ def compute_post_r0_metrics(
     # ── 0. Mesh scale + extra local refinement ───────────────────────────────
     # A second refinement pass (finer step than find_minimum_cg1's default
     # 5-round, 0.4×h_mesh pass) reduces gradient residual before the Hessian.
-    # Uses 8 halving rounds starting at 0.2×h_mesh (final step ≈ 0.00078×h_mesh).
+    # refine_rounds controls how many halving rounds are used (default 8,
+    # matching the previous hardcoded value).
+    _t_refine_start = time.perf_counter()
     _h_mesh = metrics._estimate_cell_h(Psi.function_space.mesh)
     _psi_r0_before = float(metrics.eval_function_at_points(
         Psi, np.array([r0], dtype=np.float64), comm=comm
     )[0])
     _r0_extra, _psi_r0_after = metrics.refine_minimum(
-        Psi, r0, comm=comm, h=_h_mesh * 0.2, n_rounds=8,
+        Psi, r0, comm=comm, h=_h_mesh * 0.2, n_rounds=refine_rounds,
     )
     if np.isfinite(_psi_r0_after) and _psi_r0_after < _psi_r0_before:
         r0 = _r0_extra
@@ -231,7 +237,8 @@ def compute_post_r0_metrics(
     else:
         _refine_msg = f"already at local minimum ({_psi_r0_before:.4e}); r0 unchanged"
     if comm.rank == 0:
-        print(f"[r0 refine] extra pass (h={_h_mesh*0.2:.3e}, 8 rounds): {_refine_msg}")
+        print(f"[r0 refine] extra pass (h={_h_mesh*0.2:.3e}, {refine_rounds} rounds): {_refine_msg}")
+    _t_refine_end = time.perf_counter()
 
     # Dedicated Hessian step: cap at 2×h_mesh.
     # Callers supply a coarse step (typically 3×h_mesh) for broad search; the
@@ -257,6 +264,7 @@ def compute_post_r0_metrics(
         print(f"[consistency] ray_length     = {ray_length:.4e} mesh units")
 
     # ── 1. Secular frequencies on UNCLIPPED Psi ─────────────────────────────
+    _t_hessian_start = time.perf_counter()
     sec = metrics.secular_frequencies_from_pseudopotential(
         Psi, m_kg=m_kg, r0=r0, h=_h_hessian, comm=comm,
         coord_scale=coord_unit, v_rf=vrf,
@@ -399,6 +407,7 @@ def compute_post_r0_metrics(
         print(f"[hessian] classification: {_cls_labels.get(hessian_status, hessian_status)}")
 
     # ── 4. Transport direction from weakest secular mode ─────────────────────
+    _t_hessian_end = time.perf_counter()
     eigvals_arr = np.array(eigvals)
     eigvecs_arr = np.array(sec["eigvecs"])
     weak_idx = int(np.argmin(eigvals_arr))
@@ -418,6 +427,7 @@ def compute_post_r0_metrics(
     )[0])
 
     # ── 7. Depth metrics ─────────────────────────────────────────────────────
+    _t_depth_start = time.perf_counter()
     depth = None
     if compute_depth:
         depth = metrics.estimate_trap_depth_by_rays(
@@ -425,7 +435,10 @@ def compute_post_r0_metrics(
             coord_scale=coord_unit, v_rf=vrf,
             transport_dir=transport_eigvec,
             transport_mode=transport_mode,
+            skip_depth_y=skip_depth_y,
+            skip_transport_scan=skip_transport_scan,
         )
+    _t_depth_end = time.perf_counter()
 
     return {
         "sec": sec,
@@ -443,6 +456,12 @@ def compute_post_r0_metrics(
         # Gradient stationarity diagnostic: |∇Ψ|/(|H|_F × h).
         # < 0.1 → well near-stationary; < 0.5 → accepted for borderline_numeric.
         "grad_rel_at_r0": float(_grad_rel),
+        "refine_rounds_used": int(refine_rounds),
+        "timings_s": {
+            "refinement": _t_refine_end - _t_refine_start,
+            "hessian_and_grad": _t_hessian_end - _t_hessian_start,
+            "depth_scan": _t_depth_end - _t_depth_start,
+        },
     }
 
 
