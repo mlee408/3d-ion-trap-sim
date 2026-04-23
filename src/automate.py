@@ -156,7 +156,7 @@ class RunConfig:
     charge_e: float
     h: float
     depth_ray_length: float
-    depth_nrays: int
+    depth_nrays: Optional[int]   # None = defer to run_sweep_metrics.py default
     prefix: str
     vrf: float
     coord_unit: Optional[float]
@@ -177,6 +177,8 @@ class RunConfig:
     refine_rounds: Optional[int]
     skip_depth_y: bool
     skip_transport_scan: bool
+    # Resolved paper benchmark key (None = skip comparison)
+    paper_benchmark: Optional[str]
 
 
 @dataclass
@@ -223,7 +225,7 @@ def parse_param_specs(raw_specs: Sequence[str]) -> List[ParamSpec]:
         low = float(low_s)
         high = float(high_s)
         if high < low:
-            raise ValueError(f"Invalid bounds for {name}: high < low")
+            raise ValueError(f"Invalid bounds for {name}: high ({high}) < low ({low})")
         specs.append(ParamSpec(name=name, low=low, high=high))
     return specs
 
@@ -604,6 +606,36 @@ PAPER_BENCHMARKS: Dict[str, Dict[str, Any]] = {
 }
 
 
+def select_benchmark(
+    paper_benchmark: str,
+    mass_amu: float,
+    rf_freq: float,
+    vrf: float,
+) -> Optional[str]:
+    """Resolve --paper-benchmark to a key in PAPER_BENCHMARKS, or None.
+
+    'auto' uses operating conditions to pick the most appropriate benchmark.
+    """
+    if paper_benchmark == "none":
+        return None
+    if paper_benchmark != "auto":
+        if paper_benchmark not in PAPER_BENCHMARKS:
+            raise ValueError(
+                f"Unknown --paper-benchmark '{paper_benchmark}'. "
+                f"Valid keys: {list(PAPER_BENCHMARKS)} + ['auto','none']"
+            )
+        return paper_benchmark
+
+    # auto: match by ion mass, RF frequency, and RF voltage
+    _yb = abs(mass_amu - 171.0) < 1.0 and abs(rf_freq - 44.3e6) / 44.3e6 < 0.05 and abs(vrf - 190.0) / 190.0 < 0.10
+    _ca = abs(mass_amu - 40.0) < 1.0 and abs(rf_freq - 40.0e6) / 40.0e6 < 0.05 and abs(vrf - 150.0) / 150.0 < 0.10
+    if _yb:
+        return "paper2_linear_yb171"
+    if _ca:
+        return "paper2_linear_ca40_scaled"
+    return "paper2_linear_ca40_scaled"   # approximate fallback; logged by caller
+
+
 def compare_to_paper_benchmarks(
     report: Dict[str, Any],
     metrics: Dict[str, Any],
@@ -887,10 +919,13 @@ def build_run_case_command(cfg: RunConfig, mesh_path: Path, case_dir: Path, case
         "--rf-freq", str(cfg.rf_freq),
         "--mass-amu", str(cfg.mass_amu),
         "--charge-e", str(cfg.charge_e),
-        "--depth-nrays", str(cfg.depth_nrays),
         "--prefix", case_prefix,
         "--vrf", str(cfg.vrf),
     ]
+    # Only forward --depth-nrays when user explicitly set it; otherwise let
+    # run_sweep_metrics.py / run_case.py choose their own mode-appropriate default.
+    if cfg.depth_nrays is not None:
+        cmd.extend(["--depth-nrays", str(cfg.depth_nrays)])
 
     # run_case.py-only arguments
     if not is_sweep:
@@ -1004,7 +1039,12 @@ def evaluate_case(
         metrics = extract_metrics_from_report(report)
         score = score_case_metrics(metrics)
         rejection = classify_rejection(metrics, "ok")
-        paper_cmp = compare_to_paper_benchmarks(report, metrics)
+        if cfg.paper_benchmark is not None:
+            paper_cmp = compare_to_paper_benchmarks(
+                report, metrics, benchmark_key=cfg.paper_benchmark
+            )
+        else:
+            paper_cmp = None
 
         elapsed = time.time() - start
         return CaseResult(
@@ -1092,6 +1132,7 @@ def _result_row(result: CaseResult) -> Dict[str, Any]:
     if result.paper_comparison:
         row["paper_verdict"] = result.paper_comparison.get("verdict")
         row["paper_summary"] = result.paper_comparison.get("summary")
+        row["paper_benchmark_key"] = result.paper_comparison.get("benchmark_key")
     return row
 
 
@@ -1151,6 +1192,14 @@ def run_bayesian_search(
         print("[bayes] Install with: pip install scikit-optimize")
 
     from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    # ── Separate fixed params (low == high) from variable params ─────────
+    fixed_specs    = [s for s in param_specs if s.low == s.high]
+    variable_specs = [s for s in param_specs if s.low != s.high]
+    fixed_params: Dict[str, float] = {s.name: s.low for s in fixed_specs}
+
+    if fixed_specs:
+        print(f"[bayes] fixed params: {', '.join(f'{s.name}={s.low}' for s in fixed_specs)}")
 
     rng = random.Random(seed)
     results: List[CaseResult] = []
@@ -1227,7 +1276,7 @@ def run_bayesian_search(
         print(f"[bayes] Resume: loading {len(existing)} existing rows.")
         for row in existing.values():
             try:
-                x = [float(row[f"param_{s.name}"]) for s in param_specs]
+                x = [float(row[f"param_{s.name}"]) for s in variable_specs]
                 y_raw = row.get("score", "")
                 y = float(y_raw) if y_raw not in ("", "None", None) else None
                 all_x.append(x)
@@ -1235,16 +1284,27 @@ def run_bayesian_search(
             except (KeyError, ValueError):
                 pass
 
+    if not variable_specs:
+        # ── All params fixed: run n_cases evaluations at the fixed point ──
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            remaining = n_cases - len(existing)
+            param_list = [dict(fixed_params) for _ in range(remaining)]
+            submit_batch(ex, param_list)
+        return results
+
     if not _has_skopt:
         # ── Pure random fallback ──────────────────────────────────────────
         with ProcessPoolExecutor(max_workers=max_workers) as ex:
             remaining = n_cases - len(existing)
-            param_list = [sample_random_params(param_specs, rng) for _ in range(remaining)]
+            param_list = [
+                {**sample_random_params(variable_specs, rng), **fixed_params}
+                for _ in range(remaining)
+            ]
             submit_batch(ex, param_list)
         return results
 
     # ── Bayesian loop ─────────────────────────────────────────────────────
-    dimensions = [Real(s.low, s.high, name=s.name) for s in param_specs]
+    dimensions = [Real(s.low, s.high, name=s.name) for s in variable_specs]
     opt = Optimizer(
         dimensions=dimensions,
         base_estimator="GP",
@@ -1282,12 +1342,15 @@ def run_bayesian_search(
             if not isinstance(suggested[0], list):
                 suggested = [suggested]   # single-point ask returns a flat list
 
-            param_batch = [_list_to_params(x, param_specs) for x in suggested]
+            param_batch = [
+                {**_list_to_params(x, variable_specs), **fixed_params}
+                for x in suggested
+            ]
             batch_results = submit_batch(ex, param_batch)
 
             # Update the surrogate with completed results.
             pen = failure_penalty(results)
-            xs_new = [_params_to_list(r.params, param_specs) for r in batch_results]
+            xs_new = [_params_to_list(r.params, variable_specs) for r in batch_results]
             ys_new = [-(r.score if r.score is not None else pen) for r in batch_results]
             opt.tell(xs_new, ys_new)
 
@@ -1397,7 +1460,11 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--charge-e", type=float, default=1.0)
     ap.add_argument("--h", type=float, default=2e-6)
     ap.add_argument("--depth-ray-length", type=float, default=200e-6)
-    ap.add_argument("--depth-nrays", type=int, default=48)
+    ap.add_argument("--depth-nrays", type=int, default=None,
+                    help="Fibonacci-sphere ray count for depth estimation. "
+                         "If omitted, defers to run_sweep_metrics.py's own default "
+                         "(48 in normal mode, 12 in --fast-metrics mode). "
+                         "Explicit value always wins over mode defaults.")
     ap.add_argument("--prefix", type=str, default="auto")
     ap.add_argument("--vrf", type=float, default=1.0)
     ap.add_argument("--coord-unit", type=float, default=None)
@@ -1409,10 +1476,22 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--r0-z-max", type=float, default=None,
                     help="Upper z bound for RF-null search (mesh units). "
                          "Auto-detected by run_case.py from electrode top + margin if omitted.")
-    ap.add_argument("--r0-x-min", type=float, default=None)
-    ap.add_argument("--r0-x-max", type=float, default=None)
-    ap.add_argument("--r0-y-min", type=float, default=None)
-    ap.add_argument("--r0-y-max", type=float, default=None)
+    ap.add_argument("--r0-x-min", type=float, default=None,
+                    help="Lower x bound (mesh units) for RF-null search. "
+                         "Intended to describe the interior trapping volume in vacuum, "
+                         "not the full domain. Auto-detected from RF geometry if omitted.")
+    ap.add_argument("--r0-x-max", type=float, default=None,
+                    help="Upper x bound (mesh units) for RF-null search. "
+                         "Intended to describe the interior trapping volume in vacuum, "
+                         "not the full domain. Auto-detected from RF geometry if omitted.")
+    ap.add_argument("--r0-y-min", type=float, default=None,
+                    help="Lower y bound (mesh units) for RF-null search. "
+                         "Intended to describe the interior trapping volume in vacuum. "
+                         "Auto-detected from RF geometry if omitted.")
+    ap.add_argument("--r0-y-max", type=float, default=None,
+                    help="Upper y bound (mesh units) for RF-null search. "
+                         "Intended to describe the interior trapping volume in vacuum. "
+                         "Auto-detected from RF geometry if omitted.")
     ap.add_argument("--r0-search-margin", type=float, default=None,
                     help="Margin (metres) above electrode top for z auto-detect. "
                          "Passed to run_case.py only when explicitly set.")
@@ -1421,6 +1500,22 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--outer-tags", type=int, nargs="*", default=[4],
                     help="Facet tags for the outer Neumann boundary (default: [4]). "
                          "Must match --outer-tags in run_case.py.")
+
+    # Paper benchmark selection
+    ap.add_argument(
+        "--paper-benchmark",
+        choices=["auto", "paper2_linear_yb171", "paper2_linear_ca40_scaled",
+                 "paper1_ca40_experiment", "none"],
+        default="auto",
+        help=(
+            "Which paper benchmark to compare against. "
+            "'auto' (default): infer from mass_amu / rf_freq / vrf — "
+            "Yb-171 at 44.3 MHz / 190 V → paper2_linear_yb171; "
+            "Ca-40 at 40 MHz / 150 V → paper2_linear_ca40_scaled; "
+            "other → paper2_linear_ca40_scaled (approximate, logged). "
+            "'none' skips paper comparison entirely."
+        ),
+    )
 
     # Fast-metrics / skip flags (forwarded to run_sweep_metrics.py only)
     ap.add_argument("--fast-metrics", action="store_true",
@@ -1445,6 +1540,24 @@ def main() -> None:
     param_specs = parse_param_specs(args.param)
     if not param_specs:
         raise ValueError("You must provide at least one --param range.")
+
+    # ── Resolve paper benchmark ───────────────────────────────────────────────
+    resolved_benchmark = select_benchmark(
+        args.paper_benchmark, args.mass_amu, args.rf_freq, args.vrf
+    )
+    if args.paper_benchmark == "auto":
+        _approx = (
+            resolved_benchmark == "paper2_linear_ca40_scaled"
+            and not (abs(args.mass_amu - 40.0) < 1.0
+                     and abs(args.rf_freq - 40.0e6) / 40.0e6 < 0.05
+                     and abs(args.vrf - 150.0) / 150.0 < 0.10)
+        )
+        _label = f"{resolved_benchmark} (approximate — operating conditions differ)" if _approx else resolved_benchmark
+        print(f"[benchmark] auto selected: {_label}")
+    elif resolved_benchmark is None:
+        print("[benchmark] paper comparison disabled (--paper-benchmark none)")
+    else:
+        print(f"[benchmark] using: {resolved_benchmark}")
 
     cfg = RunConfig(
         run_case_py=args.run_case,
@@ -1477,7 +1590,28 @@ def main() -> None:
         refine_rounds=args.refine_rounds,
         skip_depth_y=args.skip_depth_y,
         skip_transport_scan=args.skip_transport_scan,
+        paper_benchmark=resolved_benchmark,
     )
+
+    # ── Startup log: show what is actually being forwarded ───────────────────
+    _is_sweep = cfg.run_case_py.name == "run_sweep_metrics.py"
+    if _is_sweep:
+        _nrays_s = str(cfg.depth_nrays) if cfg.depth_nrays is not None else "defer"
+        _rounds_s = str(cfg.refine_rounds) if cfg.refine_rounds is not None else "defer"
+        print(
+            f"[automate] sweep settings → "
+            f"fast_metrics={cfg.fast_metrics}  "
+            f"depth_nrays={_nrays_s}  "
+            f"refine_rounds={_rounds_s}  "
+            f"skip_depth_y={cfg.skip_depth_y}  "
+            f"skip_transport_scan={cfg.skip_transport_scan}  "
+            f"paper_benchmark={resolved_benchmark or 'none'}"
+        )
+        # Warn if x/y not bounded — may scan full vacuum domain
+        if args.r0_x_min is None and args.r0_x_max is None:
+            print(
+                "[r0 bounds] x/y unbounded — search may scan the full vacuum domain and be slow"
+            )
 
     config_dump = {
         "run_config": asdict(cfg),

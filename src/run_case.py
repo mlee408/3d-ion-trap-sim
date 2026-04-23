@@ -558,11 +558,10 @@ def main():
     )
     ap.add_argument(
         "--r0-x-auto", action="store_true",
-        help="Auto-detect x bounds for the RF-null search from the RF electrode "
-             "geometry.  Computes the RF surface x-extent, then restricts the "
-             "search to the central half of that extent (electrode_x_mid ± 0.25 × span). "
-             "Useful for 2-junction runs without explicit --r0-x-min/max.  "
-             "Printed bounds can be copied as explicit flags for subsequent runs."
+        help="(Kept for backward compatibility — x bounds are now always auto-detected "
+             "from the RF electrode geometry when --r0-x-min/max are not supplied.) "
+             "Restricts the search to the central half of the RF x-extent "
+             "(electrode_x_mid ± 0.25 × span).  Override with explicit --r0-x-min/max."
     )
     ap.add_argument(
         "--outer-tags", type=int, nargs="*", default=[4],
@@ -795,14 +794,16 @@ def main():
             print("[r0 search] z_min auto-set to 0.0 (DC surface). "
                   "Override with --r0-z-min if your trap sits below z=0.")
 
-    # x/y bounds — explicit flags take priority; --r0-x-auto fills in x if
-    # neither --r0-x-min nor --r0-x-max was supplied.
+    # x/y bounds — explicit flags take priority; auto-detect from RF electrode
+    # geometry for 3D meshes when no explicit bounds are supplied.  This keeps
+    # the search inside the physical trapping channel and prevents the centroid
+    # from drifting into outer vacuum padding.
     r0_x_min = args.r0_x_min
     r0_x_max = args.r0_x_max
     r0_y_min = args.r0_y_min
     r0_y_max = args.r0_y_max
 
-    if args.r0_x_auto and r0_x_min is None and r0_x_max is None:
+    if (r0_x_min is None and r0_x_max is None and domain.topology.dim == 3):
         try:
             # Reuse rf_nodes gathered during z auto-detect; fall back to
             # computing them now if z auto-detect was skipped or failed.
@@ -820,7 +821,7 @@ def main():
             x_rf_min = float(x_rf.min())
             x_rf_max = float(x_rf.max())
             x_rf_mid = (x_rf_min + x_rf_max) / 2.0
-            x_rf_half = (x_rf_max - x_rf_min) / 4.0  # ±25 % of full span
+            x_rf_half = (x_rf_max - x_rf_min) / 4.0  # ±25% of full span
             r0_x_min = x_rf_mid - x_rf_half
             r0_x_max = x_rf_mid + x_rf_half
             if rank == 0:
@@ -831,6 +832,34 @@ def main():
         except Exception as _e:
             if rank == 0:
                 print(f"[r0 search] x_auto failed ({_e}); no x bound applied.")
+
+    if (r0_y_min is None and r0_y_max is None and domain.topology.dim == 3):
+        try:
+            if rf_nodes is None:
+                fdim_local = domain.topology.dim - 1
+                domain.topology.create_connectivity(fdim_local, 0)
+                f2v = domain.topology.connectivity(fdim_local, 0)
+                rf_facet_indices = np.concatenate(
+                    [facet_tags.find(t) for t in args.rf_tags]
+                )
+                rf_nodes = np.unique(
+                    np.concatenate([f2v.links(int(fi)) for fi in rf_facet_indices])
+                )
+            y_rf = domain.geometry.x[rf_nodes, 1]
+            y_rf_min = float(y_rf.min())
+            y_rf_max = float(y_rf.max())
+            y_rf_mid = (y_rf_min + y_rf_max) / 2.0
+            y_rf_half = (y_rf_max - y_rf_min) / 4.0  # ±25% of full span
+            r0_y_min = y_rf_mid - y_rf_half
+            r0_y_max = y_rf_mid + y_rf_half
+            if rank == 0:
+                print(f"[r0 search] y_auto: RF y=[{y_rf_min:.4g}, {y_rf_max:.4g}], "
+                      f"centre±25%=[{r0_y_min:.4g}, {r0_y_max:.4g}] mesh units")
+                print(f"[r0 search] hint: override with "
+                      f"--r0-y-min {r0_y_min:.4g} --r0-y-max {r0_y_max:.4g}")
+        except Exception as _e:
+            if rank == 0:
+                print(f"[r0 search] y_auto failed ({_e}); no y bound applied.")
 
     # Print active bounds summary for reproducibility.
     if rank == 0:
