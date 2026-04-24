@@ -12,36 +12,11 @@ rf_cell_gen.py and assemble_mesh.py must be in geometry/.
 Parameters swept by automate.py:
     {rf_width_um}  -- electrode width in um (min 10, step 5)
                       controls BOTH rail and pillar thickness equally
-    {rf_height}    -- vertical distance from surface RF electrode top to
-                      the centroid of the 3D RF beam cross-section [µm]
-                      (NOT total beam height; NOT bottom-of-beam to substrate)
+    {rf_height}    -- support beam height in um
 
 window_n is fixed per sweep run (passed as $N in the bash for-loop).
 
 Update OPT_* with best values from your mesh quality sweep.
-for N in 2; do
-  python -u src/automate.py \
-    --run-case ./src/run_sweep_metrics.py \
-    --mesh-template "python ./scripts/make_mesh_parametric.py \
-        --window-n $N \
-        --rf-width-um {rf_width_um} \
-        --rf-height {rf_height} \
-        --out {mesh_path}" \
-    --workdir ./sweeps/sweep_geom_n${N}\
-    --rf-tags 1 --ground-tags 2 3 --outer-tags 4 \
-    --param rf_width_um:45:70 \
-    --param rf_height:200:300 \
-    --n-cases 4 --n-random-start 8 \
-    --max-workers 4 --seed 42\
-    --degree 2 --mass-amu 171.0 --charge-e 1.0 \
-    --rf-freq 44.3e6 --vrf 190 --coord-unit 1e-3 \
-    --r0-x-min -0.15 --r0-x-max 0.45 \
-    --r0-y-min -0.18 --r0-y-max 0.18 \
-    --r0-z-min -0.03 --r0-z-max 0.12 \
-    --prefix sweep_n2_yb2025 \
-    --fast-metrics \
-    --paper-benchmark paper2_linear_yb171
-done
 """
 
 from __future__ import annotations
@@ -75,9 +50,7 @@ def main() -> int:
                     help="Electrode width in um (min 10, step 5). "
                          "Controls both rail and pillar thickness equally.")
     ap.add_argument("--rf-height",   type=float, default=290.0,
-                    help="Vertical distance from surface RF electrode top to "
-                         "RF beam cross-section centroid [µm]. "
-                         "Beam spans ±(dv/2) around this centre in z.")
+                    help="Support beam height in um")
 
     # Mesh quality
     ap.add_argument("--lc-electrode",  type=float, default=OPT_LC_ELECTRODE)
@@ -101,7 +74,7 @@ def main() -> int:
     case_dir = out_path.parent
 
     print(f"[make_mesh] window_n={window_n}  rf_width={rf_width}um  "
-          f"rf_height={rf_height}um (beam-centre above surface RF top)", flush=True)
+          f"rf_height={rf_height}um", flush=True)
 
     # ── Step 1: generate parametric RF cell STEP via rf_cell_gen.py ──────
     # rf_cell_gen.py writes to cwd, so run it from case_dir.
@@ -132,45 +105,24 @@ def main() -> int:
     print(f"[make_mesh] RF STEP: {rf_step.name}", flush=True)
 
     # ── Step 1b: merge rf_surface.step into the RF cell STEP ─────────────
-    # rf_surface.step must be merged here (not inside rf_cell_gen.py) so that
-    # assemble_mesh.py's tiling duplicates the base plate for both junctions.
-    #
-    # IMPORTANT: rf_cell_gen.py translates the whole cell down by -0.02 mm so
-    # support beam bottoms sit at z=-0.02. rf_surface.step is at z=[-0.01, 0].
-    # We shift rf_surface.step down by -0.02 mm before fusing so its top face
-    # at z=-0.02 is flush with the beam bottoms, giving a clean shared face.
+    # Delegates to scripts/merge_rf_with_base.py so diagnostic output is clean
+    # and failures surface with tracebacks instead of being swallowed.
     rf_with_base = case_dir / (rf_step.stem + "_wb.step")
-    merge_script = f"""
-import gmsh, sys
-gmsh.initialize([sys.argv[0]])
-gmsh.option.setNumber("General.Terminal", 0)
-gmsh.model.add("m")
-occ = gmsh.model.occ
+    merge_script_path = HERE / "merge_rf_with_base.py"
+    if not merge_script_path.exists():
+        print(f"ERROR: missing {merge_script_path}", file=sys.stderr)
+        return 1
 
-def iv(p):
-    before = set(t for _, t in occ.getEntities(3))
-    occ.importShapes(p)
-    occ.synchronize()
-    after = set(t for _, t in occ.getEntities(3))
-    return [(3, t) for t in sorted(after - before)]
-
-rf   = iv(r"{rf_step}")
-base = iv(r"{RF_SURFACE_STEP}")
-
-# rf_surface.step is already at z=[-0.02, 0], which matches rf_cell_gen.py's
-# cell bottom (support beams translated to sit at z=-0.02). No translate needed.
-all_vols = rf + base
-if len(all_vols) > 1:
-    fused, _ = occ.fuse(all_vols[:1], all_vols[1:],
-                        removeObject=True, removeTool=True)
-    occ.synchronize()
-
-gmsh.write(r"{rf_with_base}")
-gmsh.finalize()
-"""
-    rc = subprocess.run([sys.executable, "-c", merge_script]).returncode
+    cmd_merge = [
+        sys.executable, str(merge_script_path),
+        str(rf_step),
+        str(RF_SURFACE_STEP),
+        str(rf_with_base),
+    ]
+    print(f"[make_mesh] merging: {' '.join(cmd_merge)}", flush=True)
+    rc = subprocess.run(cmd_merge).returncode
     if rc != 0:
-        print("ERROR: failed to merge rf_surface into RF cell", file=sys.stderr)
+        print(f"ERROR: merge_rf_with_base.py failed (exit {rc})", file=sys.stderr)
         return rc
     print(f"[make_mesh] RF+surface STEP: {rf_with_base.name}", flush=True)
 
