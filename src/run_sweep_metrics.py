@@ -235,6 +235,14 @@ def main() -> None:
     )
     Psi.name = "Psi_rf"
 
+    # DG pseudopotential for depth estimation — preserves peak |∇φ|² values
+    # near electrode surfaces (no inter-element smoothing from CG projection).
+    Psi_dg = metrics.compute_rf_pseudopotential(
+        phi_rf, omega_rf=2.0 * np.pi * args.rf_freq, q_C=q, m_kg=m,
+        degree=args.degree, discontinuous=True,
+    )
+    Psi_dg.name = "Psi_rf_dg"
+
     # ── r0 search bounds — identical logic to run_case.py ────────────────────
     # IMPORTANT: keep this section a verbatim mirror of run_case.py so that
     # both scripts always find the same trap minimum.
@@ -456,6 +464,7 @@ def main() -> None:
         refine_rounds=refine_rounds,
         skip_depth_y=skip_depth_y,
         skip_transport_scan=skip_transport,
+        Psi_depth=Psi_dg,
     )
     t_post = time.perf_counter()
     sec   = post["sec"]

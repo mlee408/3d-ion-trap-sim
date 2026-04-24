@@ -40,6 +40,7 @@ def compute_rf_pseudopotential(
     degree: int = 1,
     prefix: str = "PsiRF_",
     petsc_options: Optional[Dict[str, str]] = None,
+    discontinuous: bool = False,
 ) -> fem.Function:
     """RF pseudopotential (normalised, J/V²) from unit RF potential φ (0–1).
 
@@ -48,13 +49,26 @@ def compute_rf_pseudopotential(
 
     Ψ = q² |∇φ|² / (4 m ω²)
 
+    Parameters
+    ----------
+    discontinuous : bool, default False
+        If True, interpolate Ψ into a DG (Discontinuous Galerkin) function
+        space instead of L2-projecting onto CG.  DG interpolation evaluates
+        |∇φ|² directly at each element's interpolation points with no
+        inter-element continuity constraint, preserving peak values near
+        electrode surfaces.  This gives more accurate depth estimates
+        (comparable to COMSOL's direct gradient evaluation) at the cost of
+        a larger DOF vector.  The CG path (default) is preferred for Hessian /
+        secular-frequency work where smooth local curvature matters more than
+        peak accuracy.
+
     Notes
     -----
     * φ is dimensionless (boundary conditions φ=1 on RF, φ=0 on ground),
       so |∇φ|² has units of [mesh_unit]⁻².  The secular frequencies derived
       from this Ψ must be scaled by V_RF / coord_scale (see
       `secular_frequencies_from_pseudopotential`).
-    * The CG1 L2-projection of |∇φ|² can produce small negative nodal values
+    * The CG L2-projection of |∇φ|² can produce small negative nodal values
       (Gibbs-like undershoot near discontinuities).  The raw (unclipped) field
       is returned so that curvature information near the RF null is preserved
       for Hessian / secular-frequency computation.  Callers that need a
@@ -62,11 +76,23 @@ def compute_rf_pseudopotential(
       explicitly with ``np.maximum(Psi.x.array, 0)``.
     """
     domain = phi_rf.function_space.mesh
-    V = fem.functionspace(domain, ("CG", degree))
     E_expr = -ufl.grad(phi_rf)
     Emag2_expr = ufl.dot(E_expr, E_expr)
     coeff = (q_C ** 2) / (4.0 * m_kg * (omega_rf ** 2))
-    Psi = project(coeff * Emag2_expr, V, prefix=prefix, petsc_options=petsc_options)
+
+    if discontinuous:
+        # DG interpolation: evaluate the UFL expression directly at each
+        # element's interpolation points.  No global linear system, no
+        # inter-element averaging — peaks near electrodes are preserved.
+        V_dg = fem.functionspace(domain, ("DG", degree))
+        expr = fem.Expression(coeff * Emag2_expr, V_dg.element.interpolation_points())
+        Psi = fem.Function(V_dg)
+        Psi.interpolate(expr)
+    else:
+        # CG L2-projection: smooth, globally continuous, good for Hessian.
+        V = fem.functionspace(domain, ("CG", degree))
+        Psi = project(coeff * Emag2_expr, V, prefix=prefix, petsc_options=petsc_options)
+
     Psi.name = "Psi_RF_J"
     return Psi
 

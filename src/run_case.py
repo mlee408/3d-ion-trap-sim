@@ -11,7 +11,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 from mpi4py import MPI
@@ -176,6 +176,7 @@ def compute_post_r0_metrics(
     refine_rounds: int = 8,
     skip_depth_y: bool = False,
     skip_transport_scan: bool = False,
+    Psi_depth: Optional[fem.Function] = None,
 ) -> dict:
     """Canonical post-r0 physics pipeline shared by run_case.py and run_sweep_metrics.py.
 
@@ -196,6 +197,12 @@ def compute_post_r0_metrics(
     transport_mode : "fast" (eigvec + x-scan only) or "full" (adds CTC path)
     compute_depth  : if False, skip depth estimation (depth key will be None)
     comm           : MPI communicator (default: domain.comm)
+    Psi_depth      : optional DG pseudopotential for depth estimation.  If
+                     provided, this is used instead of the clipped CG Psi for
+                     ray scans.  DG fields preserve peak |∇φ|² values near
+                     electrode surfaces (no inter-element smoothing), giving
+                     more accurate depth estimates.  Compute with
+                     ``metrics.compute_rf_pseudopotential(..., discontinuous=True)``.
 
     Returns
     -------
@@ -421,6 +428,19 @@ def compute_post_r0_metrics(
         print(f"[consistency] Psi_clipped (depth input): type={type(Psi_clipped).__name__}  "
               f"name={Psi_clipped.name!r}  same_space={Psi_clipped.function_space is Psi.function_space}")
 
+    # ── 5b. Select depth-scan field: DG (if provided) > CG clipped ────────
+    if Psi_depth is not None:
+        Psi_for_depth = fem.Function(Psi_depth.function_space)
+        Psi_for_depth.x.array[:] = np.maximum(Psi_depth.x.array, 0.0)
+        Psi_for_depth.name = "Psi_rf_dg_clipped"
+        if comm.rank == 0:
+            print(f"[consistency] Psi_depth (DG, for depth): "
+                  f"type={type(Psi_for_depth).__name__}  "
+                  f"name={Psi_for_depth.name!r}  "
+                  f"ndofs={Psi_for_depth.x.array.shape[0]}")
+    else:
+        Psi_for_depth = Psi_clipped
+
     # ── 6. Ψ₀ from the CLIPPED field at r0 ──────────────────────────────────
     psi_min_clipped = float(metrics.eval_function_at_points(
         Psi_clipped, np.array([r0], dtype=np.float64), comm=comm
@@ -431,7 +451,7 @@ def compute_post_r0_metrics(
     depth = None
     if compute_depth:
         depth = metrics.estimate_trap_depth_by_rays(
-            Psi_clipped, r0=r0, ray_length=ray_length, nrays=nrays, comm=comm,
+            Psi_for_depth, r0=r0, ray_length=ray_length, nrays=nrays, comm=comm,
             coord_scale=coord_unit, v_rf=vrf,
             transport_dir=transport_eigvec,
             transport_mode=transport_mode,
@@ -717,6 +737,14 @@ def main():
     )
     Psi.name = "Psi_rf"
 
+    # DG pseudopotential for depth estimation — preserves peak |∇φ|² values
+    # near electrode surfaces (no inter-element smoothing from CG projection).
+    Psi_dg = metrics.compute_rf_pseudopotential(
+        phi_rf, omega_rf=2.0 * np.pi * args.rf_freq, q_C=q, m_kg=m,
+        degree=args.degree, discontinuous=True,
+    )
+    Psi_dg.name = "Psi_rf_dg"
+
     if rank == 0:
         psi_arr = Psi.x.array
         print(f"[phi_rf] min={phi_rf.x.array.min():.4f}  max={phi_rf.x.array.max():.4f}")
@@ -944,6 +972,7 @@ def main():
         transport_mode=args.transport_mode,
         compute_depth=not args.no_depth,
         comm=comm,
+        Psi_depth=Psi_dg,
     )
     sec            = post["sec"]
     depth          = post["depth"]

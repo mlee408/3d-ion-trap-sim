@@ -65,8 +65,16 @@ def _find_report(case_dir: Path, hint_prefix: Optional[str] = None) -> Optional[
     for p in candidates:
         if p.exists():
             return p
-    # Fallback: sole JSON file that is not params.json
-    jsons = [p for p in sorted(case_dir.glob("*.json")) if p.name != "params.json"]
+    # Fallback: prefer *_sweep.json, then *_report.json, then sole non-params JSON.
+    # Exclude sidecar outputs written by this script (_transport.json, _transport_scan.csv).
+    jsons = [
+        p for p in sorted(case_dir.glob("*.json"))
+        if p.name != "params.json" and not p.name.endswith("_transport.json")
+    ]
+    for suffix in ("_sweep.json", "_report.json"):
+        hits = [p for p in jsons if p.name.endswith(suffix)]
+        if hits:
+            return hits[0]
     return jsons[0] if len(jsons) == 1 else None
 
 
@@ -210,11 +218,12 @@ def _build_psi(phi_rf, report: Dict[str, Any]):
     charge  = float(report.get("charge_e", 1.0)) * _E_CHARGE
     omega   = 2.0 * np.pi * rf_freq
 
-    print("[ctb] computing pseudopotential ...", flush=True)
+    print("[ctb] computing pseudopotential (DG — no inter-element smoothing) ...", flush=True)
     Psi = metrics.compute_rf_pseudopotential(
         phi_rf, omega_rf=omega, q_C=charge, m_kg=mass, degree=degree,
+        discontinuous=True,
     )
-    Psi.name = "Psi_rf"
+    Psi.name = "Psi_rf_dg"
     print("[ctb] pseudopotential ready", flush=True)
     return Psi
 
@@ -230,6 +239,7 @@ def _scan_transport_barrier(
     scan_both_axes: bool = False,
     optim_method: str = "coord_descent",   # kept for CLI compat; unused
     comm=None,
+    csv_out: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Scan toward the nearest junction center and compute the transport barrier.
 
@@ -242,6 +252,8 @@ def _scan_transport_barrier(
     """
     import metrics
 
+    _PSI_NEG_WARN_THRESH = -1e-25   # below this we warn; pure roundoff is ~1e-30
+
     domain     = Psi.function_space.mesh
     coord_unit = float(report.get("coord_unit_m_per_mesh", 1e-3))
     vrf        = float(report.get("vrf_V", 1.0))
@@ -252,20 +264,24 @@ def _scan_transport_barrier(
     # r0 in mesh units
     r0 = np.array([r0_x_m, r0_y_m, r0_z_m]) / coord_unit
 
-    phys_scale = vrf ** 2       # Psi stored per (V²); multiply to get SI Joules
+    phys_scale = (vrf / coord_unit) ** 2   # Psi uses mesh-coord gradients (1/mesh_unit);
+                                           # scale to SI: V_RF² / coord_unit²  [J]
     to_eV      = phys_scale / _E_CHARGE
 
     # Step size for coordinate descent in transverse plane — use mesh cell size
     h_mesh = metrics._estimate_cell_h(domain)
     h_yz_base = h_mesh * 1.5    # matches metrics._ctc_scan
 
-    # Psi at r0
+    # Psi at r0 — keep raw (unclipped) to detect whether r0 is on the RF null
     psi0_raw = float(metrics.eval_function_at_points(
         Psi, np.array([r0], dtype=np.float64), comm=comm
     )[0])
     if not np.isfinite(psi0_raw):
         raise ValueError(f"Psi is NaN at r0 (mesh units {r0.tolist()}). r0 may be outside mesh.")
-    psi0_raw = max(psi0_raw, 0.0)
+    if psi0_raw < _PSI_NEG_WARN_THRESH:
+        print(f"[ctb] WARNING: psi(r0)={psi0_raw:.3e} J is significantly negative "
+              f"(threshold {_PSI_NEG_WARN_THRESH:.0e}). Check for baseline subtraction "
+              f"or interpolation artefacts.", flush=True)
 
     def _eval_psi(pt: np.ndarray) -> float:
         v = float(metrics.eval_function_at_points(
@@ -286,24 +302,40 @@ def _scan_transport_barrier(
                             cur_v = v; trial = cand
         return trial, cur_v
 
-    # ── Find nearest junction center ─────────────────────────────────────────
+    # ── Find nearest and far junction centers ────────────────────────────────
     pitch_mesh  = junction_pitch / coord_unit
-    junc_x_mesh = round(r0[0] / pitch_mesh) * pitch_mesh
+    near_junc   = round(r0[0] / pitch_mesh) * pitch_mesh   # nearest junction
+    # Far junction: the next junction center away from r0 (toward the barrier)
+    if r0[0] >= near_junc:
+        far_junc = near_junc + pitch_mesh
+    else:
+        far_junc = near_junc - pitch_mesh
+    junc_x_mesh = far_junc            # target junction for the forward scan
 
-    dx_mesh      = junc_x_mesh - r0[0]
-    scan_end     = junc_x_mesh + 0.2 * abs(dx_mesh)
+    dx_mesh      = far_junc - r0[0]   # signed distance to the far junction
+    scan_end     = far_junc + 0.2 * abs(dx_mesh)
     scan_back    = r0[0] - 0.2 * abs(dx_mesh)
 
     x_fwd = np.linspace(r0[0], scan_end,  n_steps)
     x_bwd = np.linspace(r0[0], scan_back, max(n_steps // 5, 5))
 
     # ── Forward scan (r0 → junction + 20%) ───────────────────────────────────
-    print(f"[ctb] scanning x: r0={r0[0]:.4f} → junction={junc_x_mesh:.4f} "
-          f"(+20%={scan_end:.4f})  n_steps={n_steps}  h_yz={h_yz_base:.4f}", flush=True)
+    print(f"[ctb] r0 psi={psi0_raw:.3e} J  ({psi0_raw*to_eV*1e3:.4f} meV)", flush=True)
+    print(f"[ctb] scanning x: r0={r0[0]:.4f} → far_junction={junc_x_mesh:.4f} "
+          f"(+20%={scan_end:.4f})  near_junction={near_junc:.4f}  "
+          f"n_steps={n_steps}  h_yz={h_yz_base:.4f}", flush=True)
+    print(f"[ctb] coord_unit={coord_unit}  vrf={vrf} V  phys_scale={phys_scale:.3e}"
+          f"  to_eV={to_eV:.3e}", flush=True)
+
+    # csv_rows accumulates every scan step for the sidecar CSV
+    csv_rows: List[Dict[str, Any]] = []
 
     cur = r0.copy()
     cur_v = psi0_raw
-    psi_fwd = np.full(len(x_fwd), np.nan)
+    # Store unclipped psi values; NaN marks out-of-mesh or not-yet-reached
+    psi_fwd  = np.full(len(x_fwd), np.nan)
+    yopt_fwd = np.full(len(x_fwd), np.nan)
+    zopt_fwd = np.full(len(x_fwd), np.nan)
     for i, xi in enumerate(x_fwd):
         trial = cur.copy(); trial[0] = xi
         tv = _eval_psi(trial)
@@ -311,13 +343,27 @@ def _scan_transport_barrier(
             break
         trial, tv = _yz_descent(trial, tv)
         cur = trial; cur_v = tv
-        psi_fwd[i] = max(tv, 0.0)
+        psi_fwd[i]  = tv          # unclipped — negative roundoff preserved
+        yopt_fwd[i] = trial[1]
+        zopt_fwd[i] = trial[2]
+        if tv < _PSI_NEG_WARN_THRESH:
+            print(f"[ctb] WARNING step {i}: psi={tv:.3e} J is significantly negative", flush=True)
         if (i + 1) % 10 == 0:
-            print(f"[ctb]   step {i+1}/{len(x_fwd)}  x={xi:.4f}  psi={tv:.3e}", flush=True)
+            print(f"[ctb]   step {i+1}/{len(x_fwd)}  x={xi:.4f}  psi={tv:.3e}  "
+                  f"({tv*to_eV*1e3:.4f} meV)", flush=True)
+        csv_rows.append({
+            "direction": "fwd", "step": i,
+            "x_mesh": xi, "y_mesh": trial[1], "z_mesh": trial[2],
+            "x_m": xi * coord_unit, "y_m": trial[1] * coord_unit,
+            "z_m": trial[2] * coord_unit,
+            "psi_J": tv, "psi_eV": tv * to_eV, "psi_meV": tv * to_eV * 1e3,
+        })
 
     # ── Backward scan (r0 → r0 - 20%) ────────────────────────────────────────
     cur = r0.copy(); cur_v = psi0_raw
-    psi_bwd = np.full(len(x_bwd) - 1, np.nan)
+    psi_bwd  = np.full(len(x_bwd) - 1, np.nan)
+    yopt_bwd = np.full(len(x_bwd) - 1, np.nan)
+    zopt_bwd = np.full(len(x_bwd) - 1, np.nan)
     for i, xi in enumerate(x_bwd[1:]):
         trial = cur.copy(); trial[0] = xi
         tv = _eval_psi(trial)
@@ -325,7 +371,16 @@ def _scan_transport_barrier(
             break
         trial, tv = _yz_descent(trial, tv)
         cur = trial; cur_v = tv
-        psi_bwd[i] = max(tv, 0.0)
+        psi_bwd[i]  = tv
+        yopt_bwd[i] = trial[1]
+        zopt_bwd[i] = trial[2]
+        csv_rows.append({
+            "direction": "bwd", "step": i,
+            "x_mesh": xi, "y_mesh": trial[1], "z_mesh": trial[2],
+            "x_m": xi * coord_unit, "y_m": trial[1] * coord_unit,
+            "z_m": trial[2] * coord_unit,
+            "psi_J": tv, "psi_eV": tv * to_eV, "psi_meV": tv * to_eV * 1e3,
+        })
 
     # Combine: backward reversed + forward
     x_full   = np.concatenate([x_bwd[1:][::-1], x_fwd])
@@ -335,34 +390,96 @@ def _scan_transport_barrier(
     if valid.sum() < 3:
         raise RuntimeError("Transport scan: fewer than 3 valid Psi evaluations — scan may have left the mesh.")
 
-    x_v = x_full[valid]
-    p_v = psi_full[valid]
+    # Barrier is defined only along the forward path (r0 → junction).
+    # The backward slice is kept in x_full/psi_full for diagnostics only.
+    valid_fwd = np.isfinite(psi_fwd)
+    if valid_fwd.sum() < 3:
+        raise RuntimeError("Transport scan: fewer than 3 valid forward-scan points — scan may have left the mesh.")
 
-    # ── Barrier ───────────────────────────────────────────────────────────────
-    psi_max     = float(np.max(p_v))
-    peak_idx    = int(np.argmax(p_v))
-    peak_x_mesh = float(x_v[peak_idx])
-    barrier_raw = max(psi_max - psi0_raw, 0.0)
+    p_fwd = psi_fwd[valid_fwd]
+    x_fwd_valid = x_fwd[valid_fwd]
 
-    barrier_eV = barrier_raw * to_eV
-    psi_max_eV = psi_max     * to_eV
-    psi_r0_eV  = psi0_raw    * to_eV
-    peak_x_m   = peak_x_mesh * coord_unit
-    junc_x_m   = junc_x_mesh * coord_unit
+    # ── Barrier — two definitions, both unclipped before reporting ───────────
+    psi_max     = float(np.max(p_fwd))
+    psi_min     = float(np.min(p_fwd))
+    psi_end     = float(p_fwd[-1])
+    peak_idx    = int(np.argmax(p_fwd))
+    min_idx     = int(np.argmin(p_fwd))
+    peak_x_mesh = float(x_fwd_valid[peak_idx])
+    min_x_mesh  = float(x_fwd_valid[min_idx])
+
+    # barrier_A: how far above r0 the peak rises (classic CTC definition)
+    barrier_A_raw = psi_max - psi0_raw   # can be negative if peak < start
+    # barrier_B: total elevation from lowest point on path to the peak
+    barrier_B_raw = psi_max - psi_min    # always >= 0 by definition
+
+    barrier_A_eV  = barrier_A_raw * to_eV
+    barrier_B_eV  = barrier_B_raw * to_eV
+    psi_max_eV    = psi_max  * to_eV
+    psi_min_eV    = psi_min  * to_eV
+    psi_r0_eV     = psi0_raw * to_eV
+    psi_end_eV    = psi_end  * to_eV
+    peak_x_m      = peak_x_mesh * coord_unit
+    min_x_m       = min_x_mesh  * coord_unit
+    junc_x_m      = junc_x_mesh * coord_unit
 
     fwd_valid = np.isfinite(psi_fwd)
     reached_junction = (fwd_valid.sum() > 0 and
                         float(x_fwd[np.where(fwd_valid)[0][-1]]) >= junc_x_mesh - 1e-8 * pitch_mesh)
 
-    print(f"[ctb] barrier={barrier_eV*1e3:.3f} meV  "
-          f"peak_x={peak_x_m*1e6:.1f} µm  junction_x={junc_x_m*1e6:.1f} µm  "
-          f"reached={'yes' if reached_junction else 'NO'}", flush=True)
+    # ── Debug summary ──────────────────────────────────────────────────────────
+    print(f"[ctb] ── scan summary ──────────────────────────────────────────", flush=True)
+    print(f"[ctb]   psi_start  = {psi0_raw:.4e} J  = {psi_r0_eV*1e3:.4f} meV", flush=True)
+    print(f"[ctb]   psi_min    = {psi_min:.4e} J  = {psi_min_eV*1e3:.4f} meV  "
+          f"at x={min_x_m*1e6:.1f} µm", flush=True)
+    print(f"[ctb]   psi_max    = {psi_max:.4e} J  = {psi_max_eV*1e3:.4f} meV  "
+          f"at x={peak_x_m*1e6:.1f} µm (peak)", flush=True)
+    print(f"[ctb]   psi_end    = {psi_end:.4e} J  = {psi_end_eV*1e3:.4f} meV", flush=True)
+    print(f"[ctb]   barrier_A (peak−start)    = {barrier_A_raw:.4e} J  = "
+          f"{barrier_A_eV*1e3:.4f} meV  [clipped={max(barrier_A_eV,0)*1e3:.4f} meV]",
+          flush=True)
+    print(f"[ctb]   barrier_B (peak−path_min) = {barrier_B_raw:.4e} J  = "
+          f"{barrier_B_eV*1e3:.4f} meV", flush=True)
+    print(f"[ctb]   junction_x={junc_x_m*1e6:.1f} µm  "
+          f"reached={'yes' if reached_junction else 'NO'}  "
+          f"n_valid={int(valid_fwd.sum())}", flush=True)
+    if abs(psi0_raw) < 1e-28:
+        print(f"[ctb] WARNING: psi(r0) ≈ 0 ({psi0_raw:.3e} J). r0 may be on the RF null "
+              f"— check that r0 coordinates are correct and not on the trap axis.", flush=True)
+    if abs(psi_max) < 1e-25:
+        print(f"[ctb] WARNING: psi_max ≈ 0 ({psi_max:.3e} J). Entire scan path may be on "
+              f"the RF null — verify junction_pitch and junction_x.", flush=True)
+
+    # ── Write CSV sidecar ──────────────────────────────────────────────────────
+    if csv_out is not None and csv_rows:
+        _csv_fields = ["direction", "step",
+                       "x_mesh", "y_mesh", "z_mesh",
+                       "x_m", "y_m", "z_m",
+                       "psi_J", "psi_eV", "psi_meV"]
+        try:
+            with csv_out.open("w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=_csv_fields, extrasaction="ignore")
+                w.writeheader()
+                w.writerows(csv_rows)
+            print(f"[ctb] scan CSV → {csv_out}", flush=True)
+        except OSError as exc:
+            print(f"[ctb] WARNING: could not write scan CSV: {exc}", flush=True)
 
     result: Dict[str, Any] = {
-        "transport_barrier_xscan_eV":           round(barrier_eV, 8),
+        # ── backward-compatible key (clipped, peak−start) ──────────────────
+        "transport_barrier_xscan_eV":           round(max(barrier_A_eV, 0.0), 8),
+        # ── new diagnostic keys (unclipped) ───────────────────────────────
+        "transport_barrier_meV_peak_minus_start":    round(barrier_A_eV  * 1e3, 6),
+        "transport_barrier_meV_peak_minus_path_min": round(barrier_B_eV  * 1e3, 6),
+        "transport_path_min_meV":                    round(psi_min_eV    * 1e3, 6),
+        "transport_path_max_meV":                    round(psi_max_eV    * 1e3, 6),
+        "transport_path_start_meV":                  round(psi_r0_eV     * 1e3, 6),
+        "transport_path_end_meV":                    round(psi_end_eV    * 1e3, 6),
+        # ── geometry ──────────────────────────────────────────────────────
         "transport_xscan_psi_max_eV":           round(psi_max_eV, 8),
         "transport_xscan_psi_r0_eV":            round(psi_r0_eV, 8),
         "transport_xscan_peak_x_m":             round(peak_x_m, 10),
+        "transport_xscan_path_min_x_m":         round(min_x_m, 10),
         "transport_xscan_nearest_junction_x_m": round(junc_x_m, 10),
         "transport_xscan_n_points":             int(valid.sum()),
         "transport_xscan_reached_junction":     bool(reached_junction),
@@ -391,13 +508,14 @@ def _scan_transport_barrier(
                             if v < tv:
                                 tv = v; trial = cand
             cur_y = trial; cur_v_y = tv
-            psi_y[i] = max(tv, 0.0)
+            psi_y[i] = tv   # unclipped
 
         valid_y = np.isfinite(psi_y)
         if valid_y.sum() >= 3:
-            psi_y_max     = float(np.max(psi_y[valid_y]))
-            barrier_y_raw = max(psi_y_max - psi0_raw, 0.0)
-            result["transport_barrier_yscan_eV"] = round(barrier_y_raw * to_eV, 8)
+            p_y = psi_y[valid_y]
+            psi_y_max     = float(np.max(p_y))
+            barrier_y_raw = psi_y_max - psi0_raw
+            result["transport_barrier_yscan_eV"] = round(max(barrier_y_raw * to_eV, 0.0), 8)
         else:
             result["transport_barrier_yscan_eV"] = None
 
@@ -486,6 +604,11 @@ def process_case(
         )
         Psi = _build_psi(phi_rf, report)
 
+        # CSV sidecar lives next to the JSON report
+        csv_sidecar = report_path.with_name(
+            report_path.stem + "_transport_scan.csv"
+        ) if report_path is not None else None
+
         transport = _scan_transport_barrier(
             Psi, report,
             junction_pitch=junction_pitch,
@@ -493,6 +616,7 @@ def process_case(
             scan_both_axes=scan_both_axes,
             optim_method=optim_method,
             comm=comm,
+            csv_out=csv_sidecar,
         )
     except Exception as exc:
         return _error(f"{type(exc).__name__}: {exc}")
