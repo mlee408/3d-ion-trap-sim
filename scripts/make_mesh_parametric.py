@@ -41,7 +41,7 @@ RF_SURFACE_STEP = ROOT / "cad" / "base" / "rf_surface.step"
 OPT_LC_ELECTRODE = 0.003
 OPT_LC_CENTER    = 0.005
 OPT_LC_FAR       = 0.035
-OPT_PAD_Z_TOP    = 0.500
+OPT_PAD_Z_TOP    = 0.600
 
 
 def main() -> int:
