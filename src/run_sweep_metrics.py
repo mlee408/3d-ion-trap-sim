@@ -76,6 +76,12 @@ def main() -> None:
         help="Skip y-axis depth scan (~400 fewer Psi evals). "
              "depth_y_* keys will be null in JSON output.",
     )
+    ap.add_argument(
+        "--save-solution", action="store_true",
+        help="Save the phi_rf DOF array as {prefix}_phi_rf_dofs.npy after the Laplace "
+             "solve.  This checkpoint allows compute_transport_barrier.py to skip the "
+             "FEM re-solve when adding transport barrier data to completed cases.",
+    )
     # ── r0 search bounds (same semantics as run_case.py) ────────────────────
     ap.add_argument("--r0-x-min", type=float, default=None)
     ap.add_argument("--r0-x-max", type=float, default=None)
@@ -208,6 +214,14 @@ def main() -> None:
     )
     phi_rf.name = "phi_rf"
     t_solve = time.perf_counter()
+
+    # ── Optional: save phi_rf checkpoint for compute_transport_barrier.py ────
+    phi_rf_ckpt_name: str | None = None
+    if args.save_solution and rank == 0:
+        _ckpt_path = args.outdir / f"{args.prefix}_phi_rf_dofs.npy"
+        np.save(str(_ckpt_path), phi_rf.x.array)
+        phi_rf_ckpt_name = _ckpt_path.name
+        print(f"[sweep] phi_rf checkpoint: {_ckpt_path}")
 
     # ── RF pseudopotential (unclipped — same as run_case.py) ─────────────────
     e_charge = 1.602176634e-19
@@ -584,6 +598,8 @@ def main() -> None:
                 "y": [r0_y_min, r0_y_max],
                 "z": [r0_z_min, r0_z_max],
             },
+            # Checkpoint for compute_transport_barrier.py (None unless --save-solution)
+            "phi_rf_checkpoint": phi_rf_ckpt_name,
         }
 
         args.outdir.mkdir(parents=True, exist_ok=True)

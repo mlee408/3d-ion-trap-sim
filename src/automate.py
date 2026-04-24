@@ -197,6 +197,7 @@ class CaseResult:
     physical_min_ok: Optional[bool]
     hessian_status: Optional[str]
     grad_rel_at_r0: Optional[float]
+    transport_barrier_eV: Optional[float]
     score_breakdown: Optional[Dict[str, Any]]
     report_path: Optional[str]
     stderr_path: Optional[str]
@@ -339,8 +340,11 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
         physical_min_ok = bool(_pmo) if _pmo is not None else None
         hessian_status  = report.get("hessian_status")
         grad_rel_at_r0  = safe_float(report.get("grad_rel_at_r0"))
+        transport_barrier_eV = safe_float(report.get("transport_barrier_xscan_eV"))
+        depth_z_eV = safe_float(report.get("depth_z_eV"))
         return {
             "depth_eV": depth_eV,
+            "depth_z_eV": depth_z_eV,
             "min_freq_hz": min_freq_hz,
             "max_freq_hz": max_freq_hz,
             "mode_spread_hz": mode_spread_hz,
@@ -348,6 +352,7 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
             "physical_min_ok": physical_min_ok,
             "hessian_status": hessian_status,
             "grad_rel_at_r0": grad_rel_at_r0,
+            "transport_barrier_eV": transport_barrier_eV,
         }
 
     # ── run_case.py format (nested keys) ─────────────────────────────────
@@ -417,56 +422,57 @@ def score_case_metrics(metrics: Dict[str, Any]) -> Optional[float]:
 
     Hard rejects (return None — treated as failures by the Bayesian surrogate):
       - physical_min_ok == False  (far-field or electrode-adjacent minimum)
-      - depth_eV or min_freq_hz missing/NaN
+      - depth_z_eV (or depth_eV fallback) or min_freq_hz missing/NaN
 
-    Score terms (all ~O(1–5) for typical Ca+ geometries at 40 MHz, 150 V):
-      +5.0    × depth_eV          radial_depth_core_eV — local confinement depth
-      +1e-6   × min_freq_hz       weaker of top-2 radial modes (axial excluded)
+    Score terms (all ~O(1–5) for typical Yb-171 geometries at 44 MHz, 190 V):
+      +2.0    × depth_z_eV        axial (z) trap depth — paper-comparable primary metric
+      +2e-6   × min_freq_hz       weaker of top-2 radial modes (axial excluded)
       −0.3e-6 × spread_excess_hz  excess radial mode spread beyond 5 MHz target band
-
-      score = 2.0 * depth_z_eV + 2.0 * min_strong_freq_MHz - 0.3 * spread_excess_MHz
+      −50.0   × transport_barrier_eV  junction escape barrier (lower = easier shuttling)
 
     Mode-spread policy:
       Spread below SPREAD_TARGET_HZ (5 MHz) is free — some asymmetry is expected
       in non-square window patterns (e.g. n=3).  Only the excess is penalised, and
       at 0.3e-6 the penalty grows slowly enough that a 10 MHz excess costs ~3 points
-      (comparable to the depth term) rather than swamping it.  Observed n=3 sweeps
-      had ~16 MHz spread, which would have cost 16 under the old raw-spread policy
-      but costs only ~3.3 here, keeping the score meaningful.
+      (comparable to the depth term) rather than swamping it.
+
+    Transport barrier weight rationale:
+      7 meV (paper benchmark) costs ~0.35 pts — negligible for a well-optimised trap.
+      100 meV (unoptimised) costs ~5 pts — dominates and pushes the optimiser to fix it.
+      Coefficient chosen so transport quality is the critical QCCD differentiator.
 
     Soft multiplier (score × 0.85) for borderline_numeric Hessian:
       Applied after all additive terms so it scales the full score down uniformly.
-      Ensures numerically uncertain cases rank below clearly valid ones with similar
-      depth/frequency, without hard-rejecting them entirely.
     """
     # ── Hard reject ──────────────────────────────────────────────────────────
     if metrics.get("physical_min_ok") is False:
         return None
 
-    depth_eV       = metrics.get("depth_eV")
+    depth_z_eV     = metrics.get("depth_z_eV") or metrics.get("depth_eV")
     min_freq_hz    = metrics.get("min_freq_hz")
     mode_spread_hz = metrics.get("mode_spread_hz")
 
-    depth_z_eV = metrics.get("depth_z_eV")
-    min_strong_freq_hz = metrics.get("min_strong_freq_hz")
-
-    if depth_eV is None or min_freq_hz is None:
+    if depth_z_eV is None or min_freq_hz is None:
         return None
 
     # ── Additive terms ───────────────────────────────────────────────────────
-    term_depth = 5.0  * depth_eV
-    term_freq  = 1e-6 * min_freq_hz
-
-    term_depth = 2.0 * depth_z_eV if depth_z_eV is not None else term_depth
-    term_freq = 2e-6 * min_strong_freq_hz if min_strong_freq_hz is not None else term_freq
+    term_depth = 2.0  * depth_z_eV
+    term_freq  = 2e-6 * min_freq_hz
 
     # Excess-only spread penalty: free up to 5 MHz, then 0.3 pts per MHz beyond.
-    _SPREAD_TARGET_HZ  = 5e6
-    _SPREAD_COEFF      = 0.3e-6
-    spread_excess_hz   = max(0.0, mode_spread_hz) - _SPREAD_TARGET_HZ if mode_spread_hz is not None else 0.0
-    term_spread_pen    = _SPREAD_COEFF * max(0.0, spread_excess_hz)
+    _SPREAD_TARGET_HZ = 5e6
+    _SPREAD_COEFF     = 0.3e-6
+    spread_excess_hz  = (max(0.0, mode_spread_hz) - _SPREAD_TARGET_HZ
+                         if mode_spread_hz is not None else 0.0)
+    term_spread_pen   = _SPREAD_COEFF * max(0.0, spread_excess_hz)
 
-    score = term_depth + term_freq - term_spread_pen
+    # Transport barrier penalty (only when available)
+    transport_barrier_eV = metrics.get("transport_barrier_eV")
+    _TRANSPORT_COEFF = 50.0
+    term_transport_pen = (_TRANSPORT_COEFF * transport_barrier_eV
+                          if transport_barrier_eV is not None else 0.0)
+
+    score = term_depth + term_freq - term_spread_pen - term_transport_pen
 
     # ── Soft multiplier for borderline Hessian ───────────────────────────────
     if metrics.get("hessian_status") == "borderline_numeric":
@@ -477,7 +483,10 @@ def score_case_metrics(metrics: Dict[str, Any]) -> Optional[float]:
         "term_depth": round(term_depth, 4),
         "term_freq": round(term_freq, 4),
         "term_spread_pen": round(-term_spread_pen, 4),
+        "term_transport_pen": round(-term_transport_pen, 4),
         "spread_excess_mhz": round(max(0.0, spread_excess_hz) / 1e6, 3),
+        "transport_barrier_meV": (round(transport_barrier_eV * 1e3, 3)
+                                  if transport_barrier_eV is not None else None),
     }
 
     return score
@@ -1063,6 +1072,7 @@ def evaluate_case(
             status="ok",
             score=score,
             depth_eV=metrics.get("depth_eV"),
+            transport_barrier_eV=metrics.get("transport_barrier_eV"),
             min_freq_hz=metrics.get("min_freq_hz"),
             max_freq_hz=metrics.get("max_freq_hz"),
             mode_spread_hz=metrics.get("mode_spread_hz"),
@@ -1091,6 +1101,7 @@ def evaluate_case(
             status="failed",
             score=None,
             depth_eV=None,
+            transport_barrier_eV=None,
             min_freq_hz=None,
             max_freq_hz=None,
             mode_spread_hz=None,
@@ -1120,6 +1131,7 @@ def _result_row(result: CaseResult) -> Dict[str, Any]:
         "score": result.score,
         "rejection_reason": result.rejection_reason,
         "depth_eV": result.depth_eV,
+        "transport_barrier_eV": result.transport_barrier_eV,
         "min_freq_hz": result.min_freq_hz,
         "max_freq_hz": result.max_freq_hz,
         "mode_spread_hz": result.mode_spread_hz,
@@ -1240,11 +1252,14 @@ def run_bayesian_search(
         _bd = result.score_breakdown or {}
         _bd_str = ""
         if _bd:
+            _tb_meV = _bd.get("transport_barrier_meV")
+            _tb_str = f"  tb={_tb_meV:.1f}meV" if _tb_meV is not None else ""
             _bd_str = (
                 f"  depth={_bd.get('term_depth', 0):.3g}"
                 f"  freq={_bd.get('term_freq', 0):.3g}"
                 f"  spread_pen={_bd.get('term_spread_pen', 0):.3g}"
                 f"  (excess={_bd.get('spread_excess_mhz', 0):.2g} MHz)"
+                f"{_tb_str}"
             )
         _rej_str = f"  REJECT={result.rejection_reason}" if result.rejection_reason else ""
         _paper_str = ""
@@ -1424,10 +1439,13 @@ def print_best(results: Sequence[CaseResult], *, top_k: int = 5) -> None:
         _paper = ""
         if r.paper_comparison and r.paper_comparison.get("verdict"):
             _paper = f", paper={r.paper_comparison['verdict']}"
+        _tb = ""
+        if r.transport_barrier_eV is not None:
+            _tb = f", transport_barrier={r.transport_barrier_eV*1e3:.2f}meV"
         print(
             f"{r.case_id}: score={r.score:.6g}, depth_eV={r.depth_eV}, "
             f"min_freq_hz={r.min_freq_hz}, mode_spread_hz={r.mode_spread_hz}"
-            f"{_paper}, case_dir={r.case_dir}"
+            f"{_tb}{_paper}, case_dir={r.case_dir}"
         )
 
 
