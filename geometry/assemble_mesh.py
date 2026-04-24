@@ -139,6 +139,7 @@ def add_mesh_size_fields(
     lc_electrode, lc_center, lc_far,
     dist_min, dist_max,
     center_radius, trap_centers,
+    inner_box=None,
 ):
     """Set mesh sizes via Distance+Threshold from electrode surfaces + Ball(s) at trap centres.
 
@@ -192,6 +193,28 @@ def add_mesh_size_fields(
             gmsh.model.mesh.field.setNumber(f_ball, "ZCenter", tc[2])
             fields.append(f_ball)
             print(f"[fields] Ball(lc={lc_center}) centred at {tc}, r={r_ball}")
+
+    # Optional Box field: enforce fine mesh inside an inner-trap region.
+    # Inside the box the size is clamped to lc_in (<=lc_center).
+    # Outside the box VOut is set to lc_far so the Min field still uses
+    # the finest available value from the other fields.
+    # inner_box = (xmin, xmax, ymin, ymax, zmin, zmax, lc_in, thickness)
+    if inner_box is not None:
+        xb0, xb1, yb0, yb1, zb0, zb1, lc_in, thickness = inner_box
+        f_box = gmsh.model.mesh.field.add("Box")
+        gmsh.model.mesh.field.setNumber(f_box, "VIn",       lc_in)
+        gmsh.model.mesh.field.setNumber(f_box, "VOut",      lc_far)
+        gmsh.model.mesh.field.setNumber(f_box, "XMin",      xb0)
+        gmsh.model.mesh.field.setNumber(f_box, "XMax",      xb1)
+        gmsh.model.mesh.field.setNumber(f_box, "YMin",      yb0)
+        gmsh.model.mesh.field.setNumber(f_box, "YMax",      yb1)
+        gmsh.model.mesh.field.setNumber(f_box, "ZMin",      zb0)
+        gmsh.model.mesh.field.setNumber(f_box, "ZMax",      zb1)
+        gmsh.model.mesh.field.setNumber(f_box, "Thickness", thickness)
+        fields.append(f_box)
+        print(f"[fields] Box(VIn={lc_in}, VOut={lc_far}, thickness={thickness}) "
+              f"x=[{xb0:.4f},{xb1:.4f}] y=[{yb0:.4f},{yb1:.4f}] "
+              f"z=[{zb0:.4f},{zb1:.4f}]")
 
     # Min field: every point gets the finest size from all active fields
     f_min = gmsh.model.mesh.field.add("Min")
@@ -293,6 +316,33 @@ def main():
                          "Default: 0.600 mm (the standard cell pitch). "
                          "The physical cell is wider than this, so outer RF arms will "
                          "overlap — the fuse merges them into one continuous beam.")
+
+    # ── Inner-box field (hybrid mesh experiment) ──────────────────────────────
+    # When --box-lc-in is set, a Gmsh Box field enforces fine mesh inside a
+    # box around the trap region (Option-A hybrid: single conformal mesh).
+    # Outside the box lc_far takes over.  All four args default to None so
+    # existing callers see zero change in behaviour.
+    ap.add_argument(
+        "--box-lc-in", type=float, default=None,
+        help="Fine mesh size inside the inner-trap box field (mm). "
+             "When set, enables the Box field.  Typical: 0.005 (= lc-center). "
+             "Default: None (Box field disabled).",
+    )
+    ap.add_argument(
+        "--box-margin-xy", type=float, default=0.150,
+        help="XY margin beyond conductor bbox for inner-box bounds (mm, default 0.150). "
+             "Inner box x/y = conductor_bbox ± box-margin-xy.",
+    )
+    ap.add_argument(
+        "--box-z-top-offset", type=float, default=0.250,
+        help="Height of inner-box top above conductor_zmax (mm, default 0.250). "
+             "E.g. with conductor_zmax=0.247 and offset=0.250 the box top is 0.497 mm.",
+    )
+    ap.add_argument(
+        "--box-thickness", type=float, default=0.020,
+        help="Smooth-transition thickness at inner-box wall (mm, default 0.020). "
+             "Keeps the size gradient manageable for the mesher.",
+    )
 
     ap.add_argument("--nopopup", action="store_true")
     args = ap.parse_args()
@@ -531,6 +581,23 @@ def main():
                 trap_centers.append((lr_centre, args.center_radius))
                 print(f"[trap centre] --linear-region-x extra ball: {lr_centre}")
 
+    # Optionally compute inner-box bounds for the hybrid Box field.
+    inner_box = None
+    if args.box_lc_in is not None:
+        bm = args.box_margin_xy
+        xb0 = xmin - bm
+        xb1 = xmax + bm
+        yb0 = ymin - bm
+        yb1 = ymax + bm
+        zb0 = zmin                           # bottom of conductor bbox
+        zb1 = zmax + args.box_z_top_offset   # well above the ion height
+        inner_box = (xb0, xb1, yb0, yb1, zb0, zb1,
+                     args.box_lc_in, args.box_thickness)
+        print(f"[inner-box] lc_in={args.box_lc_in}, margin_xy={bm}, "
+              f"z_top_offset={args.box_z_top_offset}")
+        print(f"[inner-box] bounds: x=[{xb0:.4f},{xb1:.4f}] "
+              f"y=[{yb0:.4f},{yb1:.4f}] z=[{zb0:.4f},{zb1:.4f}]")
+
     add_mesh_size_fields(
         rf_surfs, dc_surfs, gnd_surfs,
         lc_electrode=args.lc_electrode,
@@ -540,6 +607,7 @@ def main():
         dist_max=args.dist_max,
         center_radius=args.center_radius,
         trap_centers=trap_centers,
+        inner_box=inner_box,
     )
 
     # 7) generate and write mesh

@@ -22,6 +22,15 @@ if [[ ! -f "$TRANSPORT_SCRIPT" ]]; then
     exit 1
 fi
 
+# ── Python interpreter (must have dolfinx / mpi4py) ──────────────────────────
+# Default: fenicsx conda env. Override with PYTHON=/path/to/python.
+PYTHON="${PYTHON:-/Users/michaelee408/Downloads/ENTER/envs/fenicsx/bin/python3}"
+if [[ ! -x "$PYTHON" ]]; then
+    echo "ERROR: python not found at: $PYTHON" >&2
+    echo "Set PYTHON=/path/to/python3 to override." >&2
+    exit 1
+fi
+
 TRANSPORT_SCRIPT="$(realpath "$TRANSPORT_SCRIPT")"
 SWEEP_DIR="$(pwd)"
 LOG_FILE="${SWEEP_DIR}/transport_barrier_run.log"
@@ -92,7 +101,7 @@ for num in "$@"; do
     report_path=""
     if report_path=$(find_report "$case_dir"); then
         # Use python to check success field robustly
-        success=$(python3 -c "
+        success=$("$PYTHON" -c "
 import json, sys
 try:
     r = json.load(open('$report_path'))
@@ -124,7 +133,7 @@ except Exception as e:
     } >> "$LOG_FILE"
 
     set +e
-    python3 "$TRANSPORT_SCRIPT" \
+    "$PYTHON" "$TRANSPORT_SCRIPT" \
         --case-dir "$case_dir" \
         --output-mode patch \
         --overwrite \
@@ -174,7 +183,7 @@ for cid in "${CASES_OK[@]}"; do
 done
 
 # Python one-liner to extract and print ranked table
-python3 - "${ok_dirs[@]}" "$SUMMARY_CSV" <<'PYEOF'
+"$PYTHON" - "${ok_dirs[@]}" "$SUMMARY_CSV" <<'PYEOF'
 import json, csv, sys
 from pathlib import Path
 

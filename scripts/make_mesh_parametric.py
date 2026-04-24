@@ -4,7 +4,7 @@ make_mesh_parametric.py
 
 Wrapper for the geometry sweep:
   1. rf_cell_gen.py   -> generates parametric RF cell STEP
-  2. assemble_mesh.py -> tiles 2 junctions + builds vacuum box + meshes
+  2. assemble_mesh.py -> tiles N junctions + builds vacuum box + meshes
 
 Place in scripts/ (or wherever your project keeps sweep scripts).
 rf_cell_gen.py and assemble_mesh.py must be in geometry/.
@@ -12,7 +12,10 @@ rf_cell_gen.py and assemble_mesh.py must be in geometry/.
 Parameters swept by automate.py:
     {rf_width_um}  -- electrode width in um (min 10, step 5)
                       controls BOTH rail and pillar thickness equally
-    {rf_height}    -- support beam height in um
+    {rf_height}    -- vertical distance from surface RF electrode top to
+                      the centroid of the 3D RF beam cross-section [µm]
+                      (NOT total beam height; NOT bottom-of-beam to substrate)
+    {njunctions}   -- number of junctions (1/2/3/4, default 2)
 
 window_n is fixed per sweep run (passed as $N in the bash for-loop).
 
@@ -50,7 +53,11 @@ def main() -> int:
                     help="Electrode width in um (min 10, step 5). "
                          "Controls both rail and pillar thickness equally.")
     ap.add_argument("--rf-height",   type=float, default=290.0,
-                    help="Support beam height in um")
+                    help="Vertical distance from surface RF electrode top to "
+                         "RF beam cross-section centroid [µm]. "
+                         "Beam spans ±(dv/2) around this centre in z.")
+    ap.add_argument("--njunctions",  type=int, default=2,
+                    help="Number of junctions to assemble (1/2/3/4). Default: 2")
 
     # Mesh quality
     ap.add_argument("--lc-electrode",  type=float, default=OPT_LC_ELECTRODE)
@@ -69,12 +76,14 @@ def main() -> int:
     window_n  = max(1, round(args.window_n))
     rf_width  = args.rf_width_um
     rf_height = args.rf_height
+    njunctions = max(1, min(4, args.njunctions))
 
     out_path = Path(args.out).resolve()
     case_dir = out_path.parent
 
     print(f"[make_mesh] window_n={window_n}  rf_width={rf_width}um  "
-          f"rf_height={rf_height}um", flush=True)
+          f"rf_height={rf_height}um (beam-centre above surface RF top)  "
+          f"njunctions={njunctions}", flush=True)
 
     # ── Step 1: generate parametric RF cell STEP via rf_cell_gen.py ──────
     # rf_cell_gen.py writes to cwd, so run it from case_dir.
@@ -126,15 +135,15 @@ def main() -> int:
         return rc
     print(f"[make_mesh] RF+surface STEP: {rf_with_base.name}", flush=True)
 
-    # ── Step 2: mesh with assemble_mesh.py (handles 2-junction tiling) ───
-    # Pass the merged RF+surface STEP — assemble_mesh.py tiles it twice,
-    # so both junctions get the base plate.
+    # ── Step 2: mesh with assemble_mesh.py (handles N-junction tiling) ───
+    # Pass the merged RF+surface STEP — assemble_mesh.py tiles it N times,
+    # so all junctions get the base plate.
     cmd_mesh = [
         sys.executable, str(ASSEMBLE),
         "--rf",             str(rf_with_base),
         "--dc",             str(DC_STEP),
         "--ground",         str(GND_STEP),
-        "--njunctions",     "2",        # two-junction assembly
+        "--njunctions",     str(njunctions),
         "--junction-pitch", "0.600",    # 600 um centre-to-centre
         "--lc-electrode",   str(args.lc_electrode),
         "--lc-center",      str(args.lc_center),
