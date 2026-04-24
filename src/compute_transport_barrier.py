@@ -169,21 +169,25 @@ def _resolve_phi_rf(
     if not mesh_path.exists():
         raise FileNotFoundError(f"Mesh file not found: {mesh_path}")
 
+    print(f"[ctb] loading mesh {mesh_path.name} ...", flush=True)
     domain, facet_tags, _ = load_case_mesh(mesh_path)
     if facet_tags is None:
         raise RuntimeError("Mesh has no facet tags — cannot apply boundary conditions.")
+    print(f"[ctb] mesh loaded  (degree={degree})", flush=True)
 
     outer_set = set(outer_tags)
     gnd_tags_bc = [t for t in ground_tags if t not in outer_set]
     bc_map: Dict[int, float] = {t: 1.0 for t in rf_tags}
     bc_map.update({t: 0.0 for t in gnd_tags_bc})
 
+    print(f"[ctb] solving Laplace  rf_tags={rf_tags}  gnd_tags={gnd_tags_bc} ...", flush=True)
     phi_rf = solve_laplace_tagged(
         domain, facet_tags, bc_map,
         degree=degree,
         petsc_prefix="ctb_rf_",
     )
     phi_rf.name = "phi_rf"
+    print("[ctb] Laplace solve done", flush=True)
 
     # Save checkpoint so future runs skip the re-solve entirely
     ckpt_name = f"{prefix}_phi_rf_dofs.npy" if prefix else "phi_rf_dofs.npy"
@@ -206,10 +210,12 @@ def _build_psi(phi_rf, report: Dict[str, Any]):
     charge  = float(report.get("charge_e", 1.0)) * _E_CHARGE
     omega   = 2.0 * np.pi * rf_freq
 
+    print("[ctb] computing pseudopotential ...", flush=True)
     Psi = metrics.compute_rf_pseudopotential(
         phi_rf, omega_rf=omega, q_C=charge, m_kg=mass, degree=degree,
     )
     Psi.name = "Psi_rf"
+    print("[ctb] pseudopotential ready", flush=True)
     return Psi
 
 
@@ -222,21 +228,21 @@ def _scan_transport_barrier(
     junction_pitch: float = 600e-6,
     n_steps: int = 60,
     scan_both_axes: bool = False,
-    optim_method: str = "Nelder-Mead",
+    optim_method: str = "coord_descent",   # kept for CLI compat; unused
     comm=None,
 ) -> Dict[str, Any]:
     """Scan toward the nearest junction center and compute the transport barrier.
 
-    The scan starts at r0 and walks outward toward the nearest junction center
-    (x = round(r0_x / pitch) * pitch), extending 20 % past the junction center.
-    At each x position the pseudopotential is minimised in the transverse (y, z)
-    plane by scipy Nelder-Mead, chaining the initial guess from the previous step.
+    Algorithm mirrors metrics._ctc_scan: walk in x, at each step use multi-scale
+    coordinate descent in (y, z) to track the Ψ valley floor.  This is more robust
+    than scipy Nelder-Mead because the step size is derived from the mesh cell size
+    rather than a fixed heuristic.
 
     Returns a dict ready to be merged into the JSON report.
     """
-    import scipy.optimize
     import metrics
 
+    domain     = Psi.function_space.mesh
     coord_unit = float(report.get("coord_unit_m_per_mesh", 1e-3))
     vrf        = float(report.get("vrf_V", 1.0))
     r0_x_m    = float(report["r0_x_m"])
@@ -246,15 +252,12 @@ def _scan_transport_barrier(
     # r0 in mesh units
     r0 = np.array([r0_x_m, r0_y_m, r0_z_m]) / coord_unit
 
-    # Physical scale: Psi (unit-voltage, mesh-gradient) → SI Joules → eV
-    # Ψ_SI = q²V²|∇φ|²/(4mω²);  our Psi already encodes q,m,ω so
-    # Psi_stored × (V/coord_unit_gradient_factor)² needs re-scaling.
-    # The stored Psi was computed with φ=1 V, so to get SI energy:
-    #   E_SI [J] = Psi_stored × vrf²
-    # (Psi is in units of J/V² per the compute_rf_pseudopotential formula,
-    #  which uses q_C, m_kg, omega_rf in SI and phi_rf normalised to 1 V.)
-    phys_scale = vrf ** 2       # J/V² × V² = J
+    phys_scale = vrf ** 2       # Psi stored per (V²); multiply to get SI Joules
     to_eV      = phys_scale / _E_CHARGE
+
+    # Step size for coordinate descent in transverse plane — use mesh cell size
+    h_mesh = metrics._estimate_cell_h(domain)
+    h_yz_base = h_mesh * 1.5    # matches metrics._ctc_scan
 
     # Psi at r0
     psi0_raw = float(metrics.eval_function_at_points(
@@ -270,65 +273,64 @@ def _scan_transport_barrier(
         )[0])
         return v if np.isfinite(v) else 1e30
 
+    def _yz_descent(trial: np.ndarray, cur_v: float) -> Tuple[np.ndarray, float]:
+        """Multi-scale coordinate descent in y,z axes (axes 1 and 2)."""
+        for h_scale in (2.0, 1.0):
+            h = h_yz_base * h_scale
+            for _ in range(2):
+                for ax in (1, 2):
+                    for sign in (+1.0, -1.0):
+                        cand = trial.copy(); cand[ax] += sign * h
+                        v = _eval_psi(cand)
+                        if v < cur_v:
+                            cur_v = v; trial = cand
+        return trial, cur_v
+
     # ── Find nearest junction center ─────────────────────────────────────────
-    pitch_mesh = junction_pitch / coord_unit
+    pitch_mesh  = junction_pitch / coord_unit
     junc_x_mesh = round(r0[0] / pitch_mesh) * pitch_mesh
-    junc_y_mesh = 0.0
 
-    dx_mesh = junc_x_mesh - r0[0]
-    scan_end_mesh = junc_x_mesh + 0.2 * abs(dx_mesh)
+    dx_mesh      = junc_x_mesh - r0[0]
+    scan_end     = junc_x_mesh + 0.2 * abs(dx_mesh)
+    scan_back    = r0[0] - 0.2 * abs(dx_mesh)
 
-    # Build x-scan points centred on r0 outward (bidirectional for robust chaining)
-    x_toward = np.linspace(r0[0], scan_end_mesh, n_steps)
-    # Also extend slightly backward from r0 to characterise the linear region
-    x_back   = np.linspace(r0[0], r0[0] - 0.2 * abs(dx_mesh), max(n_steps // 5, 5))
+    x_fwd = np.linspace(r0[0], scan_end,  n_steps)
+    x_bwd = np.linspace(r0[0], scan_back, max(n_steps // 5, 5))
 
-    # Combine: backward reversed + forward, removing duplicate r0
-    x_all = np.concatenate([x_back[::-1][:-1], x_toward])
+    # ── Forward scan (r0 → junction + 20%) ───────────────────────────────────
+    print(f"[ctb] scanning x: r0={r0[0]:.4f} → junction={junc_x_mesh:.4f} "
+          f"(+20%={scan_end:.4f})  n_steps={n_steps}  h_yz={h_yz_base:.4f}", flush=True)
 
-    # ── Bidirectional (y,z) chaining ─────────────────────────────────────────
-    # Scan forward from r0 (optimising y,z at each x), then backward from r0.
-    # The forward scan is the primary one; backward gives the linear-region profile.
+    cur = r0.copy()
+    cur_v = psi0_raw
+    psi_fwd = np.full(len(x_fwd), np.nan)
+    for i, xi in enumerate(x_fwd):
+        trial = cur.copy(); trial[0] = xi
+        tv = _eval_psi(trial)
+        if tv > 1e29:
+            break
+        trial, tv = _yz_descent(trial, tv)
+        cur = trial; cur_v = tv
+        psi_fwd[i] = max(tv, 0.0)
+        if (i + 1) % 10 == 0:
+            print(f"[ctb]   step {i+1}/{len(x_fwd)}  x={xi:.4f}  psi={tv:.3e}", flush=True)
 
-    def _scan_1d(x_pts: np.ndarray, yz0: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Scan along x_pts, minimising Ψ in (y,z) at each step.
-        Returns (x_pts, psi_vals) where psi_vals are the minimised Ψ values."""
-        yz = yz0.copy()
-        psi_vals = np.full(len(x_pts), np.nan)
-        for i, xi in enumerate(x_pts):
-            pt0 = np.array([xi, yz[0], yz[1]])
-            v0 = _eval_psi(pt0)
-            if v0 > 1e29:
-                break   # left mesh
-            # Nelder-Mead over (y, z) with a small initial simplex
-            h_yz = max(abs(dx_mesh) * 0.05, 1.0)
-            res = scipy.optimize.minimize(
-                lambda yz_: _eval_psi(np.array([xi, yz_[0], yz_[1]])),
-                x0=yz,
-                method=optim_method,
-                options={
-                    "xatol": 1e-6, "fatol": 1e-14,
-                    "maxiter": 300,
-                    "initial_simplex": np.array([
-                        yz,
-                        yz + np.array([h_yz, 0.0]),
-                        yz + np.array([0.0, h_yz]),
-                    ]),
-                },
-            )
-            yz = res.x
-            psi_vals[i] = max(res.fun, 0.0)
-        return x_pts, psi_vals
+    # ── Backward scan (r0 → r0 - 20%) ────────────────────────────────────────
+    cur = r0.copy(); cur_v = psi0_raw
+    psi_bwd = np.full(len(x_bwd) - 1, np.nan)
+    for i, xi in enumerate(x_bwd[1:]):
+        trial = cur.copy(); trial[0] = xi
+        tv = _eval_psi(trial)
+        if tv > 1e29:
+            break
+        trial, tv = _yz_descent(trial, tv)
+        cur = trial; cur_v = tv
+        psi_bwd[i] = max(tv, 0.0)
 
-    yz_r0 = np.array([r0[1], r0[2]])
-    x_fwd, psi_fwd = _scan_1d(x_toward, yz_r0)
-    x_bwd, psi_bwd = _scan_1d(x_back[1:], yz_r0)   # skip r0 duplicate
+    # Combine: backward reversed + forward
+    x_full   = np.concatenate([x_bwd[1:][::-1], x_fwd])
+    psi_full = np.concatenate([psi_bwd[::-1],   psi_fwd])
 
-    # Combine for full profile (backward reversed + forward)
-    x_full   = np.concatenate([x_bwd[::-1], x_fwd])
-    psi_full = np.concatenate([psi_bwd[::-1], psi_fwd])
-
-    # Drop NaN points
     valid = np.isfinite(psi_full)
     if valid.sum() < 3:
         raise RuntimeError("Transport scan: fewer than 3 valid Psi evaluations — scan may have left the mesh.")
@@ -337,67 +339,60 @@ def _scan_transport_barrier(
     p_v = psi_full[valid]
 
     # ── Barrier ───────────────────────────────────────────────────────────────
-    psi_max = float(np.max(p_v))
-    peak_idx = int(np.argmax(p_v))
+    psi_max     = float(np.max(p_v))
+    peak_idx    = int(np.argmax(p_v))
     peak_x_mesh = float(x_v[peak_idx])
     barrier_raw = max(psi_max - psi0_raw, 0.0)
 
-    barrier_eV    = barrier_raw * to_eV
-    psi_max_eV    = psi_max     * to_eV
-    psi_r0_eV     = psi0_raw   * to_eV
-    peak_x_m      = peak_x_mesh * coord_unit
-    junc_x_m      = junc_x_mesh * coord_unit
+    barrier_eV = barrier_raw * to_eV
+    psi_max_eV = psi_max     * to_eV
+    psi_r0_eV  = psi0_raw    * to_eV
+    peak_x_m   = peak_x_mesh * coord_unit
+    junc_x_m   = junc_x_mesh * coord_unit
 
-    # Check if scan reached the junction center
     fwd_valid = np.isfinite(psi_fwd)
     reached_junction = (fwd_valid.sum() > 0 and
                         float(x_fwd[np.where(fwd_valid)[0][-1]]) >= junc_x_mesh - 1e-8 * pitch_mesh)
 
+    print(f"[ctb] barrier={barrier_eV*1e3:.3f} meV  "
+          f"peak_x={peak_x_m*1e6:.1f} µm  junction_x={junc_x_m*1e6:.1f} µm  "
+          f"reached={'yes' if reached_junction else 'NO'}", flush=True)
+
     result: Dict[str, Any] = {
-        "transport_barrier_xscan_eV":        round(barrier_eV, 8),
-        "transport_xscan_psi_max_eV":        round(psi_max_eV, 8),
-        "transport_xscan_psi_r0_eV":         round(psi_r0_eV, 8),
-        "transport_xscan_peak_x_m":          round(peak_x_m, 10),
+        "transport_barrier_xscan_eV":           round(barrier_eV, 8),
+        "transport_xscan_psi_max_eV":           round(psi_max_eV, 8),
+        "transport_xscan_psi_r0_eV":            round(psi_r0_eV, 8),
+        "transport_xscan_peak_x_m":             round(peak_x_m, 10),
         "transport_xscan_nearest_junction_x_m": round(junc_x_m, 10),
-        "transport_xscan_n_points":          int(valid.sum()),
-        "transport_xscan_reached_junction":  bool(reached_junction),
-        "transport_xscan_junction_pitch_m":  junction_pitch,
+        "transport_xscan_n_points":             int(valid.sum()),
+        "transport_xscan_reached_junction":     bool(reached_junction),
+        "transport_xscan_junction_pitch_m":     junction_pitch,
     }
 
     # ── Optional y-scan ───────────────────────────────────────────────────────
     if scan_both_axes:
-        y_end_mesh  = r0[1] + 0.5 * pitch_mesh
-        y_pts_fwd   = np.linspace(r0[1], y_end_mesh + 0.2 * abs(y_end_mesh - r0[1]), n_steps)
-        xz_r0       = np.array([r0[0], r0[2]])
+        y_end = r0[1] + 0.5 * pitch_mesh
+        y_pts = np.linspace(r0[1], y_end + 0.2 * abs(y_end - r0[1]), n_steps)
+        cur_y = r0.copy(); cur_v_y = psi0_raw
+        psi_y = np.full(len(y_pts), np.nan)
+        for i, yi in enumerate(y_pts):
+            trial = cur_y.copy(); trial[1] = yi
+            tv = _eval_psi(trial)
+            if tv > 1e29:
+                break
+            # Coordinate descent in x, z
+            for h_scale in (2.0, 1.0):
+                h = h_yz_base * h_scale
+                for _ in range(2):
+                    for ax in (0, 2):
+                        for sign in (+1.0, -1.0):
+                            cand = trial.copy(); cand[ax] += sign * h
+                            v = _eval_psi(cand)
+                            if v < tv:
+                                tv = v; trial = cand
+            cur_y = trial; cur_v_y = tv
+            psi_y[i] = max(tv, 0.0)
 
-        def _scan_y(y_pts: np.ndarray, xz0: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-            xz = xz0.copy()
-            psi_vals = np.full(len(y_pts), np.nan)
-            h_xz = max(abs(dx_mesh) * 0.05, 1.0)
-            for i, yi in enumerate(y_pts):
-                pt0 = np.array([xz[0], yi, xz[1]])
-                v0 = _eval_psi(pt0)
-                if v0 > 1e29:
-                    break
-                res = scipy.optimize.minimize(
-                    lambda xz_: _eval_psi(np.array([xz_[0], yi, xz_[1]])),
-                    x0=xz,
-                    method=optim_method,
-                    options={
-                        "xatol": 1e-6, "fatol": 1e-14,
-                        "maxiter": 300,
-                        "initial_simplex": np.array([
-                            xz,
-                            xz + np.array([h_xz, 0.0]),
-                            xz + np.array([0.0, h_xz]),
-                        ]),
-                    },
-                )
-                xz = res.x
-                psi_vals[i] = max(res.fun, 0.0)
-            return y_pts, psi_vals
-
-        _, psi_y = _scan_y(y_pts_fwd, xz_r0)
         valid_y = np.isfinite(psi_y)
         if valid_y.sum() >= 3:
             psi_y_max     = float(np.max(psi_y[valid_y]))
