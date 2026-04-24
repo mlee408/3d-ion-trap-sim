@@ -424,6 +424,8 @@ def score_case_metrics(metrics: Dict[str, Any]) -> Optional[float]:
       +1e-6   × min_freq_hz       weaker of top-2 radial modes (axial excluded)
       −0.3e-6 × spread_excess_hz  excess radial mode spread beyond 5 MHz target band
 
+      score = 2.0 * depth_z_eV + 2.0 * min_strong_freq_MHz - 0.3 * spread_excess_MHz
+
     Mode-spread policy:
       Spread below SPREAD_TARGET_HZ (5 MHz) is free — some asymmetry is expected
       in non-square window patterns (e.g. n=3).  Only the excess is penalised, and
@@ -445,12 +447,18 @@ def score_case_metrics(metrics: Dict[str, Any]) -> Optional[float]:
     min_freq_hz    = metrics.get("min_freq_hz")
     mode_spread_hz = metrics.get("mode_spread_hz")
 
+    depth_z_eV = metrics.get("depth_z_eV")
+    min_strong_freq_hz = metrics.get("min_strong_freq_hz")
+
     if depth_eV is None or min_freq_hz is None:
         return None
 
     # ── Additive terms ───────────────────────────────────────────────────────
     term_depth = 5.0  * depth_eV
     term_freq  = 1e-6 * min_freq_hz
+
+    term_depth = 2.0 * depth_z_eV if depth_z_eV is not None else term_depth
+    term_freq = 2e-6 * min_strong_freq_hz if min_strong_freq_hz is not None else term_freq
 
     # Excess-only spread penalty: free up to 5 MHz, then 0.3 pts per MHz beyond.
     _SPREAD_TARGET_HZ  = 5e6
