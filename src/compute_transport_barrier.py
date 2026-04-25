@@ -109,10 +109,10 @@ def _load_phi_rf_from_checkpoint(
     checkpoint_path: Path,
     degree: int,
     comm,
-) -> Tuple[Any, Any]:
+) -> Tuple[Any, Any, Any]:
     """Load mesh and restore phi_rf from a saved DOF-array checkpoint.
 
-    Returns (domain, phi_rf_function).
+    Returns (domain, facet_tags, phi_rf_function).
     """
     from run_case import load_case_mesh
     from dolfinx import fem
@@ -130,7 +130,7 @@ def _load_phi_rf_from_checkpoint(
             "The mesh or degree may have changed since the checkpoint was saved."
         )
     phi_rf.x.array[:] = dofs
-    return domain, phi_rf
+    return domain, facet_tags, phi_rf
 
 
 def _resolve_phi_rf(
@@ -141,10 +141,11 @@ def _resolve_phi_rf(
     ground_tags: List[int],
     outer_tags: List[int],
     comm,
-) -> Tuple[Any, Any, bool]:
-    """Return (domain, phi_rf, used_checkpoint).
+) -> Tuple[Any, Any, Any, bool]:
+    """Return (domain, facet_tags, phi_rf, used_checkpoint).
 
     Tries checkpoint first; falls back to a fresh Laplace solve.
+    facet_tags is always returned so callers can reuse it for DC solves.
     """
     from run_case import load_case_mesh, solve_laplace_tagged
     from dolfinx import fem
@@ -173,8 +174,14 @@ def _resolve_phi_rf(
             ckpt_path = p
 
     if ckpt_path is not None:
-        domain, phi_rf = _load_phi_rf_from_checkpoint(mesh_path, ckpt_path, degree, comm)
-        return domain, phi_rf, True
+        try:
+            domain, facet_tags, phi_rf = _load_phi_rf_from_checkpoint(
+                mesh_path, ckpt_path, degree, comm
+            )
+            return domain, facet_tags, phi_rf, True
+        except ValueError as exc:
+            print(f"[ctb] checkpoint unusable ({exc}); falling back to re-solve.", flush=True)
+            # ckpt_path stays set so we overwrite it with the fresh solution below
 
     # Re-solve
     if not mesh_path.exists():
@@ -200,13 +207,14 @@ def _resolve_phi_rf(
     phi_rf.name = "phi_rf"
     print("[ctb] Laplace solve done", flush=True)
 
-    # Save checkpoint so future runs skip the re-solve entirely
-    ckpt_name = f"{prefix}_phi_rf_dofs.npy" if prefix else "phi_rf_dofs.npy"
+    # Save (or overwrite stale) checkpoint so future runs skip the re-solve entirely
+    ckpt_name = (ckpt_path.name if ckpt_path is not None
+                 else (f"{prefix}_phi_rf_dofs.npy" if prefix else "phi_rf_dofs.npy"))
     ckpt_out = case_dir / ckpt_name
     np.save(str(ckpt_out), phi_rf.x.array)
     report["phi_rf_checkpoint"] = ckpt_name   # picked up when JSON is patched later
 
-    return domain, phi_rf, False
+    return domain, facet_tags, phi_rf, False
 
 
 # ── Core: compute Psi from phi_rf ─────────────────────────────────────────────
@@ -229,6 +237,131 @@ def _build_psi(phi_rf, report: Dict[str, Any]):
     Psi.name = "Psi_rf_dg"
     print("[ctb] pseudopotential ready", flush=True)
     return Psi
+
+
+# ── DC electrode Laplace solutions ───────────────────────────────────────────
+
+def _resolve_phi_dc_all(
+    case_dir: Path,
+    report: Dict[str, Any],
+    domain,
+    facet_tags,
+    *,
+    dc_tags: List[int],
+    rf_tags: List[int],
+    ground_tags: List[int],
+    outer_tags: List[int],
+    degree: int = 2,
+    comm,
+) -> Dict[int, Any]:
+    """Solve or load the unit-voltage Laplace solution for each DC electrode tag.
+
+    For each tag in dc_tags, solves ∇²φ = 0 with φ=1 on that tag and φ=0 on
+    all other electrode surfaces (RF + ground + other DC).  Outer boundaries
+    remain Neumann.  Returns {tag: phi_dc_function}.
+    """
+    from dolfinx import fem
+    from run_case import solve_laplace_tagged
+
+    prefix = report.get("prefix", "")
+    outer_set = set(outer_tags)
+    phi_dc_map: Dict[int, Any] = {}
+
+    for tag in dc_tags:
+        ckpt_name = (f"{prefix}_phi_dc_tag{tag}_dofs.npy" if prefix
+                     else f"phi_dc_tag{tag}_dofs.npy")
+        ckpt_path = case_dir / ckpt_name
+
+        if ckpt_path.exists():
+            print(f"[ctb] loading DC checkpoint for tag {tag}: {ckpt_name}", flush=True)
+            V = fem.functionspace(domain, ("CG", degree))
+            phi_dc = fem.Function(V)
+            phi_dc.name = f"phi_dc_{tag}"
+            dofs = np.load(str(ckpt_path))
+            if dofs.shape == phi_dc.x.array.shape:
+                phi_dc.x.array[:] = dofs
+                phi_dc_map[tag] = phi_dc
+                continue
+            else:
+                print(f"[ctb] checkpoint shape mismatch for tag {tag}, re-solving", flush=True)
+
+        # Build BC map: 1V on this DC tag, 0V on RF and ground electrodes.
+        # RF electrodes are AC-coupled — DC potential is 0V on them.
+        bc_map: Dict[int, float] = {tag: 1.0}
+        for rt in rf_tags:
+            bc_map[rt] = 0.0
+        for gt in ground_tags:
+            if gt not in outer_set and gt != tag:
+                bc_map[gt] = 0.0
+        for other_tag in dc_tags:
+            if other_tag != tag:
+                bc_map[other_tag] = 0.0
+
+        print(f"[ctb] solving DC Laplace for tag {tag}  bc_map={bc_map} ...", flush=True)
+        phi_dc = solve_laplace_tagged(
+            domain, facet_tags, bc_map,
+            degree=degree,
+            petsc_prefix=f"ctb_dc{tag}_",
+        )
+        phi_dc.name = f"phi_dc_{tag}"
+
+        np.save(str(ckpt_path), phi_dc.x.array)
+        print(f"[ctb] DC tag {tag} solved and saved → {ckpt_name}", flush=True)
+        phi_dc_map[tag] = phi_dc
+
+    return phi_dc_map
+
+
+def _build_effective_potential(
+    Psi,
+    phi_dc_map: Dict[int, Any],
+    dc_voltages: Dict[int, float],
+    report: Dict[str, Any],
+) -> Any:
+    """Build Φ_eff = Ψ_RF + q × Σ V_i × φ_DC_i as a dolfinx Function.
+
+    Psi is in "raw" mesh units where Ψ_J = Ψ_raw × (V_RF/coord_unit)².
+    phi_dc functions are dimensionless (unit-voltage Laplace solutions).
+    dc_voltages[tag] is the applied DC voltage in Volts.
+
+    DC contribution in raw units: DC_raw = q × V_DC × φ_DC / phys_scale
+    so that Φ_eff_J = Φ_eff_raw × phys_scale = Ψ_J + Σ q × V_DC_i × φ_DC_i.
+    """
+    from dolfinx import fem
+
+    charge = float(report.get("charge_e", 1.0)) * _E_CHARGE
+    coord_unit = float(report.get("coord_unit_m_per_mesh", 1e-3))
+    vrf = float(report.get("vrf_V", 1.0))
+    phys_scale = (vrf / coord_unit) ** 2
+
+    Phi_eff = fem.Function(Psi.function_space)
+    Phi_eff.name = "Phi_eff"
+    Phi_eff.x.array[:] = Psi.x.array[:]
+
+    n_active = 0
+    for tag, phi_dc in phi_dc_map.items():
+        v_dc = dc_voltages.get(tag, 0.0)
+        if abs(v_dc) < 1e-15:
+            continue
+        n_active += 1
+
+        # Interpolate phi_dc (CG) into Psi's function space (may be DG)
+        if phi_dc.function_space == Psi.function_space:
+            dc_dofs = phi_dc.x.array
+        else:
+            phi_dc_interp = fem.Function(Psi.function_space)
+            phi_dc_interp.interpolate(phi_dc)
+            dc_dofs = phi_dc_interp.x.array
+
+        Phi_eff.x.array[:] += (charge * v_dc / phys_scale) * dc_dofs
+
+    v_range = [dc_voltages[t] for t in phi_dc_map if t in dc_voltages]
+    print(
+        f"[ctb] built Φ_eff = Ψ_RF + DC  ({n_active} active DC electrode(s), "
+        f"V_dc range [{min(v_range, default=0):.3f}, {max(v_range, default=0):.3f}] V)",
+        flush=True,
+    )
+    return Phi_eff
 
 
 # ── Transport barrier scan ────────────────────────────────────────────────────
@@ -316,16 +449,16 @@ def _scan_transport_barrier(
     junc_x_mesh = far_junc            # target junction for the forward scan
 
     dx_mesh      = far_junc - r0[0]   # signed distance to the far junction
-    scan_end     = far_junc + 0.2 * abs(dx_mesh)
+    scan_end     = far_junc           # stop at junction center (no overshoot)
     scan_back    = r0[0] - 0.2 * abs(dx_mesh)
 
     x_fwd = np.linspace(r0[0], scan_end,  n_steps)
     x_bwd = np.linspace(r0[0], scan_back, max(n_steps // 5, 5))
 
-    # ── Forward scan (r0 → junction + 20%) ───────────────────────────────────
+    # ── Forward scan (r0 → junction center) ──────────────────────────────────
     print(f"[ctb] r0 psi={psi0_raw:.3e} J  ({psi0_raw*to_eV*1e3:.4f} meV)", flush=True)
     print(f"[ctb] scanning x: r0={r0[0]:.4f} → far_junction={junc_x_mesh:.4f} "
-          f"(+20%={scan_end:.4f})  near_junction={near_junc:.4f}  "
+          f"near_junction={near_junc:.4f}  "
           f"n_steps={n_steps}  h_yz={h_yz_base:.4f}", flush=True)
     print(f"[ctb] coord_unit={coord_unit}  vrf={vrf} V  phys_scale={phys_scale:.3e}"
           f"  to_eV={to_eV:.3e}", flush=True)
@@ -750,7 +883,10 @@ def _ctc_string_method(
                 flush=True,
             )
 
-        if max_disp < 1e-5 * h_mesh:
+        # Require at least 5 iterations before the displacement threshold can
+        # trigger — prevents false convergence when the string starts on the
+        # RF null (flat y/z landscape gives near-zero displacement in iter 1).
+        if it >= 4 and max_disp < 1e-5 * h_mesh:
             converged = True
             print(f"[ctc] converged at iteration {it+1} (displacement threshold)", flush=True)
             break
@@ -829,6 +965,415 @@ def _ctc_string_method(
     }
 
 
+# ── Paper-method: pseudopotential-minimum path + CTC path (2025 paper) ───────
+
+def _paper_ctc_and_min_scan(
+    Psi,
+    report: Dict[str, Any],
+    *,
+    junction_pitch: float = 600e-6,
+    n_x: int = 60,
+    ctc_z_min_m: Optional[float] = None,
+    ctc_z_max_m: Optional[float] = None,
+    n_z: int = 200,
+    ctc_target_conf: float = 0.75e9,   # eV/m²
+    ctc_target_auto: bool = False,
+    hessian_step_um: float = 2.0,
+    run_min: bool = True,
+    run_ctc: bool = True,
+    comm=None,
+    csv_out_min: Optional[Path] = None,
+    csv_out_ctc: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """2025-paper method: scan z at y=0 for each x; extract pseudopotential-
+    minimum path and constant-total-confinement (CTC) path.
+
+    C(x,0,z) = ∇²Φ_pp  [eV/m²] via Hessian trace central finite differences.
+    CTC path: z where C = ctc_target_conf at each x.
+    Min path: z where Φ_pp is minimum at each x.
+
+    Crossing selection:
+      For each x, the CTC uses the "outer" crossing: the first sign change of
+      (C - C_target) at z ≥ z_min_local.  This corresponds to the confinement
+      isosurface that bounds the trap from above (moving away from the surface).
+      If no outer crossing exists (C(z_min) < C_target at this x), falls back
+      to the nearest-to-z_min crossing and marks ctc_crossing_side="inner".
+
+    ctc_target_auto=True: set C_target = C(z_min) at the first x step (r0),
+      calibrating the CTC threshold to the actual linear-region confinement.
+
+    Returns dict with transport_min_path, transport_ctc_path, ctc_barrier_eV,
+    ctc_barrier_meV, ctc_target_conf_eV_per_m2, ctc_max_abs_dz_um,
+    ctc_rms_dz_um, ctc_no_crossing_count.
+    """
+    import metrics
+
+    domain     = Psi.function_space.mesh
+    coord_unit = float(report.get("coord_unit_m_per_mesh", 1e-3))
+    vrf        = float(report.get("vrf_V", 1.0))
+    r0_x_m     = float(report["r0_x_m"])
+    r0_y_m     = float(report["r0_y_m"])
+    r0_z_m     = float(report["r0_z_m"])
+
+    phys_scale = (vrf / coord_unit) ** 2
+    to_eV      = phys_scale / _E_CHARGE
+
+    r0 = np.array([r0_x_m, r0_y_m, r0_z_m]) / coord_unit  # mesh units
+
+    # ── Junction x ────────────────────────────────────────────────────────────
+    pitch_mesh = junction_pitch / coord_unit
+    near_junc  = round(r0[0] / pitch_mesh) * pitch_mesh
+    far_junc   = (near_junc + pitch_mesh if r0[0] >= near_junc
+                  else near_junc - pitch_mesh)
+    junc_x_mesh = far_junc
+    junc_x_m    = junc_x_mesh * coord_unit
+
+    # ── x sample points: linear region → junction center (no overshoot) ─────
+    dx_mesh  = far_junc - r0[0]
+    scan_end = far_junc          # stop exactly at junction center
+    x_mesh   = np.linspace(r0[0], scan_end, n_x)
+
+    # ── z range in mesh units ─────────────────────────────────────────────────
+    coords = domain.geometry.x
+    z_mesh_all = coords[:, 2]
+    z_floor_mesh = float(z_mesh_all.min())
+    z_ceil_mesh  = float(z_mesh_all.max())
+    # Default: full mesh z extent, shrunk slightly from boundaries
+    z_margin = 0.01 * (z_ceil_mesh - z_floor_mesh)
+    if ctc_z_min_m is not None:
+        z_min_mesh = ctc_z_min_m / coord_unit
+    else:
+        z_min_mesh = z_floor_mesh + z_margin
+    if ctc_z_max_m is not None:
+        z_max_mesh = ctc_z_max_m / coord_unit
+    else:
+        z_max_mesh = z_ceil_mesh - z_margin
+    z_scan_mesh = np.linspace(z_min_mesh, z_max_mesh, n_z)  # shape (n_z,)
+
+    # ── Finite-difference step in mesh units and SI ───────────────────────────
+    h_si   = hessian_step_um * 1e-6                  # metres
+    h_mesh = h_si / coord_unit                       # mesh units
+    # Laplacian conversion: C [eV/m²] = to_eV × Σ FD_second / h_si²
+    # (the coord_unit² in the denominator and numerator cancel perfectly)
+    lap_scale = to_eV / (h_si ** 2)
+
+    y_fixed_mesh = 0.0  # y = 0
+
+    # ctc_target_auto: calibrate C_target to C(z_min) at the first x step.
+    # This ensures the CTC passes through the linear-region trap minimum.
+    # The actual value is determined on the first x step below.
+    _ctc_target_resolved = ctc_target_conf   # may be overridden on ix==0
+    _ctc_target_set_auto = False
+
+    print(f"[paper-ctc] scanning {n_x} x-points  "
+          f"x=[{r0[0]*coord_unit*1e6:.1f}, {scan_end*coord_unit*1e6:.1f}] µm  "
+          f"n_z={n_z}  z=[{z_min_mesh*coord_unit*1e6:.1f}, "
+          f"{z_max_mesh*coord_unit*1e6:.1f}] µm  "
+          f"h_fd={hessian_step_um:.1f} µm  "
+          f"C_target={'auto (from r0)' if ctc_target_auto else f'{ctc_target_conf:.3e} eV/m²'}",
+          flush=True)
+
+    # ── Per-x scan ────────────────────────────────────────────────────────────
+    # For each x we need 7 × n_z evaluations:
+    #   center, ±x, ±y, ±z stencil.
+    # Batch all 7n_z evaluations per x for efficiency.
+
+    min_path_rows: List[Dict[str, Any]] = []
+    ctc_path_rows: List[Dict[str, Any]] = []
+    prev_z_ctc_mesh: Optional[float] = None   # z-continuity anchor for CTC crossing
+    for ix, xi in enumerate(x_mesh):
+        # Build 7 × n_z stencil points, shape (7*n_z, 3)
+        base_pts = np.column_stack([
+            np.full(n_z, xi), np.full(n_z, y_fixed_mesh), z_scan_mesh
+        ])  # (n_z, 3) — center
+        pts_xp = base_pts.copy(); pts_xp[:, 0] += h_mesh
+        pts_xm = base_pts.copy(); pts_xm[:, 0] -= h_mesh
+        pts_yp = base_pts.copy(); pts_yp[:, 1] += h_mesh
+        pts_ym = base_pts.copy(); pts_ym[:, 1] -= h_mesh
+        pts_zp = base_pts.copy(); pts_zp[:, 2] += h_mesh
+        pts_zm = base_pts.copy(); pts_zm[:, 2] -= h_mesh
+
+        all_pts = np.vstack([base_pts, pts_xp, pts_xm,
+                             pts_yp,  pts_ym,
+                             pts_zp,  pts_zm])  # (7*n_z, 3)
+        vals = metrics.eval_function_at_points(Psi, all_pts, comm=comm)
+
+        phi_c  = vals[0       : n_z]
+        phi_xp = vals[n_z     : 2*n_z]
+        phi_xm = vals[2*n_z   : 3*n_z]
+        phi_yp = vals[3*n_z   : 4*n_z]
+        phi_ym = vals[4*n_z   : 5*n_z]
+        phi_zp = vals[5*n_z   : 6*n_z]
+        phi_zm = vals[6*n_z   : 7*n_z]
+
+        # Second derivatives (raw Psi units / mesh_unit²)
+        d2x = phi_xp - 2.0*phi_c + phi_xm
+        d2y = phi_yp - 2.0*phi_c + phi_ym
+        d2z = phi_zp - 2.0*phi_c + phi_zm
+        # Laplacian in eV/m²
+        conf = lap_scale * (d2x + d2y + d2z)  # shape (n_z,)
+
+        phi_eV = phi_c * to_eV   # pseudopotential along this column [eV]
+
+        # Valid mask: both phi and conf finite
+        valid_mask = np.isfinite(phi_c) & np.isfinite(conf)
+
+        # Global argmin — used for min-path and to anchor the CTC outer-crossing search
+        valid_phi = np.where(np.isfinite(phi_c), phi_c, np.inf)
+        iz_min_local = int(np.argmin(valid_phi))
+        z_min_local  = z_scan_mesh[iz_min_local] if np.isfinite(phi_c[iz_min_local]) else None
+
+        if run_min and z_min_local is not None:
+            phi_min_eV  = float(phi_eV[iz_min_local])
+            conf_min_eV = float(conf[iz_min_local]) if np.isfinite(conf[iz_min_local]) else float("nan")
+            trap_h_um   = (z_min_local * coord_unit) * 1e6
+            min_path_rows.append({
+                "x_m":                  float(xi * coord_unit),
+                "y_m":                  float(y_fixed_mesh * coord_unit),
+                "z_m":                  float(z_min_local * coord_unit),
+                "phi_pp_eV":            round(phi_min_eV, 9),
+                "total_conf_eV_per_m2": round(conf_min_eV, 3),
+                "trap_height_um":       round(trap_h_um, 4),
+                "path_type":            "minimum",
+            })
+            # Auto-calibrate C_target on first valid x step (use global min for CTC)
+            if ctc_target_auto and not _ctc_target_set_auto and np.isfinite(conf[iz_min_local]):
+                _ctc_target_resolved = float(conf[iz_min_local])
+                _ctc_target_set_auto = True
+                print(f"[paper-ctc] auto C_target = {_ctc_target_resolved:.4e} eV/m² "
+                      f"(C at z_min at r0, x={xi*coord_unit*1e6:.1f} µm)", flush=True)
+
+        if run_ctc:
+            # CTC crossing selection with z-continuity.
+            #
+            # At each x we find ALL sign changes of (C - C_target) in the z scan
+            # and classify them as outer (z >= z_min_local) or inner.
+            #
+            # Crossing preference (in order):
+            #   1. If prev_z_ctc_mesh is set (not the first step), pick the outer
+            #      crossing whose interpolated z is nearest to prev_z_ctc_mesh.
+            #      This enforces path continuity and prevents branch-hopping.
+            #   2. On the first step (no prev_z), take the first outer crossing
+            #      (smallest z >= z_min, i.e. nearest to the trap minimum).
+            #   3. If no outer crossings exist, fall back to the inner crossing
+            #      nearest to prev_z (or z_min on the first step).
+            #   4. If no crossings at all, snap to the z with C nearest to target.
+            conf_v = np.where(valid_mask, conf, np.nan)
+            conf_shifted = conf_v - _ctc_target_resolved
+
+            # Collect ALL sign changes, classified as outer/inner
+            outer_sign_changes: List[int] = []
+            inner_sign_changes: List[int] = []
+            for k in range(n_z - 1):
+                if (np.isfinite(conf_shifted[k]) and np.isfinite(conf_shifted[k+1])
+                        and conf_shifted[k] * conf_shifted[k+1] < 0):
+                    if z_min_local is not None:
+                        mid_z  = 0.5 * (z_scan_mesh[k] + z_scan_mesh[k+1])
+                        if mid_z >= z_min_local:
+                            outer_sign_changes.append(k)
+                        else:
+                            inner_sign_changes.append(k)
+                    else:
+                        outer_sign_changes.append(k)
+
+            def _interp_z(k_idx: int) -> float:
+                """Linearly interpolate the crossing z between scan points k and k+1."""
+                c0, c1 = conf_shifted[k_idx], conf_shifted[k_idx + 1]
+                t = -c0 / (c1 - c0)
+                return z_scan_mesh[k_idx] + t * (z_scan_mesh[k_idx + 1] - z_scan_mesh[k_idx])
+
+            no_exact_crossing = False
+            ctc_crossing_side = "outer"
+
+            if outer_sign_changes:
+                if prev_z_ctc_mesh is not None:
+                    # Prefer the outer crossing nearest to previous step's z
+                    k = min(outer_sign_changes,
+                            key=lambda ki: abs(_interp_z(ki) - prev_z_ctc_mesh))
+                else:
+                    # First step: take the first outer crossing (nearest to z_min)
+                    k = outer_sign_changes[0]
+            elif inner_sign_changes:
+                ctc_crossing_side = "inner"
+                anchor = prev_z_ctc_mesh if prev_z_ctc_mesh is not None else z_min_local
+                if anchor is not None:
+                    k = min(inner_sign_changes,
+                            key=lambda ki: abs(_interp_z(ki) - anchor))
+                else:
+                    k = inner_sign_changes[0]
+            else:
+                # No crossing at all: nearest to target
+                no_exact_crossing = True
+                ctc_crossing_side = "nearest"
+                k = int(np.nanargmin(np.abs(conf_shifted)))
+
+            if not no_exact_crossing:
+                c0, c1 = conf_shifted[k], conf_shifted[k + 1]
+                t = -c0 / (c1 - c0)
+                z_ctc_mesh = z_scan_mesh[k] + t * (z_scan_mesh[k + 1] - z_scan_mesh[k])
+                phi_ctc_eV = float(
+                    phi_eV[k] + t * (phi_eV[k + 1] - phi_eV[k])
+                    if np.isfinite(phi_eV[k]) and np.isfinite(phi_eV[k + 1])
+                    else phi_eV[k] if np.isfinite(phi_eV[k]) else phi_eV[k + 1]
+                )
+            else:
+                z_ctc_mesh = z_scan_mesh[k]
+                phi_ctc_eV = float(phi_eV[k]) if np.isfinite(phi_eV[k]) else float("nan")
+
+            prev_z_ctc_mesh = z_ctc_mesh   # update continuity anchor
+
+            trap_h_um = (z_ctc_mesh * coord_unit) * 1e6
+            if no_exact_crossing:
+                conf_at_ctc = float(conf[k]) if np.isfinite(conf[k]) else float("nan")
+            else:
+                conf_at_ctc = float(_ctc_target_resolved)
+            ctc_path_rows.append({
+                "x_m":                      float(xi * coord_unit),
+                "y_m":                      float(y_fixed_mesh * coord_unit),
+                "z_m":                      float(z_ctc_mesh * coord_unit),
+                "phi_pp_eV":                round(phi_ctc_eV, 9),
+                "total_conf_eV_per_m2":     round(conf_at_ctc, 3),
+                "trap_height_um":           round(trap_h_um, 4),
+                "path_type":                "ctc",
+                "ctc_crossing_side":        ctc_crossing_side,
+                "no_exact_ctc_crossing":    no_exact_crossing,
+            })
+
+        if (ix + 1) % 10 == 0 or ix == 0:
+            print(f"[paper-ctc]   x step {ix+1}/{n_x}  "
+                  f"x={xi*coord_unit*1e6:.1f} µm", flush=True)
+
+    result: Dict[str, Any] = {}
+
+    # ── Minimum path results ──────────────────────────────────────────────────
+    if run_min and min_path_rows:
+        phi_min_vals = [r["phi_pp_eV"] for r in min_path_rows if np.isfinite(r["phi_pp_eV"])]
+        if phi_min_vals:
+            # Barrier = max(phi_pp along path) - phi_pp(r0), measured from start.
+            # Using max-min would include descent-below-start artifacts and overshoot.
+            phi_r0_min    = min_path_rows[0]["phi_pp_eV"]
+            barrier_min_eV = max(phi_min_vals) - phi_r0_min
+        else:
+            barrier_min_eV = float("nan")
+        result["transport_min_path"]          = min_path_rows
+        result["transport_min_barrier_eV"]    = round(barrier_min_eV, 8)
+        result["transport_min_barrier_meV"]   = round(barrier_min_eV * 1e3, 6)
+        print(f"[paper-ctc] min-path barrier = {barrier_min_eV*1e3:.4f} meV", flush=True)
+
+    # ── CTC path results ──────────────────────────────────────────────────────
+    if run_ctc and ctc_path_rows:
+        phi_ctc_vals = [r["phi_pp_eV"] for r in ctc_path_rows if np.isfinite(r["phi_pp_eV"])]
+        n_no_cross   = sum(1 for r in ctc_path_rows if r.get("no_exact_ctc_crossing"))
+        if phi_ctc_vals:
+            # Barrier = max(phi_pp along CTC path) - phi_pp(r0 on CTC path)
+            phi_r0_ctc    = ctc_path_rows[0]["phi_pp_eV"]
+            ctc_barrier_eV = max(phi_ctc_vals) - phi_r0_ctc
+        else:
+            ctc_barrier_eV = float("nan")
+        result["transport_ctc_path"]           = ctc_path_rows
+        result["ctc_barrier_eV"]               = round(ctc_barrier_eV, 8)
+        result["ctc_barrier_meV"]              = round(ctc_barrier_eV * 1e3, 6)
+        result["ctc_target_conf_eV_per_m2"]    = _ctc_target_resolved
+        result["ctc_no_crossing_count"]        = n_no_cross
+        n_inner = sum(1 for r in ctc_path_rows if r.get("ctc_crossing_side") == "inner")
+        result["ctc_inner_crossing_count"]     = n_inner
+
+        print(f"[paper-ctc] CTC barrier = {ctc_barrier_eV*1e3:.4f} meV  "
+              f"no_crossing={n_no_cross}/{len(ctc_path_rows)}", flush=True)
+
+        # ── Path overlap diagnostics ──────────────────────────────────────────
+        if run_min and min_path_rows and len(min_path_rows) == len(ctc_path_rows):
+            dz_arr = np.array([
+                (c["z_m"] - m["z_m"]) * 1e6
+                for c, m in zip(ctc_path_rows, min_path_rows)
+            ])
+            result["ctc_max_abs_dz_um"] = round(float(np.max(np.abs(dz_arr))), 4)
+            result["ctc_rms_dz_um"]     = round(float(np.sqrt(np.mean(dz_arr**2))), 4)
+            print(f"[paper-ctc] path overlap: max|dz|={result['ctc_max_abs_dz_um']:.2f} µm  "
+                  f"rms_dz={result['ctc_rms_dz_um']:.2f} µm", flush=True)
+        else:
+            result["ctc_max_abs_dz_um"] = None
+            result["ctc_rms_dz_um"]     = None
+
+    # ── Write CSVs ────────────────────────────────────────────────────────────
+    _min_fields = ["x_m", "y_m", "z_m", "phi_pp_eV",
+                   "total_conf_eV_per_m2", "trap_height_um", "path_type"]
+    _ctc_fields = _min_fields + ["ctc_crossing_side", "no_exact_ctc_crossing"]
+
+    if csv_out_min is not None and min_path_rows:
+        try:
+            with csv_out_min.open("w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=_min_fields, extrasaction="ignore")
+                w.writeheader(); w.writerows(min_path_rows)
+            print(f"[paper-ctc] min-path CSV → {csv_out_min}", flush=True)
+        except OSError as exc:
+            print(f"[paper-ctc] WARNING: could not write min CSV: {exc}", flush=True)
+
+    if csv_out_ctc is not None and ctc_path_rows:
+        try:
+            with csv_out_ctc.open("w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=_ctc_fields, extrasaction="ignore")
+                w.writeheader(); w.writerows(ctc_path_rows)
+            print(f"[paper-ctc] ctc-path CSV → {csv_out_ctc}", flush=True)
+        except OSError as exc:
+            print(f"[paper-ctc] WARNING: could not write ctc CSV: {exc}", flush=True)
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
+
+        def _extract(rows, key):
+            return [r[key] for r in rows] if rows else []
+
+        if min_path_rows:
+            xs_min = [r["x_m"] * 1e6 for r in min_path_rows]
+            axes[0].plot(xs_min, _extract(min_path_rows, "trap_height_um"),
+                         label="min-Φ path", color="C0")
+            axes[1].plot(xs_min, _extract(min_path_rows, "total_conf_eV_per_m2"),
+                         label="min-Φ path", color="C0")
+            axes[2].plot(xs_min, _extract(min_path_rows, "phi_pp_eV"),
+                         label="min-Φ path", color="C0")
+        if ctc_path_rows:
+            xs_ctc = [r["x_m"] * 1e6 for r in ctc_path_rows]
+            axes[0].plot(xs_ctc, _extract(ctc_path_rows, "trap_height_um"),
+                         label="CTC path", color="C1", linestyle="--")
+            axes[1].plot(xs_ctc, _extract(ctc_path_rows, "total_conf_eV_per_m2"),
+                         label="CTC path", color="C1", linestyle="--")
+            axes[2].plot(xs_ctc, _extract(ctc_path_rows, "phi_pp_eV"),
+                         label="CTC path", color="C1", linestyle="--")
+            axes[1].axhline(ctc_target_conf, color="grey", linestyle=":",
+                            label=f"C_target={ctc_target_conf:.2e}")
+
+        axes[0].set_ylabel("Trap height (µm)")
+        axes[1].set_ylabel("Total conf C (eV/m²)")
+        axes[2].set_ylabel("Φ_pp (eV)")
+        axes[2].set_xlabel("x (µm)")
+        for ax in axes:
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.4)
+        axes[0].set_title("Paper CTC diagnostic — min-Φ vs CTC paths")
+        fig.tight_layout()
+
+        # Save alongside the CTC CSV if path available; else alongside min CSV
+        _plot_base = csv_out_ctc or csv_out_min
+        if _plot_base is not None:
+            plot_path = _plot_base.with_suffix("").parent / (
+                _plot_base.stem.replace("_ctc_path", "").replace("_min_path", "")
+                + "_paper_ctc_diag.png"
+            )
+            fig.savefig(str(plot_path), dpi=120)
+            print(f"[paper-ctc] diagnostic plot → {plot_path}", flush=True)
+        plt.close(fig)
+    except Exception as exc:
+        print(f"[paper-ctc] plotting skipped: {exc}", flush=True)
+
+    return result
+
+
 # ── Single-case entry point ───────────────────────────────────────────────────
 
 def process_case(
@@ -841,11 +1386,21 @@ def process_case(
     overwrite: bool,
     dry_run: bool,
     output_mode: str,
-    transport_mode: str = "xscan",
+    transport_mode: str = "both",
     n_nodes: int = 40,
     rf_tags: Optional[List[int]] = None,
     ground_tags: Optional[List[int]] = None,
     outer_tags: Optional[List[int]] = None,
+    dc_voltages: Optional[Dict[int, float]] = None,
+    # Paper CTC parameters
+    ctc_n_x: int = 60,
+    ctc_n_z: int = 200,
+    ctc_z_min_m: Optional[float] = None,
+    ctc_z_max_m: Optional[float] = None,
+    ctc_target_conf: float = 0.75e9,
+    ctc_target_auto: bool = False,
+    ctc_hessian_step_um: float = 2.0,
+    depth_correction: float = 1.0,
 ) -> Dict[str, Any]:
     """Run the transport barrier scan for one case directory.
 
@@ -876,10 +1431,16 @@ def process_case(
         return _skip("report.success == False")
 
     # Already computed and not overwriting?
-    if transport_mode == "string":
-        _skip_key = "transport_barrier_ctc_eV"
+    if transport_mode == "ctc":
+        _skip_key = "ctc_barrier_eV"
+    elif transport_mode == "min":
+        _skip_key = "transport_min_barrier_eV"
     elif transport_mode == "both":
-        _skip_key = "transport_barrier_ctc_eV"  # require both; ctc is the new one
+        _skip_key = "ctc_barrier_eV"
+    elif transport_mode == "string":
+        _skip_key = "transport_barrier_ctc_eV"
+    elif transport_mode == "legacy_both":
+        _skip_key = "transport_barrier_ctc_eV"
     else:
         _skip_key = "transport_barrier_xscan_eV"
     existing_val = report.get(_skip_key)
@@ -915,14 +1476,54 @@ def process_case(
     _ground_tags = ground_tags or run_cfg.get("ground_tags") or [2, 3]
     _outer_tags  = outer_tags  or run_cfg.get("outer_tags")  or [4]
 
+    # ── Resolve DC voltages (CLI > report JSON > automation_config) ───────────
+    _dc_voltages: Dict[int, float] = {}
+    if dc_voltages:
+        _dc_voltages = dc_voltages
+    else:
+        # Try report JSON
+        _raw = (report.get("dc_voltages") or report.get("dc_voltage_map")
+                or report.get("V_dc"))
+        if _raw is None:
+            _raw = (run_cfg.get("dc_voltages") or run_cfg.get("dc_voltage_map"))
+        if isinstance(_raw, dict):
+            _dc_voltages = {int(k): float(v) for k, v in _raw.items()}
+        elif isinstance(_raw, list):
+            _dc_tags_raw = (report.get("dc_tags") or run_cfg.get("dc_tags") or [])
+            _dc_voltages = {int(t): float(v)
+                            for t, v in zip(_dc_tags_raw, _raw) if abs(float(v)) > 1e-15}
+
+    if _dc_voltages:
+        print(f"[ctb] DC voltages: {_dc_voltages}", flush=True)
+    else:
+        print("[ctb] No DC voltages — computing RF-only barrier  "
+              "(use --dc-voltages to add DC compensation)", flush=True)
+
     t0 = time.perf_counter()
     try:
-        domain, phi_rf, used_ckpt = _resolve_phi_rf(
+        domain, facet_tags, phi_rf, used_ckpt = _resolve_phi_rf(
             case_dir, report,
             rf_tags=_rf_tags, ground_tags=_ground_tags, outer_tags=_outer_tags,
             comm=comm,
         )
         Psi = _build_psi(phi_rf, report)
+
+        # ── Build effective potential Φ_eff = Ψ_RF + q × Σ V_i × φ_DC_i ─────
+        if _dc_voltages:
+            degree = int(report.get("degree", 2))
+            dc_tags_list = list(_dc_voltages.keys())
+            phi_dc_map = _resolve_phi_dc_all(
+                case_dir, report, domain, facet_tags,
+                dc_tags=dc_tags_list,
+                rf_tags=_rf_tags,
+                ground_tags=_ground_tags,
+                outer_tags=_outer_tags,
+                degree=degree,
+                comm=comm,
+            )
+            Phi_eff = _build_effective_potential(Psi, phi_dc_map, _dc_voltages, report)
+        else:
+            Phi_eff = Psi  # RF-only fallback
 
         # CSV sidecar lives next to the JSON report
         csv_sidecar = report_path.with_name(
@@ -931,9 +1532,10 @@ def process_case(
 
         transport: Dict[str, Any] = {}
 
-        if transport_mode in ("xscan", "both"):
+        # ── Legacy modes: xscan, string, both (xscan+string) ─────────────────
+        if transport_mode in ("xscan", "legacy_both"):
             transport = _scan_transport_barrier(
-                Psi, report,
+                Phi_eff, report,
                 junction_pitch=junction_pitch,
                 n_steps=n_steps,
                 scan_both_axes=scan_both_axes,
@@ -942,12 +1544,12 @@ def process_case(
                 csv_out=csv_sidecar,
             )
 
-        if transport_mode in ("string", "both"):
+        if transport_mode in ("string", "legacy_both"):
             ctc_csv_sidecar = report_path.with_name(
                 report_path.stem + "_ctc_path.csv"
             ) if report_path is not None else None
             ctc = _ctc_string_method(
-                Psi, report,
+                Phi_eff, report,
                 junction_pitch=junction_pitch,
                 n_nodes=n_nodes,
                 comm=comm,
@@ -955,7 +1557,7 @@ def process_case(
             )
             transport.update(ctc)
 
-        if transport_mode == "both":
+        if transport_mode == "legacy_both":
             xscan_eV = transport.get("transport_barrier_xscan_eV") or 0.0
             ctc_eV   = transport.get("transport_barrier_ctc_eV")   or 0.0
             if ctc_eV > xscan_eV * 1.1:
@@ -965,10 +1567,49 @@ def process_case(
                     f"or the endpoint is pinned incorrectly.",
                     flush=True,
                 )
+
+        # ── Paper modes: min, ctc, both (min+ctc) ────────────────────────────
+        if transport_mode in ("min", "ctc", "both"):
+            _run_min = transport_mode in ("min", "both")
+            _run_ctc = transport_mode in ("ctc", "both")
+            _csv_min = (report_path.with_name(report_path.stem + "_min_path.csv")
+                        if report_path is not None and _run_min else None)
+            _csv_ctc = (report_path.with_name(report_path.stem + "_ctc_path.csv")
+                        if report_path is not None and _run_ctc else None)
+            paper_result = _paper_ctc_and_min_scan(
+                Phi_eff, report,
+                junction_pitch=junction_pitch,
+                n_x=ctc_n_x,
+                ctc_z_min_m=ctc_z_min_m,
+                ctc_z_max_m=ctc_z_max_m,
+                n_z=ctc_n_z,
+                ctc_target_conf=ctc_target_conf,
+                ctc_target_auto=ctc_target_auto,
+                hessian_step_um=ctc_hessian_step_um,
+                run_min=_run_min,
+                run_ctc=_run_ctc,
+                comm=comm,
+                csv_out_min=_csv_min,
+                csv_out_ctc=_csv_ctc,
+            )
+            transport.update(paper_result)
     except Exception as exc:
         return _error(f"{type(exc).__name__}: {exc}")
 
     elapsed = time.perf_counter() - t0
+
+    # ── Apply depth correction factor (accounts for mesh resolution vs. COMSOL) ──
+    if depth_correction != 1.0:
+        for raw_key, corr_key in [
+            ("transport_min_barrier_eV",  "transport_min_barrier_eV_corrected"),
+            ("ctc_barrier_eV",            "ctc_barrier_eV_corrected"),
+            ("transport_min_barrier_meV", "transport_min_barrier_meV_corrected"),
+            ("ctc_barrier_meV",           "ctc_barrier_meV_corrected"),
+        ]:
+            raw_val = transport.get(raw_key)
+            if raw_val is not None:
+                prec = 8 if raw_key.endswith("_eV") else 6
+                transport[corr_key] = round(float(raw_val) * depth_correction, prec)
 
     # ── Write results ─────────────────────────────────────────────────────────
     if output_mode == "patch":
@@ -985,9 +1626,11 @@ def process_case(
         sidecar_path = case_dir / sidecar
         sidecar_path.write_text(json.dumps(transport, indent=2, sort_keys=True, default=str))
 
-    # Pick the primary barrier value: prefer ctc if available, else xscan
-    barrier_eV = transport.get("transport_barrier_ctc_eV",
-                               transport.get("transport_barrier_xscan_eV", 0.0))
+    # Pick the primary barrier: min-path > paper CTC > string CTC > xscan
+    barrier_eV = (transport.get("transport_min_barrier_eV")
+                  or transport.get("ctc_barrier_eV")
+                  or transport.get("transport_barrier_ctc_eV")
+                  or transport.get("transport_barrier_xscan_eV", 0.0))
     peak_x_m   = transport.get("transport_xscan_peak_x_m",
                                transport.get("transport_ctc_peak_x_m"))
     junc_x_m   = transport.get("transport_xscan_nearest_junction_x_m",
@@ -1057,11 +1700,48 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="'patch': add fields to existing JSON in-place. "
                          "'sidecar': write a separate *_transport.json file.")
     ap.add_argument("--transport-mode",
-                    choices=["xscan", "string", "both"], default="xscan",
-                    help="xscan: existing x-axis scan (default). string: string-method CTC path. "
-                         "both: run both and report both barriers.")
+                    choices=["min", "ctc", "both",
+                             "xscan", "string", "legacy_both"],
+                    default="both",
+                    help=(
+                        "Paper modes (2025 method): "
+                        "  min  — pseudopotential-minimum path at y=0; "
+                        "  ctc  — constant-total-confinement path at y=0; "
+                        "  both — min + ctc (default, matches 2025 paper). "
+                        "Legacy modes: "
+                        "  xscan — coordinate-descent x-scan; "
+                        "  string — string-method CTC path; "
+                        "  legacy_both — xscan + string."
+                    ))
     ap.add_argument("--n-nodes", type=int, default=40, dest="n_nodes",
-                    help="Number of string nodes for CTC path (string and both modes only).")
+                    help="Number of string nodes for string-method CTC path.")
+
+    # ── Paper CTC parameters ──────────────────────────────────────────────────
+    ap.add_argument("--ctc-target-conf", type=float, default=0.75e9,
+                    metavar="EV_PER_M2",
+                    help="Target total confinement C = ∇²Φ_pp in eV/m² for the CTC path "
+                         "(default 0.75e9, matching the 2025 3D-printed micro junction paper).")
+    ap.add_argument("--ctc-target-auto", action="store_true",
+                    help="Auto-calibrate C_target to C(z_min) at the first x step (r0). "
+                         "Ensures the CTC passes through the linear-region trap minimum; "
+                         "recommended when geometry confinement differs from the paper.")
+    ap.add_argument("--ctc-axis", type=str, default="x", choices=["x"],
+                    help="Transport axis (fixed at x for now).")
+    ap.add_argument("--ctc-fixed-y", type=float, default=0.0, metavar="M",
+                    help="Fixed y coordinate in metres for CTC and min-path scans (default 0).")
+    ap.add_argument("--ctc-z-min", type=float, default=None, metavar="M",
+                    help="Lower z bound in metres for z-scan. Defaults to mesh z floor + margin.")
+    ap.add_argument("--ctc-z-max", type=float, default=None, metavar="M",
+                    help="Upper z bound in metres for z-scan. Defaults to mesh z ceiling − margin.")
+    ap.add_argument("--ctc-n-z", type=int, default=200,
+                    help="Number of z sample points per x step (default 200).")
+    ap.add_argument("--ctc-n-x", type=int, default=60,
+                    help="Number of x sample points for CTC/min scan (default 60, same as --n-steps).")
+    ap.add_argument("--ctc-hessian-step-um", type=float, default=2.0, metavar="UM",
+                    help="Finite-difference step size in µm for Hessian Laplacian (default 2.0 µm).")
+    ap.add_argument("--ctc-conf-units", type=str, default="eV_per_m2",
+                    choices=["eV_per_m2"],
+                    help="Units for confinement C (only eV_per_m2 supported).")
 
     # Electrode tags (optional — auto-detected from automation_config.json otherwise)
     ap.add_argument("--rf-tags", type=int, nargs="+", default=None,
@@ -1071,6 +1751,21 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Ground electrode facet tags.")
     ap.add_argument("--outer-tags", type=int, nargs="+", default=None,
                     help="Outer (Neumann) boundary tags.")
+    ap.add_argument(
+        "--depth-correction", type=float, default=1.0, metavar="FACTOR",
+        help="Multiply all transport barrier values by this factor before writing to JSON. "
+             "Use 1.3 to correct for FEniCS mesh resolution underestimate vs. COMSOL "
+             "(same systematic error as trap depth). Default: 1.0 (no correction).",
+    )
+    ap.add_argument(
+        "--dc-voltages", type=str, default=None, metavar="JSON",
+        help='DC electrode voltage map as a JSON object, e.g. \'{"2": 1.5}\'. '
+             'Keys are facet tag integers, values are applied voltages in Volts. '
+             'The script solves a unit-voltage Laplace problem for each DC tag, '
+             'then adds q × V × φ_DC to the RF pseudopotential. '
+             'Overrides any values found in the report JSON or automation_config.json. '
+             'Example: --dc-voltages \'{"2": -1.2}\' to apply -1.2 V to DC tag 2.',
+    )
 
     return ap
 
@@ -1088,19 +1783,37 @@ def main() -> None:
     ap = build_argparser()
     args = ap.parse_args()
 
+    dc_voltages_override: Optional[Dict[int, float]] = None
+    if args.dc_voltages:
+        try:
+            raw = json.loads(args.dc_voltages)
+            dc_voltages_override = {int(k): float(v) for k, v in raw.items()}
+        except (json.JSONDecodeError, ValueError, AttributeError) as exc:
+            print(f"[main] ERROR: could not parse --dc-voltages '{args.dc_voltages}': {exc}")
+            sys.exit(1)
+
     shared_kwargs = dict(
-        junction_pitch = args.junction_pitch,
-        n_steps        = args.n_steps,
-        scan_both_axes = args.scan_both_axes,
-        optim_method   = args.optim_method,
-        overwrite      = args.overwrite,
-        dry_run        = args.dry_run,
-        output_mode    = args.output_mode,
-        transport_mode = args.transport_mode,
-        n_nodes        = args.n_nodes,
-        rf_tags        = args.rf_tags,
-        ground_tags    = args.ground_tags,
-        outer_tags     = args.outer_tags,
+        junction_pitch       = args.junction_pitch,
+        n_steps              = args.n_steps,
+        scan_both_axes       = args.scan_both_axes,
+        optim_method         = args.optim_method,
+        overwrite            = args.overwrite,
+        dry_run              = args.dry_run,
+        output_mode          = args.output_mode,
+        transport_mode       = args.transport_mode,
+        n_nodes              = args.n_nodes,
+        rf_tags              = args.rf_tags,
+        ground_tags          = args.ground_tags,
+        outer_tags           = args.outer_tags,
+        dc_voltages          = dc_voltages_override,
+        ctc_n_x              = args.ctc_n_x,
+        ctc_n_z              = args.ctc_n_z,
+        ctc_z_min_m          = args.ctc_z_min,
+        ctc_z_max_m          = args.ctc_z_max,
+        ctc_target_conf      = args.ctc_target_conf,
+        ctc_target_auto      = args.ctc_target_auto,
+        ctc_hessian_step_um  = args.ctc_hessian_step_um,
+        depth_correction     = args.depth_correction,
     )
 
     # ── Single case ───────────────────────────────────────────────────────────

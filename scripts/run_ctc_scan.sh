@@ -2,11 +2,10 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # run_ctc_scan.sh
 #
-# Run the string-method CTC (Critical Transport Coordinate) path scan to
-# compute the transport barrier for one or more sweep cases.  Uses
-# --transport-mode string in compute_transport_barrier.py, which traces the
-# true lowest-energy path through the junction rather than scanning along a
-# fixed axis.
+# Run the paper-method CTC (Constant Total Confinement) path scan to compute
+# the transport barrier for one or more sweep cases.  Uses --transport-mode
+# both in compute_transport_barrier.py, which traces (a) the pseudopotential
+# minimum path and (b) the CTC isosurface path through the junction.
 #
 # Usage
 # -----
@@ -23,13 +22,23 @@
 #   # Single case directory:
 #   bash run_ctc_scan.sh --case-dir runs/sweeps/.../case_0035
 #
+#   # Use a fixed CTC target instead of auto-calibration:
+#   CTC_TARGET_CONF=7.5e8 bash run_ctc_scan.sh
+#
 # Environment overrides
 # ---------------------
-#   PYTHON=/path/to/python3        (default: fenicsx conda env)
-#   TRANSPORT_SCRIPT=/path/to/...  (default: ../src/compute_transport_barrier.py)
-#   N_NODES=40                     (CTC string nodes, default: 40)
-#   JUNCTION_PITCH=600e-6          (metres, default: 600 µm)
-#   OVERWRITE=1                    (re-run even if CTC barrier already present)
+#   PYTHON=/path/to/python3          (default: fenicsx conda env)
+#   TRANSPORT_SCRIPT=/path/to/...    (default: ../src/compute_transport_barrier.py)
+#   JUNCTION_PITCH=600e-6            (metres, default: 600 µm)
+#   OVERWRITE=1                      (re-run even if barrier already present)
+#   CTC_N_X=120                      (x-axis scan points, default: 120)
+#   CTC_N_Z=300                      (z-axis scan points per x, default: 300)
+#   CTC_Z_MIN=10e-6                  (z scan lower bound in metres, default: 10e-6)
+#   CTC_Z_MAX=200e-6                 (z scan upper bound in metres, default: 200e-6)
+#   CTC_HESSIAN_STEP_UM=2.0          (finite-diff step in µm, default: 2.0)
+#   CTC_TARGET_CONF=                 (eV/m²; unset → --ctc-target-auto)
+#   TRANSPORT_MODE=both              (both|min|ctc, default: both)
+#   DEPTH_CORRECTION=1.3             (correction factor for mesh resolution vs COMSOL; default: 1.3)
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -54,10 +63,27 @@ if [[ ! -x "$PYTHON" ]]; then
 fi
 
 # ── CTC parameters ────────────────────────────────────────────────────────────
-N_NODES="${N_NODES:-40}"
 JUNCTION_PITCH="${JUNCTION_PITCH:-600e-6}"
 OVERWRITE_FLAG=""
 [[ "${OVERWRITE:-0}" == "1" ]] && OVERWRITE_FLAG="--overwrite"
+DC_VOLTAGES="${DC_VOLTAGES:-}"
+DC_VOLTAGES_FLAG=""
+[[ -n "$DC_VOLTAGES" ]] && DC_VOLTAGES_FLAG="--dc-voltages $DC_VOLTAGES"
+
+TRANSPORT_MODE="${TRANSPORT_MODE:-both}"
+CTC_N_X="${CTC_N_X:-120}"
+CTC_N_Z="${CTC_N_Z:-300}"
+CTC_Z_MIN="${CTC_Z_MIN:-10e-6}"
+CTC_Z_MAX="${CTC_Z_MAX:-200e-6}"
+CTC_HESSIAN_STEP_UM="${CTC_HESSIAN_STEP_UM:-2.0}"
+CTC_TARGET_CONF="${CTC_TARGET_CONF:-0.75e9}"   # paper's fixed C = 0.75×10⁹ eV/m²
+DEPTH_CORRECTION="${DEPTH_CORRECTION:-1.3}"
+
+# Build target-conf flag
+CTC_TARGET_FLAG="--ctc-target-auto"
+if [[ -n "$CTC_TARGET_CONF" ]]; then
+    CTC_TARGET_FLAG="--ctc-target-conf $CTC_TARGET_CONF"
+fi
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 SWEEP_DIR=""
@@ -78,16 +104,49 @@ while [[ $# -gt 0 ]]; do
             OVERWRITE_FLAG="--overwrite"
             shift
             ;;
-        --n-nodes)
-            N_NODES="$2"
-            shift 2
-            ;;
         --junction-pitch)
             JUNCTION_PITCH="$2"
             shift 2
             ;;
+        --transport-mode)
+            TRANSPORT_MODE="$2"
+            shift 2
+            ;;
+        --ctc-n-x)
+            CTC_N_X="$2"
+            shift 2
+            ;;
+        --ctc-n-z)
+            CTC_N_Z="$2"
+            shift 2
+            ;;
+        --ctc-z-min)
+            CTC_Z_MIN="$2"
+            shift 2
+            ;;
+        --ctc-z-max)
+            CTC_Z_MAX="$2"
+            shift 2
+            ;;
+        --ctc-hessian-step-um)
+            CTC_HESSIAN_STEP_UM="$2"
+            shift 2
+            ;;
+        --ctc-target-conf)
+            CTC_TARGET_FLAG="--ctc-target-conf $2"
+            shift 2
+            ;;
+        --ctc-target-auto)
+            CTC_TARGET_FLAG="--ctc-target-auto"
+            shift
+            ;;
+        --dc-voltages)
+            DC_VOLTAGES="$2"
+            DC_VOLTAGES_FLAG="--dc-voltages $DC_VOLTAGES"
+            shift 2
+            ;;
         --help|-h)
-            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         [0-9]*)
@@ -128,13 +187,20 @@ fi
 : > "$LOG_FILE"
 
 echo "=================================================="
-echo " CTC Transport Barrier Scan (string method)"
+echo " CTC Transport Barrier Scan (paper method)"
 echo " mode          : $MODE"
 [[ -n "$SWEEP_DIR"        ]] && echo " sweep dir     : $SWEEP_DIR"
 [[ -n "$CASE_DIR_SINGLE"  ]] && echo " case dir      : $CASE_DIR_SINGLE"
 [[ ${#CASE_NUMS[@]} -gt 0 ]] && echo " case numbers  : ${CASE_NUMS[*]}"
-echo " n_nodes       : $N_NODES"
+echo " transport mode: $TRANSPORT_MODE"
+echo " ctc target    : $CTC_TARGET_FLAG"
+echo " ctc n_x       : $CTC_N_X"
+echo " ctc n_z       : $CTC_N_Z"
+echo " ctc z range   : [$CTC_Z_MIN, $CTC_Z_MAX] m"
+echo " hessian step  : $CTC_HESSIAN_STEP_UM µm"
 echo " junction pitch: $JUNCTION_PITCH m"
+echo " dc_voltages   : ${DC_VOLTAGES:-(none — RF-only barrier)}"
+echo " depth corr    : ${DEPTH_CORRECTION}"
 echo " overwrite     : ${OVERWRITE_FLAG:-(no)}"
 echo " script        : $TRANSPORT_SCRIPT"
 echo " log file      : $LOG_FILE"
@@ -211,13 +277,21 @@ except Exception as e:
     } >> "$LOG_FILE"
 
     set +e
+    # shellcheck disable=SC2086
     "$PYTHON" "$TRANSPORT_SCRIPT" \
         --case-dir "$case_dir" \
-        --transport-mode string \
+        --transport-mode "$TRANSPORT_MODE" \
         --junction-pitch "$JUNCTION_PITCH" \
-        --n-nodes "$N_NODES" \
         --output-mode patch \
+        $CTC_TARGET_FLAG \
+        --ctc-n-x "$CTC_N_X" \
+        --ctc-n-z "$CTC_N_Z" \
+        --ctc-z-min "$CTC_Z_MIN" \
+        --ctc-z-max "$CTC_Z_MAX" \
+        --ctc-hessian-step-um "$CTC_HESSIAN_STEP_UM" \
+        --depth-correction "$DEPTH_CORRECTION" \
         $OVERWRITE_FLAG \
+        $DC_VOLTAGES_FLAG \
         2>&1 | tee -a "$LOG_FILE"
     local rc=${PIPESTATUS[0]}
     set -e
@@ -337,40 +411,50 @@ for cd in case_dirs:
     except Exception:
         continue
 
-    ctc_barrier = r.get("transport_barrier_ctc_eV")
-    xscan_barrier = r.get("transport_barrier_xscan_eV")
+    # Paper-method keys (new)
+    ctc_barrier   = r.get("ctc_barrier_eV")
+    min_barrier   = r.get("transport_min_barrier_eV")
+    ctc_target    = r.get("ctc_target_conf_eV_per_m2")
+    max_dz        = r.get("ctc_max_abs_dz_um")
+    rms_dz        = r.get("ctc_rms_dz_um")
+    no_cross      = r.get("ctc_no_crossing_count", 0)
+
+    # Fall back to legacy string-method key if paper keys absent
+    if ctc_barrier is None:
+        ctc_barrier = r.get("transport_barrier_ctc_eV")
+
     if ctc_barrier is None:
         continue
 
     rows.append({
         "case_id":          cd.name,
-        "ctc_barrier_eV":   float(ctc_barrier),
-        "xscan_barrier_eV": float(xscan_barrier) if xscan_barrier is not None else None,
-        "peak_x_um":        (r.get("transport_ctc_peak_x_m") or 0) * 1e6,
-        "peak_y_um":        (r.get("transport_ctc_peak_y_m") or 0) * 1e6,
-        "peak_z_um":        (r.get("transport_ctc_peak_z_m") or 0) * 1e6,
-        "junction_x_um":    (r.get("transport_ctc_junction_x_m") or 0) * 1e6,
-        "n_nodes":          r.get("transport_ctc_n_nodes", ""),
-        "converged":        "yes" if r.get("transport_ctc_converged") else "no",
+        "ctc_barrier_meV":  float(ctc_barrier) * 1e3,
+        "min_barrier_meV":  float(min_barrier) * 1e3 if min_barrier is not None else None,
+        "ctc_target_eV_m2": ctc_target,
+        "max_dz_um":        max_dz,
+        "rms_dz_um":        rms_dz,
+        "no_crossing":      no_cross,
         "score":            scores.get(cd.name),
     })
 
-rows.sort(key=lambda x: x["ctc_barrier_eV"])
+rows.sort(key=lambda x: x["ctc_barrier_meV"])
 
 print()
-print(f"{'Rank':<5} {'case_id':<14} {'CTC meV':>10} {'xscan meV':>10} "
-      f"{'peak_x µm':>10} {'peak_z µm':>10} {'cvg':>5} {'score':>8}")
-print("─" * 78)
+print(f"{'Rank':<5} {'case_id':<14} {'CTC meV':>10} {'min meV':>10} "
+      f"{'max|dz|µm':>10} {'rms_dz µm':>10} {'no_cross':>9} {'score':>8}")
+print("─" * 82)
 for i, row in enumerate(rows, 1):
-    xscan_str = f"{row['xscan_barrier_eV']*1e3:.2f}" if row["xscan_barrier_eV"] is not None else "—"
-    score_str = f"{row['score']:.4g}" if row["score"] is not None else "—"
+    min_str   = f"{row['min_barrier_meV']:.3f}"  if row["min_barrier_meV"] is not None else "—"
+    dz_str    = f"{row['max_dz_um']:.2f}"        if row["max_dz_um"]       is not None else "—"
+    rms_str   = f"{row['rms_dz_um']:.2f}"        if row["rms_dz_um"]       is not None else "—"
+    score_str = f"{row['score']:.4g}"             if row["score"]           is not None else "—"
     print(
         f"{i:<5} {row['case_id']:<14} "
-        f"{row['ctc_barrier_eV']*1e3:>10.3f} "
-        f"{xscan_str:>10} "
-        f"{row['peak_x_um']:>10.1f} "
-        f"{row['peak_z_um']:>10.1f} "
-        f"{row['converged']:>5} "
+        f"{row['ctc_barrier_meV']:>10.3f} "
+        f"{min_str:>10} "
+        f"{dz_str:>10} "
+        f"{rms_str:>10} "
+        f"{row['no_crossing']:>9} "
         f"{score_str:>8}"
     )
 print()
@@ -382,19 +466,21 @@ else:
     out_csv = Path(case_dirs[0].parent) / "ctc_barriers.csv" if case_dirs else None
 
 if out_csv is not None and rows:
-    fieldnames = ["case_id", "ctc_barrier_eV", "ctc_barrier_meV",
-                  "xscan_barrier_eV", "xscan_barrier_meV",
-                  "peak_x_um", "peak_y_um", "peak_z_um",
-                  "junction_x_um", "n_nodes", "converged", "score"]
+    fieldnames = ["case_id",
+                  "ctc_barrier_eV", "ctc_barrier_meV",
+                  "min_barrier_eV", "min_barrier_meV",
+                  "ctc_target_eV_m2",
+                  "max_dz_um", "rms_dz_um", "no_crossing",
+                  "score"]
     with out_csv.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
         for row in rows:
             out_row = dict(row)
-            out_row["ctc_barrier_meV"]   = round(row["ctc_barrier_eV"] * 1e3, 4)
-            out_row["xscan_barrier_meV"] = (
-                round(row["xscan_barrier_eV"] * 1e3, 4)
-                if row["xscan_barrier_eV"] is not None else None
+            out_row["ctc_barrier_eV"] = row["ctc_barrier_meV"] / 1e3
+            out_row["min_barrier_eV"] = (
+                row["min_barrier_meV"] / 1e3
+                if row["min_barrier_meV"] is not None else None
             )
             w.writerow(out_row)
     print(f"CTC barrier results → {out_csv}")

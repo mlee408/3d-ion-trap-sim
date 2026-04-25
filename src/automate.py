@@ -190,6 +190,16 @@ class RunConfig:
     jct_r0_y_max: float = 0.18
     jct_r0_z_min: float = 0.01
     jct_r0_z_max: float = 0.12
+    # CTC transport barrier pass (requires save_solution=True)
+    run_ctc_pass: bool = False
+    ctc_junction_pitch_m: float = 600e-6
+    ctc_n_x: int = 60
+    ctc_n_z: int = 200
+    ctc_z_min_m: float = 10e-6
+    ctc_z_max_m: float = 200e-6
+    ctc_hessian_step_um: float = 2.0
+    ctc_target_conf: float = 0.75e9        # eV/m²; paper's fixed C = 0.75×10⁹
+    ctc_depth_correction: float = 1.3
 
 
 @dataclass
@@ -219,6 +229,8 @@ class CaseResult:
     junction_report_path: Optional[str] = None
     junction_score: Optional[float] = None
     depth_z_eV: Optional[float] = None
+    ctc_barrier_eV: Optional[float] = None        # kept for CSV backward compat
+    transport_min_barrier_eV: Optional[float] = None  # min-path barrier (used for scoring)
 
 
 # -----------------------------------------------------------------------------
@@ -353,7 +365,9 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
         physical_min_ok = bool(_pmo) if _pmo is not None else None
         hessian_status  = report.get("hessian_status")
         grad_rel_at_r0  = safe_float(report.get("grad_rel_at_r0"))
-        depth_z_eV = safe_float(report.get("depth_z_eV"))
+        depth_z_eV    = safe_float(report.get("depth_z_eV"))
+        ctc_barrier_eV = safe_float(report.get("ctc_barrier_eV"))
+        transport_min_barrier_eV = safe_float(report.get("transport_min_barrier_eV"))
         return {
             "depth_eV": depth_eV,
             "depth_z_eV": depth_z_eV,
@@ -364,6 +378,8 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
             "physical_min_ok": physical_min_ok,
             "hessian_status": hessian_status,
             "grad_rel_at_r0": grad_rel_at_r0,
+            "ctc_barrier_eV": ctc_barrier_eV,
+            "transport_min_barrier_eV": transport_min_barrier_eV,
         }
 
     # ── run_case.py format (nested keys) ─────────────────────────────────
@@ -431,16 +447,16 @@ def classify_rejection(metrics: Dict[str, Any], status: str,
 def score_case_metrics(
     metrics: Dict[str, Any],
     jct_metrics: Optional[Dict[str, Any]] = None,
+    transport_barrier_eV: Optional[float] = None,
 ) -> Optional[float]:
-    """Scalar objective blending linear-region confinement and junction quality.
+    """Scalar objective blending linear confinement, junction quality, and transport.
 
     Calibrated to match Paper 2 methodology (Yb-171, 44.3 MHz, 190 V):
       - Trap depth via axial (z) pseudopotential barrier
       - Secular frequencies from Hessian eigenvalues
       - Junction confinement fraction (radial depth at junction / linear)
-
-    Transport barrier is NOT included in scoring — it requires DC electrode
-    voltages to be meaningful, so it is computed separately on top candidates.
+      - Min-path transport barrier (pseudopotential barrier along Φ_pp-minimum
+        path at y=0, paper target 7 meV)
 
     Hard rejects (return None):
       - physical_min_ok == False  (far-field or electrode-adjacent minimum)
@@ -455,9 +471,14 @@ def score_case_metrics(
       +5.0    × confinement_fraction  radial depth retained at junction vs linear
                                       (paper target: ~0.5 → 2.5 pts)
 
+    Transport score (only when transport pass was run):
+      score_transport = 5.0 × min(1, target_barrier / transport_min_barrier)
+      target_barrier  = 7 meV (paper target)
+
     Blending:
-      If junction pass available:  score = 0.6 × score_linear + 0.4 × score_junction
-      Otherwise:                   score = score_linear
+      All three passes:  score = 0.55 × linear + 0.25 × junction + 0.20 × transport
+      Junction only:     score = 0.60 × linear + 0.40 × junction
+      Neither:           score = linear
 
     Soft multiplier (×0.85) for borderline_numeric Hessian from linear pass.
     """
@@ -492,17 +513,26 @@ def score_case_metrics(
     score_junction       = None
 
     if jct_metrics is not None:
-        # Confinement fraction: junction radial depth / linear radial depth
-        lin_radial = safe_float(metrics.get("depth_eV"))   # radial_depth_core_eV
+        lin_radial = safe_float(metrics.get("depth_eV"))
         jct_radial = safe_float(jct_metrics.get("depth_eV"))
         if lin_radial and jct_radial and lin_radial > 0:
             confinement_fraction = min(1.0, jct_radial / lin_radial)
             term_confinement = _CONFINEMENT_COEFF * confinement_fraction
-
         score_junction = term_confinement
 
-        # Blended score: 60% linear, 40% junction
-        score = 0.6 * score_linear + 0.4 * score_junction
+    # ── Transport score (optional, from min-path barrier) ───────────────────────
+    _TARGET_BARRIER_EV = 0.007   # paper target: 7 meV
+    score_transport    = None
+
+    if transport_barrier_eV is not None:
+        barrier_quality = min(1.0, _TARGET_BARRIER_EV / max(transport_barrier_eV, 1e-12))
+        score_transport = 5.0 * barrier_quality
+
+    # ── Blending ──────────────────────────────────────────────────────────────
+    if score_junction is not None and score_transport is not None:
+        score = 0.55 * score_linear + 0.25 * score_junction + 0.20 * score_transport
+    elif score_junction is not None:
+        score = 0.60 * score_linear + 0.40 * score_junction
     else:
         score = score_linear
 
@@ -520,8 +550,12 @@ def score_case_metrics(
                                  if confinement_fraction is not None else None),
         "term_confinement": round(term_confinement, 4),
         "score_junction": (round(score_junction, 4) if score_junction is not None else None),
+        "score_transport": (round(score_transport, 4) if score_transport is not None else None),
+        "transport_min_barrier_meV": (round(transport_barrier_eV * 1e3, 4)
+                                      if transport_barrier_eV is not None else None),
         "spread_excess_mhz": round(max(0.0, spread_excess_hz) / 1e6, 3),
         "junction_pass": jct_metrics is not None,
+        "transport_pass": transport_barrier_eV is not None,
     }
 
     return score
@@ -1137,7 +1171,51 @@ def evaluate_case(
                     jct_report = load_json(jct_report_path)
                     jct_metrics = extract_metrics_from_report(jct_report)
 
-        score = score_case_metrics(metrics, jct_metrics)
+        # ── Optional CTC transport barrier pass ───────────────────────────────
+        transport_barrier_eV_val: Optional[float] = None
+        ctc_barrier_eV_val: Optional[float] = None
+        if cfg.run_ctc_pass:
+            if not cfg.save_solution:
+                print(f"[{case_id}] WARNING: run_ctc_pass=True but save_solution=False — "
+                      "CTC pass skipped (phi_rf checkpoint not saved)")
+            else:
+                _ctc_script = Path(__file__).parent / "compute_transport_barrier.py"
+                _ctc_stdout = case_dir / "ctc_pass.stdout.txt"
+                _ctc_stderr = case_dir / "ctc_pass.stderr.txt"
+                _ctc_cmd = [
+                    sys.executable, str(_ctc_script),
+                    "--case-dir", str(case_dir.resolve()),
+                    "--transport-mode", "min",
+                    "--output-mode", "patch",
+                    "--ctc-target-conf", str(cfg.ctc_target_conf),
+                    "--junction-pitch", str(cfg.ctc_junction_pitch_m),
+                    "--ctc-n-x", str(cfg.ctc_n_x),
+                    "--ctc-n-z", str(cfg.ctc_n_z),
+                    "--ctc-z-min", str(cfg.ctc_z_min_m),
+                    "--ctc-z-max", str(cfg.ctc_z_max_m),
+                    "--ctc-hessian-step-um", str(cfg.ctc_hessian_step_um),
+                    "--depth-correction", str(cfg.ctc_depth_correction),
+                    "--overwrite",
+                ]
+                _ctc_rc = run_subprocess(_ctc_cmd, cwd=case_dir,
+                                         stdout_path=_ctc_stdout, stderr_path=_ctc_stderr)
+                if _ctc_rc == 0:
+                    # Reload patched report to get transport barriers.
+                    # Prefer depth-corrected value if available (accounts for
+                    # FEniCS mesh resolution vs COMSOL); fall back to raw.
+                    _ctc_report = load_json(report_path)
+                    transport_barrier_eV_val = safe_float(
+                        _ctc_report.get("transport_min_barrier_eV_corrected")
+                    ) or safe_float(
+                        _ctc_report.get("transport_min_barrier_eV"))
+                    ctc_barrier_eV_val = safe_float(
+                        _ctc_report.get("ctc_barrier_eV"))
+                else:
+                    print(f"[{case_id}] WARNING: CTC pass exited with code {_ctc_rc} — "
+                          "transport score will be omitted")
+
+        score = score_case_metrics(metrics, jct_metrics,
+                                   transport_barrier_eV=transport_barrier_eV_val)
         rejection = classify_rejection(metrics, "ok")
         if cfg.paper_benchmark is not None:
             paper_cmp = compare_to_paper_benchmarks(
@@ -1173,6 +1251,8 @@ def evaluate_case(
             paper_comparison=paper_cmp,
             junction_report_path=(str(jct_report_path) if jct_report_path else None),
             junction_score=(jct_metrics.get("_score_junction") if jct_metrics else None),
+            ctc_barrier_eV=ctc_barrier_eV_val,
+            transport_min_barrier_eV=transport_barrier_eV_val,
         )
     except Exception as e:
         elapsed = time.time() - start
@@ -1238,6 +1318,13 @@ def _result_row(result: CaseResult) -> Dict[str, Any]:
         row["paper_benchmark_key"] = result.paper_comparison.get("benchmark_key")
     row["junction_report_path"] = result.junction_report_path
     row["junction_score"] = result.junction_score
+    row["ctc_barrier_eV"] = result.ctc_barrier_eV
+    row["ctc_barrier_meV"] = (result.ctc_barrier_eV * 1e3
+                              if result.ctc_barrier_eV is not None else None)
+    row["transport_min_barrier_eV"] = result.transport_min_barrier_eV
+    row["transport_min_barrier_meV"] = (result.transport_min_barrier_eV * 1e3
+                                        if result.transport_min_barrier_eV is not None
+                                        else None)
     return row
 
 
@@ -1650,6 +1737,30 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Save phi_rf DOF checkpoint (useful for later post-processing, "
                          "e.g. transport barrier with DC voltages on top candidates).")
 
+    # CTC transport barrier pass
+    ap.add_argument("--ctc-pass", action="store_true",
+                    help="Run the CTC transport barrier scan after each linear pass. "
+                         "Requires --save-solution (phi_rf checkpoint). Adds ~6–8 min per case. "
+                         "Contributes 20%% weight to blended score when junction pass is also run.")
+    ap.add_argument("--ctc-junction-pitch", type=float, default=600e-6, metavar="M",
+                    help="Junction pitch for CTC scan (metres, default 600e-6).")
+    ap.add_argument("--ctc-n-x", type=int, default=60,
+                    help="Number of x steps in CTC scan (default 60).")
+    ap.add_argument("--ctc-n-z", type=int, default=200,
+                    help="Number of z steps in CTC scan (default 200).")
+    ap.add_argument("--ctc-z-min", type=float, default=10e-6, metavar="M",
+                    help="Minimum z for CTC scan in metres (default 10e-6).")
+    ap.add_argument("--ctc-z-max", type=float, default=200e-6, metavar="M",
+                    help="Maximum z for CTC scan in metres (default 200e-6).")
+    ap.add_argument("--ctc-hessian-step-um", type=float, default=2.0, metavar="UM",
+                    help="Finite-difference step for CTC Hessian in µm (default 2.0).")
+    ap.add_argument("--ctc-target-conf", type=float, default=0.75e9, metavar="EV_M2",
+                    help="Fixed total-confinement target C for CTC path in eV/m² "
+                         "(default 0.75e9, matching the paper).")
+    ap.add_argument("--ctc-depth-correction", type=float, default=1.3, metavar="FACTOR",
+                    help="Depth correction factor applied to CTC barrier values stored in JSON "
+                         "(default 1.3, corrects FEniCS mesh resolution underestimate vs COMSOL).")
+
     # Fast-metrics / skip flags (forwarded to run_sweep_metrics.py only)
     ap.add_argument("--fast-metrics", action="store_true",
                     help="Enable fast-metrics mode in run_sweep_metrics.py "
@@ -1731,6 +1842,15 @@ def main() -> None:
         jct_r0_y_max=args.jct_r0_y_max,
         jct_r0_z_min=args.jct_r0_z_min,
         jct_r0_z_max=args.jct_r0_z_max,
+        run_ctc_pass=args.ctc_pass,
+        ctc_junction_pitch_m=args.ctc_junction_pitch,
+        ctc_n_x=args.ctc_n_x,
+        ctc_n_z=args.ctc_n_z,
+        ctc_z_min_m=args.ctc_z_min,
+        ctc_z_max_m=args.ctc_z_max,
+        ctc_hessian_step_um=args.ctc_hessian_step_um,
+        ctc_target_conf=args.ctc_target_conf,
+        ctc_depth_correction=args.ctc_depth_correction,
     )
 
     # ── Startup log: show what is actually being forwarded ───────────────────
@@ -1746,6 +1866,7 @@ def main() -> None:
             f"skip_depth_y={cfg.skip_depth_y}  "
             f"skip_transport_scan={cfg.skip_transport_scan}  "
             f"save_solution={cfg.save_solution}  "
+            f"ctc_pass={cfg.run_ctc_pass}  "
             f"paper_benchmark={resolved_benchmark or 'none'}"
         )
         # Warn if x/y not bounded — may scan full vacuum domain
