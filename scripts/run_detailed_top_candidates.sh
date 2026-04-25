@@ -32,11 +32,15 @@ COMMON=(
 
 # ── Top candidates (one per sweep) ──────────────────────────────────────────
 CASES="
-n4_case0035 runs/sweeps/n4_thickness_height_sweep_yb2025/case_0035
-n4_case0024 runs/sweeps/n4_thickness_height_sweep_yb2025/case_0024
-n4_case0014 runs/sweeps/n4_thickness_height_sweep_yb2025/case_0014
-n4_case0007 runs/sweeps/n4_thickness_height_sweep_yb2025/case_0007
-n4_case0020 runs/sweeps/n4_thickness_height_sweep_yb2025/case_0020
+n2_case0062 sweeps/sweep_geom_n2/case_0062
+n2_case0074 sweeps/sweep_geom_n2/case_0074
+n2_case0051 sweeps/sweep_geom_n2/case_0051
+n2_case0079 sweeps/sweep_geom_n2/case_0079
+n2_case0065 sweeps/sweep_geom_n2/case_0065
+n2_case0093 sweeps/sweep_geom_n2/case_0093
+n2_case0089 sweeps/sweep_geom_n2/case_0089
+n2_case0058 sweeps/sweep_geom_n2/case_0058
+n2_case0098 sweeps/sweep_geom_n2/case_0098
 "
 
 # ── Run function ─────────────────────────────────────────────────────────────
@@ -76,6 +80,16 @@ run_transport() {
 }
 
 # ── Main loop ────────────────────────────────────────────────────────────────
+CASEDIR="sweeps/sweep_geom_n2/case_0055"
+TAG="n2_case0055"
+LIN_REPORT=$(ls "$CASEDIR/detailed_linear"/*_sweep.json 2>/dev/null | head -1)
+if [ -n "$LIN_REPORT" ]; then
+    cp "$LIN_REPORT" "$CASEDIR/n2_case0055_detailed_sweep.json"
+    LIN_CKPT=$(ls "$CASEDIR/detailed_linear"/*_phi_rf_dofs.npy 2>/dev/null | head -1)
+    [ -n "$LIN_CKPT" ] && cp "$LIN_CKPT" "$CASEDIR/n2_case0055_detailed_phi_rf_dofs.npy"
+fi
+run_transport "n2_case0055" "$CASEDIR"
+
 echo "$CASES" | while read -r tag CASEDIR; do
   [ -z "${tag:-}" ] && continue
   MESH="$CASEDIR/mesh.msh"

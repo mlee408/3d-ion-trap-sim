@@ -157,7 +157,7 @@ def _resolve_phi_rf(
         # mesh_str is typically project-root-relative (e.g. "runs/.../mesh.msh");
         # try CWD first, fall back to case_dir for older relative layouts.
         cwd_resolved = (Path.cwd() / mesh_path).resolve()
-        mesh_path = cwd_resolved if cwd_resolved.exists() else (case_dir / mesh_path).resolve()
+        mesh_path = cwd_resolved if cwd_resolved.exists() else (case_dir / mesh_path.name).resolve()
 
     # Check for checkpoint
     prefix = report.get("prefix", "")
