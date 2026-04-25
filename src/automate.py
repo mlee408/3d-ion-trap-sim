@@ -472,12 +472,15 @@ def score_case_metrics(
                                       (paper target: ~0.5 → 2.5 pts)
 
     Transport score (only when transport pass was run):
-      score_transport = 5.0 × min(1, target_barrier / transport_min_barrier)
-      target_barrier  = 7 meV (paper target)
+      score_transport = −2.0 × max(0, ctc_barrier_eV / 0.015 − 1)
+      target_barrier  = 15 meV (corrected paper CTC barrier target)
+      soft_limit      = 30 meV (acceptable but worse)
+      hard_limit      = 100 meV (transport-bad geometry)
 
     Blending:
-      All three passes:  score = 0.55 × linear + 0.25 × junction + 0.20 × transport
+      All three passes:  score = 0.45 × linear + 0.20 × junction + transport
       Junction only:     score = 0.60 × linear + 0.40 × junction
+      Transport only:    score = 0.45 × linear + transport
       Neither:           score = linear
 
     Soft multiplier (×0.85) for borderline_numeric Hessian from linear pass.
@@ -521,18 +524,24 @@ def score_case_metrics(
         score_junction = term_confinement
 
     # ── Transport score (optional, from min-path barrier) ───────────────────────
-    _TARGET_BARRIER_EV = 0.007   # paper target: 7 meV
+    _TARGET_BARRIER_EV = 0.015   # corrected paper CTC barrier target: 15 meV
+    _SOFT_LIMIT_EV     = 0.030   # 30 meV: acceptable but worse
+    _HARD_LIMIT_EV     = 0.100   # 100 meV: transport-bad geometry
     score_transport    = None
 
     if transport_barrier_eV is not None:
-        barrier_quality = min(1.0, _TARGET_BARRIER_EV / max(transport_barrier_eV, 1e-12))
-        score_transport = 5.0 * barrier_quality
+        ctc_barrier_eV = transport_barrier_eV
+        excess_ratio = max(0.0, ctc_barrier_eV / _TARGET_BARRIER_EV - 1.0)
+        term_ctc_barrier_penalty = 2.0 * excess_ratio
+        score_transport = -term_ctc_barrier_penalty
 
     # ── Blending ──────────────────────────────────────────────────────────────
     if score_junction is not None and score_transport is not None:
-        score = 0.55 * score_linear + 0.25 * score_junction + 0.20 * score_transport
+        score = 0.45 * score_linear + 0.20 * score_junction + score_transport
     elif score_junction is not None:
         score = 0.60 * score_linear + 0.40 * score_junction
+    elif score_transport is not None:
+        score = 0.45 * score_linear + score_transport
     else:
         score = score_linear
 
@@ -551,6 +560,8 @@ def score_case_metrics(
         "term_confinement": round(term_confinement, 4),
         "score_junction": (round(score_junction, 4) if score_junction is not None else None),
         "score_transport": (round(score_transport, 4) if score_transport is not None else None),
+        "ctc_barrier_penalty": (round(term_ctc_barrier_penalty, 4)
+                                if transport_barrier_eV is not None else None),
         "transport_min_barrier_meV": (round(transport_barrier_eV * 1e3, 4)
                                       if transport_barrier_eV is not None else None),
         "spread_excess_mhz": round(max(0.0, spread_excess_hz) / 1e6, 3),
@@ -629,7 +640,7 @@ PAPER_BENCHMARKS: Dict[str, Dict[str, Any]] = {
         # ── Junction performance ──────────────────────────────────────────
         "junction_trap_height_um": 40.0,        # trap height near junction centre
         "junction_confinement_fraction": 0.5,   # confinement retained at junction (~1/2)
-        "transport_barrier_eV": 0.007,          # pseudopotential barrier along CTC (< 7 meV)
+        "transport_barrier_eV": 0.015,          # pseudopotential barrier along CTC (target: 15 meV)
         # ── Residual micromotion ──────────────────────────────────────────
         "residual_pseudopotential_eV": 5e-5,    # over 20 µm span
         "micromotion_amplitude_nm": 38.0,
@@ -1250,7 +1261,7 @@ def evaluate_case(
             rejection_reason=rejection,
             paper_comparison=paper_cmp,
             junction_report_path=(str(jct_report_path) if jct_report_path else None),
-            junction_score=(jct_metrics.get("_score_junction") if jct_metrics else None),
+            junction_score=(metrics.get("_score_breakdown", {}).get("score_junction")),
             ctc_barrier_eV=ctc_barrier_eV_val,
             transport_min_barrier_eV=transport_barrier_eV_val,
         )
