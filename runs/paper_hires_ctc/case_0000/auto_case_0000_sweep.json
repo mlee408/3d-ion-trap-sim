@@ -1,0 +1,90 @@
+{
+  "mesh": "/Users/michaelee408/Documents/trap_sim/runs/paper_hires_ctc/case_0000/mesh.msh",
+  "prefix": "auto_case_0000",
+  "r0_x_m": 0.0002983324306969678,
+  "r0_y_m": 1.7315005712924853e-07,
+  "r0_z_m": 8.137172713012588e-05,
+  "freq1_hz": 148021.94560291365,
+  "freq2_hz": 2148914.557862052,
+  "freq3_hz": 2546191.122474031,
+  "strong_freq_min_hz": 2148914.557862052,
+  "strong_freq_max_hz": 2546191.122474031,
+  "depth_z_eV": 1.4485666902927146,
+  "depth_z_plus_eV": 1.4485666902927146,
+  "depth_z_minus_eV": 25.205141454380808,
+  "depth_z_interior": true,
+  "depth_y_eV": 5.278012038721255,
+  "depth_y_plus_eV": 5.280626936638192,
+  "depth_y_minus_eV": 5.278012038721255,
+  "depth_y_interior": true,
+  "radial_depth_core_eV": 0.6207765047741105,
+  "transport_barrier_xscan_eV": null,
+  "transport_barrier_eigvec_eV": null,
+  "h_used": 0.027670833465987553,
+  "physical_min_ok": true,
+  "strong_modes_ok": true,
+  "hessian_status": "valid",
+  "grad_rel_at_r0": 0.17911111186311543,
+  "success": true,
+  "notes": null,
+  "fast_metrics": false,
+  "depth_nrays_used": 48,
+  "refine_rounds_requested": 8,
+  "refine_rounds_used": 8,
+  "skipped_metrics": [
+    "transport_barrier_xscan_eV",
+    "transport_barrier_eigvec_eV"
+  ],
+  "timings_s": {
+    "mesh_load_s": 51.372,
+    "laplace_solve_s": 54.185,
+    "r0_search_s": 73.68,
+    "refinement_s": 172.05,
+    "hessian_grad_s": 85.459,
+    "depth_scan_s": 182.435,
+    "total_s": 622.721
+  },
+  "_metric_categories": {
+    "local_secular_hz": [
+      "freq1_hz",
+      "freq2_hz",
+      "freq3_hz"
+    ],
+    "strong_secular_hz": [
+      "strong_freq_min_hz",
+      "strong_freq_max_hz"
+    ],
+    "local_confinement_eV": [
+      "radial_depth_core_eV"
+    ],
+    "paper_comparison_eV": [
+      "depth_z_eV",
+      "depth_y_eV"
+    ],
+    "transport_barriers_eV": [
+      "transport_barrier_xscan_eV",
+      "transport_barrier_eigvec_eV"
+    ]
+  },
+  "rf_freq_Hz": 44300000.0,
+  "vrf_V": 190.0,
+  "mass_amu": 171.0,
+  "charge_e": 1.0,
+  "degree": 2,
+  "coord_unit_m_per_mesh": 0.001,
+  "r0_search_bounds_mesh": {
+    "x": [
+      0.12,
+      0.48
+    ],
+    "y": [
+      -0.18,
+      0.18
+    ],
+    "z": [
+      0.02,
+      0.15
+    ]
+  },
+  "phi_rf_checkpoint": null
+}

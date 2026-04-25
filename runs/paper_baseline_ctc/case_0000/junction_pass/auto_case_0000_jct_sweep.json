@@ -1,0 +1,99 @@
+{
+  "_metric_categories": {
+    "local_confinement_eV": [
+      "radial_depth_core_eV"
+    ],
+    "local_secular_hz": [
+      "freq1_hz",
+      "freq2_hz",
+      "freq3_hz"
+    ],
+    "paper_comparison_eV": [
+      "depth_z_eV",
+      "depth_y_eV"
+    ],
+    "strong_secular_hz": [
+      "strong_freq_min_hz",
+      "strong_freq_max_hz"
+    ],
+    "transport_barriers_eV": [
+      "transport_barrier_xscan_eV",
+      "transport_barrier_eigvec_eV"
+    ]
+  },
+  "charge_e": 1.0,
+  "coord_unit_m_per_mesh": 0.001,
+  "degree": 2,
+  "depth_nrays_used": 48,
+  "depth_y_eV": 1.4917707472349524,
+  "depth_y_interior": true,
+  "depth_y_minus_eV": 1.5077622608554542,
+  "depth_y_plus_eV": 1.4917707472349524,
+  "depth_z_eV": 0.8120044110670893,
+  "depth_z_interior": true,
+  "depth_z_minus_eV": 2.2278544026494638,
+  "depth_z_plus_eV": 0.8120044110670893,
+  "fast_metrics": false,
+  "freq1_hz": 336619.0634688649,
+  "freq2_hz": 2141986.783760522,
+  "freq3_hz": 2414403.8213144443,
+  "grad_rel_at_r0": 0.24438887580403965,
+  "h_used": 0.03397051522513232,
+  "hessian_status": "valid",
+  "mass_amu": 171.0,
+  "mesh": "/Users/michaelee408/Documents/trap_sim/runs/paper_baseline_ctc/case_0000/mesh.msh",
+  "notes": null,
+  "phi_rf_checkpoint": "auto_case_0000_jct_phi_rf_dofs.npy",
+  "physical_min_ok": true,
+  "prefix": "auto_case_0000_jct",
+  "r0_search_bounds_mesh": {
+    "x": [
+      -0.18,
+      0.18
+    ],
+    "y": [
+      -0.18,
+      0.18
+    ],
+    "z": [
+      0.01,
+      0.12
+    ]
+  },
+  "r0_x_m": -0.00012102190046718216,
+  "r0_y_m": 9.802731992292161e-08,
+  "r0_z_m": 7.844341574844306e-05,
+  "radial_depth_core_eV": 0.26599057550951455,
+  "refine_rounds_requested": 8,
+  "refine_rounds_used": 8,
+  "rf_freq_Hz": 44300000.0,
+  "skipped_metrics": [
+    "transport_barrier_xscan_eV",
+    "transport_barrier_eigvec_eV"
+  ],
+  "strong_freq_max_hz": 2414403.8213144443,
+  "strong_freq_min_hz": 2141986.783760522,
+  "strong_modes_ok": true,
+  "success": true,
+  "timings_s": {
+    "depth_scan_s": 97.216,
+    "hessian_grad_s": 48.333,
+    "laplace_solve_s": 26.48,
+    "mesh_load_s": 22.212,
+    "r0_search_s": 59.793,
+    "refinement_s": 90.692,
+    "total_s": 346.733
+  },
+  "transport_barrier_ctc_eV": 0.04026774,
+  "transport_barrier_ctc_meV_raw": 40.267743,
+  "transport_barrier_eigvec_eV": null,
+  "transport_barrier_xscan_eV": null,
+  "transport_ctc_converged": true,
+  "transport_ctc_junction_x_m": -0.0006,
+  "transport_ctc_n_iter": 1,
+  "transport_ctc_n_nodes": 40,
+  "transport_ctc_peak_x_m": -0.0004280591,
+  "transport_ctc_peak_y_m": 9.8e-08,
+  "transport_ctc_peak_z_m": 7.84434e-05,
+  "vrf_V": 190.0
+}

@@ -1,0 +1,64 @@
+{
+  "n_cases": 1,
+  "param_specs": [
+    {
+      "high": 56.001,
+      "low": 56.0,
+      "name": "rf_width_um"
+    },
+    {
+      "high": 247.01,
+      "low": 247.0,
+      "name": "rf_height"
+    }
+  ],
+  "run_config": {
+    "basis_tags": [],
+    "charge_e": 1.0,
+    "coord_unit": 0.001,
+    "degree": 2,
+    "depth_nrays": null,
+    "depth_ray_length": 0.0002,
+    "fast_metrics": false,
+    "ground_tags": [
+      2,
+      3
+    ],
+    "h": 2e-06,
+    "jct_r0_x_max": 0.18,
+    "jct_r0_x_min": -0.18,
+    "jct_r0_y_max": 0.18,
+    "jct_r0_y_min": -0.18,
+    "jct_r0_z_max": 0.12,
+    "jct_r0_z_min": 0.01,
+    "mass_amu": 171.0,
+    "mesh_template": "python scripts/make_mesh_parametric.py     --rf-width-um {rf_width_um}     --rf-height {rf_height}     --njunctions 2     --window-n 2     --lc-electrode 0.002     --lc-center 0.003     --lc-far 0.035     --out {mesh_path}",
+    "no_depth": false,
+    "outer_tags": [
+      4
+    ],
+    "paper_benchmark": "paper2_linear_yb171",
+    "prefix": "auto",
+    "r0_search_margin": null,
+    "r0_x_auto": false,
+    "r0_x_max": 0.48,
+    "r0_x_min": 0.12,
+    "r0_y_max": 0.18,
+    "r0_y_min": -0.18,
+    "r0_z_max": 0.15,
+    "r0_z_min": 0.02,
+    "refine_rounds": null,
+    "rf_freq": 44300000.0,
+    "rf_tags": [
+      1
+    ],
+    "run_case_py": "src/run_sweep_metrics.py",
+    "run_junction_pass": false,
+    "save_solution": false,
+    "skip_depth_y": false,
+    "skip_transport_scan": true,
+    "vrf": 190.0,
+    "workdir": "runs/paper_hires_ctc"
+  },
+  "seed": 42
+}

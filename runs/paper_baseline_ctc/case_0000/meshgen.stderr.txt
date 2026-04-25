@@ -1,0 +1,24 @@
+Warning : Union - BOPAlgo_AlertBadPositioning BOPAlgo_AlertBadPositioning BOPAlgo_AlertBadPositioning BOPAlgo_AlertBadPositioning 
+Warning : Fragments - BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape BOPAlgo_AlertSelfInterferingShape 
+Traceback (most recent call last):
+  File "/Users/michaelee408/Documents/trap_sim/scripts/make_mesh_parametric.py", line 160, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/Users/michaelee408/Documents/trap_sim/scripts/make_mesh_parametric.py", line 156, in main
+    return subprocess.run(cmd_mesh).returncode
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/michaelee408/Downloads/ENTER/envs/fenicsx/lib/python3.11/subprocess.py", line 550, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/michaelee408/Downloads/ENTER/envs/fenicsx/lib/python3.11/subprocess.py", line 1201, in communicate
+    self.wait()
+  File "/Users/michaelee408/Downloads/ENTER/envs/fenicsx/lib/python3.11/subprocess.py", line 1264, in wait
+    return self._wait(timeout=timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/michaelee408/Downloads/ENTER/envs/fenicsx/lib/python3.11/subprocess.py", line 2053, in _wait
+    (pid, sts) = self._try_wait(0)
+                 ^^^^^^^^^^^^^^^^^
+  File "/Users/michaelee408/Downloads/ENTER/envs/fenicsx/lib/python3.11/subprocess.py", line 2011, in _try_wait
+    (pid, sts) = os.waitpid(self.pid, wait_flags)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

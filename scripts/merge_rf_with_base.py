@@ -82,17 +82,55 @@ def main() -> int:
         return 1
 
     # ── heal + deduplicate for clean STEP export ──
+    # Write a pre-cleanup STEP so we can fall back if either operation destroys
+    # the solid (known issue: removeAllDuplicates can drop volumes on self-
+    # intersecting geometry flagged by BOPAlgo_AlertSelfInterferingShape).
+    import tempfile, shutil
+    tmp_step = Path(tempfile.mktemp(suffix=".step"))
+    gmsh.write(str(tmp_step))
+
     try:
         occ.healShapes(dimTags=current_vols)
         occ.synchronize()
+        after_heal = occ.getEntities(3)
+        if not after_heal:
+            print("[merge] WARNING: healShapes dropped all volumes — skipping")
+        else:
+            current_vols = after_heal
+            print(f"[merge] after healShapes: {len(current_vols)} volumes")
     except Exception as e:
         print(f"[merge] healShapes skipped: {e}")
 
     occ.removeAllDuplicates()
     occ.synchronize()
+    after_dedup = occ.getEntities(3)
+    if not after_dedup:
+        print("[merge] WARNING: removeAllDuplicates dropped all volumes — "
+              "falling back to pre-cleanup STEP")
+        shutil.copy2(tmp_step, out_step)
+        tmp_step.unlink(missing_ok=True)
+        print(f"[merge] wrote (pre-cleanup fallback): {out_step}")
+        gmsh.finalize()
+
+        # Sanity re-import check
+        gmsh.initialize([sys.argv[0]])
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.occ.importShapes(str(out_step))
+        gmsh.model.occ.synchronize()
+        check_vols = gmsh.model.occ.getEntities(3)
+        print(f"[merge] re-import check: {len(check_vols)} volumes in output STEP")
+        gmsh.finalize()
+        if not check_vols:
+            print("ERROR: written STEP has no 3D volumes — fuse succeeded but "
+                  "export dropped solids.", file=sys.stderr)
+            return 1
+        return 0
+    else:
+        current_vols = after_dedup
+
+    tmp_step.unlink(missing_ok=True)
 
     # Final verification
-    current_vols = occ.getEntities(3)
     print(f"[merge] after cleanup: {len(current_vols)} volumes")
     for (d, t) in current_vols:
         b = occ.getBoundingBox(d, t)

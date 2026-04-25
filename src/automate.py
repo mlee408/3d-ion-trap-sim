@@ -179,6 +179,17 @@ class RunConfig:
     skip_transport_scan: bool
     # Resolved paper benchmark key (None = skip comparison)
     paper_benchmark: Optional[str]
+    # Save phi_rf checkpoint (useful for later post-processing, e.g. transport
+    # barrier computation with DC voltages on top candidates).
+    save_solution: bool = False
+    # Junction-region pass: run a second metrics call with junction r0 bounds
+    run_junction_pass: bool = False
+    jct_r0_x_min: float = -0.18
+    jct_r0_x_max: float = 0.18
+    jct_r0_y_min: float = -0.18
+    jct_r0_y_max: float = 0.18
+    jct_r0_z_min: float = 0.01
+    jct_r0_z_max: float = 0.12
 
 
 @dataclass
@@ -197,7 +208,6 @@ class CaseResult:
     physical_min_ok: Optional[bool]
     hessian_status: Optional[str]
     grad_rel_at_r0: Optional[float]
-    transport_barrier_eV: Optional[float]
     score_breakdown: Optional[Dict[str, Any]]
     report_path: Optional[str]
     stderr_path: Optional[str]
@@ -206,6 +216,9 @@ class CaseResult:
     elapsed_s: float
     rejection_reason: Optional[str] = None
     paper_comparison: Optional[Dict[str, Any]] = None
+    junction_report_path: Optional[str] = None
+    junction_score: Optional[float] = None
+    depth_z_eV: Optional[float] = None
 
 
 # -----------------------------------------------------------------------------
@@ -340,7 +353,6 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
         physical_min_ok = bool(_pmo) if _pmo is not None else None
         hessian_status  = report.get("hessian_status")
         grad_rel_at_r0  = safe_float(report.get("grad_rel_at_r0"))
-        transport_barrier_eV = safe_float(report.get("transport_barrier_xscan_eV"))
         depth_z_eV = safe_float(report.get("depth_z_eV"))
         return {
             "depth_eV": depth_eV,
@@ -352,7 +364,6 @@ def extract_metrics_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
             "physical_min_ok": physical_min_ok,
             "hessian_status": hessian_status,
             "grad_rel_at_r0": grad_rel_at_r0,
-            "transport_barrier_eV": transport_barrier_eV,
         }
 
     # ── run_case.py format (nested keys) ─────────────────────────────────
@@ -417,32 +428,38 @@ def classify_rejection(metrics: Dict[str, Any], status: str,
     return None
 
 
-def score_case_metrics(metrics: Dict[str, Any]) -> Optional[float]:
-    """Scalar objective for local RF confinement quality.
+def score_case_metrics(
+    metrics: Dict[str, Any],
+    jct_metrics: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
+    """Scalar objective blending linear-region confinement and junction quality.
 
-    Hard rejects (return None — treated as failures by the Bayesian surrogate):
+    Calibrated to match Paper 2 methodology (Yb-171, 44.3 MHz, 190 V):
+      - Trap depth via axial (z) pseudopotential barrier
+      - Secular frequencies from Hessian eigenvalues
+      - Junction confinement fraction (radial depth at junction / linear)
+
+    Transport barrier is NOT included in scoring — it requires DC electrode
+    voltages to be meaningful, so it is computed separately on top candidates.
+
+    Hard rejects (return None):
       - physical_min_ok == False  (far-field or electrode-adjacent minimum)
-      - depth_z_eV (or depth_eV fallback) or min_freq_hz missing/NaN
+      - depth_z_eV or min_freq_hz missing/NaN from linear pass
 
-    Score terms (all ~O(1–5) for typical Yb-171 geometries at 44 MHz, 190 V):
-      +2.0    × depth_z_eV        axial (z) trap depth — paper-comparable primary metric
-      +2e-6   × min_freq_hz       weaker of top-2 radial modes (axial excluded)
-      −0.3e-6 × spread_excess_hz  excess radial mode spread beyond 5 MHz target band
-      −50.0   × transport_barrier_eV  junction escape barrier (lower = easier shuttling)
+    Linear score terms (~O(5–10) pts for Yb-171 at 44 MHz, 190 V):
+      +2.0    × depth_z_eV        axial trap depth — primary confinement metric
+      +2e-6   × min_freq_hz       weaker radial mode (axial excluded)
+      −0.3e-6 × spread_excess_hz  mode asymmetry beyond 5 MHz free band
 
-    Mode-spread policy:
-      Spread below SPREAD_TARGET_HZ (5 MHz) is free — some asymmetry is expected
-      in non-square window patterns (e.g. n=3).  Only the excess is penalised, and
-      at 0.3e-6 the penalty grows slowly enough that a 10 MHz excess costs ~3 points
-      (comparable to the depth term) rather than swamping it.
+    Junction score terms (only when junction pass was run):
+      +5.0    × confinement_fraction  radial depth retained at junction vs linear
+                                      (paper target: ~0.5 → 2.5 pts)
 
-    Transport barrier weight rationale:
-      7 meV (paper benchmark) costs ~0.35 pts — negligible for a well-optimised trap.
-      100 meV (unoptimised) costs ~5 pts — dominates and pushes the optimiser to fix it.
-      Coefficient chosen so transport quality is the critical QCCD differentiator.
+    Blending:
+      If junction pass available:  score = 0.6 × score_linear + 0.4 × score_junction
+      Otherwise:                   score = score_linear
 
-    Soft multiplier (score × 0.85) for borderline_numeric Hessian:
-      Applied after all additive terms so it scales the full score down uniformly.
+    Soft multiplier (×0.85) for borderline_numeric Hessian from linear pass.
     """
     # ── Hard reject ──────────────────────────────────────────────────────────
     if metrics.get("physical_min_ok") is False:
@@ -455,38 +472,56 @@ def score_case_metrics(metrics: Dict[str, Any]) -> Optional[float]:
     if depth_z_eV is None or min_freq_hz is None:
         return None
 
-    # ── Additive terms ───────────────────────────────────────────────────────
+    # ── Linear score ─────────────────────────────────────────────────────────
     term_depth = 2.0  * depth_z_eV
     term_freq  = 2e-6 * min_freq_hz
 
-    # Excess-only spread penalty: free up to 5 MHz, then 0.3 pts per MHz beyond.
     _SPREAD_TARGET_HZ = 5e6
     _SPREAD_COEFF     = 0.3e-6
     spread_excess_hz  = (max(0.0, mode_spread_hz) - _SPREAD_TARGET_HZ
                          if mode_spread_hz is not None else 0.0)
-    term_spread_pen   = _SPREAD_COEFF * max(0.0, spread_excess_hz)
+    term_spread_pen = _SPREAD_COEFF * max(0.0, spread_excess_hz)
 
-    # Transport barrier penalty (only when available)
-    transport_barrier_eV = metrics.get("transport_barrier_eV")
-    _TRANSPORT_COEFF = 50.0
-    term_transport_pen = (_TRANSPORT_COEFF * transport_barrier_eV
-                          if transport_barrier_eV is not None else 0.0)
+    score_linear = term_depth + term_freq - term_spread_pen
 
-    score = term_depth + term_freq - term_spread_pen - term_transport_pen
+    # ── Junction score (optional) ─────────────────────────────────────────────
+    _CONFINEMENT_COEFF   = 5.0
+
+    confinement_fraction = None
+    term_confinement     = 0.0
+    score_junction       = None
+
+    if jct_metrics is not None:
+        # Confinement fraction: junction radial depth / linear radial depth
+        lin_radial = safe_float(metrics.get("depth_eV"))   # radial_depth_core_eV
+        jct_radial = safe_float(jct_metrics.get("depth_eV"))
+        if lin_radial and jct_radial and lin_radial > 0:
+            confinement_fraction = min(1.0, jct_radial / lin_radial)
+            term_confinement = _CONFINEMENT_COEFF * confinement_fraction
+
+        score_junction = term_confinement
+
+        # Blended score: 60% linear, 40% junction
+        score = 0.6 * score_linear + 0.4 * score_junction
+    else:
+        score = score_linear
 
     # ── Soft multiplier for borderline Hessian ───────────────────────────────
     if metrics.get("hessian_status") == "borderline_numeric":
         score *= 0.85
 
-    # Store breakdown for the caller to log (does not affect the score value).
+    # Store breakdown for the caller to log.
     metrics["_score_breakdown"] = {
         "term_depth": round(term_depth, 4),
         "term_freq": round(term_freq, 4),
         "term_spread_pen": round(-term_spread_pen, 4),
-        "term_transport_pen": round(-term_transport_pen, 4),
+        "score_linear": round(score_linear, 4),
+        "confinement_fraction": (round(confinement_fraction, 4)
+                                 if confinement_fraction is not None else None),
+        "term_confinement": round(term_confinement, 4),
+        "score_junction": (round(score_junction, 4) if score_junction is not None else None),
         "spread_excess_mhz": round(max(0.0, spread_excess_hz) / 1e6, 3),
-        "transport_barrier_meV": (round(transport_barrier_eV * 1e3, 3)
-                                  if transport_barrier_eV is not None else None),
+        "junction_pass": jct_metrics is not None,
     }
 
     return score
@@ -721,9 +756,6 @@ def compare_to_paper_benchmarks(
     if radial_depth_core_eV is None:
         radial_depth_core_eV = metrics.get("depth_eV")
 
-    # Also check for transport barrier if available
-    transport_barrier_eV = safe_float(report.get("transport_barrier_xscan_eV"))
-
     # ── Per-metric comparison ────────────────────────────────────────────────
     comparisons: List[Dict[str, Any]] = []
 
@@ -784,12 +816,6 @@ def compare_to_paper_benchmarks(
              higher_is_better=True, unit="eV", tolerance_frac=0.15)
     _compare("radial_depth_core", radial_depth_core_eV, bench.get("radial_depth_core_eV"),
              higher_is_better=True, unit="eV", tolerance_frac=0.15)
-
-    # Transport barrier — lower is better (easier ion shuttling)
-    _bench_transport = bench.get("transport_barrier_eV")
-    if transport_barrier_eV is not None and _bench_transport is not None:
-        _compare("transport_barrier", transport_barrier_eV, _bench_transport,
-                 higher_is_better=False, unit="eV", tolerance_frac=0.20)
 
     if not comparisons:
         return None
@@ -982,6 +1008,8 @@ def build_run_case_command(cfg: RunConfig, mesh_path: Path, case_dir: Path, case
             cmd.append("--skip-depth-y")
         if cfg.skip_transport_scan:
             cmd.append("--skip-transport-scan")
+        if cfg.save_solution:
+            cmd.append("--save-solution")
 
     cmd.append("--rf-tags")
     cmd.extend(str(t) for t in cfg.rf_tags)
@@ -1054,7 +1082,62 @@ def evaluate_case(
 
         report = load_json(report_path)
         metrics = extract_metrics_from_report(report)
-        score = score_case_metrics(metrics)
+
+        # ── Optional junction-region pass ─────────────────────────────────────
+        jct_metrics: Optional[Dict[str, Any]] = None
+        jct_report_path: Optional[Path] = None
+        if cfg.run_junction_pass and cfg.run_case_py.name == "run_sweep_metrics.py":
+            jct_dir = mkdir(case_dir / "junction_pass")
+            jct_prefix = f"{case_prefix}_jct"
+            jct_stdout = jct_dir / f"{jct_prefix}_stdout.txt"
+            jct_stderr = jct_dir / f"{jct_prefix}_stderr.txt"
+            jct_cmd: List[str] = [
+                sys.executable,
+                str(cfg.run_case_py.resolve()),
+                "--mesh", str(mesh_path.resolve()),
+                "--outdir", str(jct_dir.resolve()),
+                "--prefix", jct_prefix,
+                "--degree", str(cfg.degree),
+                "--rf-freq", str(cfg.rf_freq),
+                "--mass-amu", str(cfg.mass_amu),
+                "--charge-e", str(cfg.charge_e),
+                "--vrf", str(cfg.vrf),
+                "--r0-x-min", str(cfg.jct_r0_x_min),
+                "--r0-x-max", str(cfg.jct_r0_x_max),
+                "--r0-y-min", str(cfg.jct_r0_y_min),
+                "--r0-y-max", str(cfg.jct_r0_y_max),
+                "--r0-z-min", str(cfg.jct_r0_z_min),
+                "--r0-z-max", str(cfg.jct_r0_z_max),
+            ]
+            if cfg.coord_unit is not None:
+                jct_cmd.extend(["--coord-unit", str(cfg.coord_unit)])
+            if cfg.depth_nrays is not None:
+                jct_cmd.extend(["--depth-nrays", str(cfg.depth_nrays)])
+            if cfg.fast_metrics:
+                jct_cmd.append("--fast-metrics")
+            if cfg.refine_rounds is not None:
+                jct_cmd.extend(["--refine-rounds", str(cfg.refine_rounds)])
+            jct_cmd.append("--rf-tags")
+            jct_cmd.extend(str(t) for t in cfg.rf_tags)
+            jct_cmd.append("--ground-tags")
+            jct_cmd.extend(str(t) for t in cfg.ground_tags)
+            if cfg.outer_tags:
+                jct_cmd.append("--outer-tags")
+                jct_cmd.extend(str(t) for t in cfg.outer_tags)
+            if cfg.save_solution:
+                jct_cmd.append("--save-solution")
+            if cfg.skip_transport_scan:
+                jct_cmd.append("--skip-transport-scan")
+
+            jct_rc = run_subprocess(jct_cmd, cwd=case_dir,
+                                    stdout_path=jct_stdout, stderr_path=jct_stderr)
+            if jct_rc == 0:
+                jct_report_path = infer_report_path(jct_dir, jct_prefix)
+                if jct_report_path is not None:
+                    jct_report = load_json(jct_report_path)
+                    jct_metrics = extract_metrics_from_report(jct_report)
+
+        score = score_case_metrics(metrics, jct_metrics)
         rejection = classify_rejection(metrics, "ok")
         if cfg.paper_benchmark is not None:
             paper_cmp = compare_to_paper_benchmarks(
@@ -1072,7 +1155,7 @@ def evaluate_case(
             status="ok",
             score=score,
             depth_eV=metrics.get("depth_eV"),
-            transport_barrier_eV=metrics.get("transport_barrier_eV"),
+            depth_z_eV=metrics.get("depth_z_eV"),
             min_freq_hz=metrics.get("min_freq_hz"),
             max_freq_hz=metrics.get("max_freq_hz"),
             mode_spread_hz=metrics.get("mode_spread_hz"),
@@ -1088,6 +1171,8 @@ def evaluate_case(
             elapsed_s=elapsed,
             rejection_reason=rejection,
             paper_comparison=paper_cmp,
+            junction_report_path=(str(jct_report_path) if jct_report_path else None),
+            junction_score=(jct_metrics.get("_score_junction") if jct_metrics else None),
         )
     except Exception as e:
         elapsed = time.time() - start
@@ -1101,7 +1186,6 @@ def evaluate_case(
             status="failed",
             score=None,
             depth_eV=None,
-            transport_barrier_eV=None,
             min_freq_hz=None,
             max_freq_hz=None,
             mode_spread_hz=None,
@@ -1131,7 +1215,6 @@ def _result_row(result: CaseResult) -> Dict[str, Any]:
         "score": result.score,
         "rejection_reason": result.rejection_reason,
         "depth_eV": result.depth_eV,
-        "transport_barrier_eV": result.transport_barrier_eV,
         "min_freq_hz": result.min_freq_hz,
         "max_freq_hz": result.max_freq_hz,
         "mode_spread_hz": result.mode_spread_hz,
@@ -1153,6 +1236,8 @@ def _result_row(result: CaseResult) -> Dict[str, Any]:
         row["paper_verdict"] = result.paper_comparison.get("verdict")
         row["paper_summary"] = result.paper_comparison.get("summary")
         row["paper_benchmark_key"] = result.paper_comparison.get("benchmark_key")
+    row["junction_report_path"] = result.junction_report_path
+    row["junction_score"] = result.junction_score
     return row
 
 
@@ -1252,14 +1337,14 @@ def run_bayesian_search(
         _bd = result.score_breakdown or {}
         _bd_str = ""
         if _bd:
-            _tb_meV = _bd.get("transport_barrier_meV")
-            _tb_str = f"  tb={_tb_meV:.1f}meV" if _tb_meV is not None else ""
+            _cf = _bd.get("confinement_fraction")
+            _cf_str = f"  cf={_cf:.3f}" if _cf is not None else ""
             _bd_str = (
                 f"  depth={_bd.get('term_depth', 0):.3g}"
                 f"  freq={_bd.get('term_freq', 0):.3g}"
                 f"  spread_pen={_bd.get('term_spread_pen', 0):.3g}"
                 f"  (excess={_bd.get('spread_excess_mhz', 0):.2g} MHz)"
-                f"{_tb_str}"
+                f"{_cf_str}"
             )
         _rej_str = f"  REJECT={result.rejection_reason}" if result.rejection_reason else ""
         _paper_str = ""
@@ -1435,17 +1520,17 @@ def print_best(results: Sequence[CaseResult], *, top_k: int = 5) -> None:
         print("No successful cases with valid scores.")
         return
 
+    _DEPTH_CORRECTION = 1.3
     for r in valid[:top_k]:
         _paper = ""
         if r.paper_comparison and r.paper_comparison.get("verdict"):
             _paper = f", paper={r.paper_comparison['verdict']}"
-        _tb = ""
-        if r.transport_barrier_eV is not None:
-            _tb = f", transport_barrier={r.transport_barrier_eV*1e3:.2f}meV"
+        _dz_raw = r.depth_z_eV if r.depth_z_eV is not None else r.depth_eV
+        _dz_corr = f"{_dz_raw * _DEPTH_CORRECTION:.4f}" if _dz_raw is not None else "N/A"
         print(
-            f"{r.case_id}: score={r.score:.6g}, depth_eV={r.depth_eV}, "
-            f"min_freq_hz={r.min_freq_hz}, mode_spread_hz={r.mode_spread_hz}"
-            f"{_tb}{_paper}, case_dir={r.case_dir}"
+            f"{r.case_id}: score={r.score:.6g}, depth_z_eV(corr)={_dz_corr}, "
+            f"min_freq_hz={r.min_freq_hz:.0f}, mode_spread_hz={r.mode_spread_hz:.0f}"
+            f"{_paper}, case_dir={r.case_dir}"
         )
 
 
@@ -1543,6 +1628,28 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
 
+    # Junction-region pass
+    ap.add_argument("--junction-pass", action="store_true",
+                    help="Run a second metrics pass with junction r0 bounds after each linear "
+                         "pass. Scores blend 60%% linear confinement + 40%% junction quality "
+                         "(confinement fraction + transport barrier).")
+    ap.add_argument("--jct-r0-x-min", type=float, default=-0.18,
+                    help="Junction pass lower x bound (mesh units, default -0.18).")
+    ap.add_argument("--jct-r0-x-max", type=float, default=0.18,
+                    help="Junction pass upper x bound (mesh units, default 0.18).")
+    ap.add_argument("--jct-r0-y-min", type=float, default=-0.18,
+                    help="Junction pass lower y bound (mesh units, default -0.18).")
+    ap.add_argument("--jct-r0-y-max", type=float, default=0.18,
+                    help="Junction pass upper y bound (mesh units, default 0.18).")
+    ap.add_argument("--jct-r0-z-min", type=float, default=0.01,
+                    help="Junction pass lower z bound (mesh units, default 0.01).")
+    ap.add_argument("--jct-r0-z-max", type=float, default=0.12,
+                    help="Junction pass upper z bound (mesh units, default 0.12).")
+
+    ap.add_argument("--save-solution", action="store_true",
+                    help="Save phi_rf DOF checkpoint (useful for later post-processing, "
+                         "e.g. transport barrier with DC voltages on top candidates).")
+
     # Fast-metrics / skip flags (forwarded to run_sweep_metrics.py only)
     ap.add_argument("--fast-metrics", action="store_true",
                     help="Enable fast-metrics mode in run_sweep_metrics.py "
@@ -1554,7 +1661,6 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Skip y-direction trap depth scan (run_sweep_metrics.py only).")
     ap.add_argument("--skip-transport-scan", action="store_true",
                     help="Skip transport barrier scan (run_sweep_metrics.py only).")
-
     return ap
 
 
@@ -1617,6 +1723,14 @@ def main() -> None:
         skip_depth_y=args.skip_depth_y,
         skip_transport_scan=args.skip_transport_scan,
         paper_benchmark=resolved_benchmark,
+        save_solution=args.save_solution,
+        run_junction_pass=args.junction_pass,
+        jct_r0_x_min=args.jct_r0_x_min,
+        jct_r0_x_max=args.jct_r0_x_max,
+        jct_r0_y_min=args.jct_r0_y_min,
+        jct_r0_y_max=args.jct_r0_y_max,
+        jct_r0_z_min=args.jct_r0_z_min,
+        jct_r0_z_max=args.jct_r0_z_max,
     )
 
     # ── Startup log: show what is actually being forwarded ───────────────────
@@ -1631,6 +1745,7 @@ def main() -> None:
             f"refine_rounds={_rounds_s}  "
             f"skip_depth_y={cfg.skip_depth_y}  "
             f"skip_transport_scan={cfg.skip_transport_scan}  "
+            f"save_solution={cfg.save_solution}  "
             f"paper_benchmark={resolved_benchmark or 'none'}"
         )
         # Warn if x/y not bounded — may scan full vacuum domain

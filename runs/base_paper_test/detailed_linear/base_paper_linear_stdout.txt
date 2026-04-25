@@ -1,0 +1,59 @@
+
+[sweep] mesh=mesh.msh  coord_unit=1e-03  h=5.197e-02  ray_length=2.214e+00  h_mesh=1.732e-02
+[sweep] mode=normal  nrays=48  refine_rounds=8  skip_transport=False  skip_depth_y=False
+[BC] RF Dirichlet tags : [1]  (φ = 1 V)
+[BC] GND Dirichlet tags: [2, 3]  (φ = 0 V)
+[BC] Neumann (outer)   : [4]  (∂φ/∂n = 0)
+[sweep] phi_rf checkpoint: runs/base_paper_test/detailed_linear/base_paper_linear_phi_rf_dofs.npy
+[r0 search] active bounds (mesh units): x=[0.12,0.48]  y=[-0.18,0.18]  z=[0.02,0.15]
+[r0 debug] candidate DOFs: 3453807 non-negative → 334743 in z-window [0.02,0.15] (9.7% retained)
+[r0 debug] z of bottom-5%% Ψ DOFs in window [0.02,0.15] mesh units:
+  z percentiles [5,25,50,75,95] = ['0.03184', '0.07082', '0.08167', '0.09212', '0.1375'] mesh units
+  → in µm: ['31.8', '70.8', '81.7', '92.1', '137.5']
+  (target: cluster should sit well below z_max; ~60%% of z_max = 90 µm ≈ 0.09 mesh units)
+[trap min] r0 (coarse)=[0.293468513165665, -0.0002625651440026686, 0.08190668021259319], Psi_min=-2.3215e-33 J
+[trap min] r0_SI (coarse, pre-refinement)=[0.00029346851316566503, -2.625651440026686e-07, 8.190668021259319e-05] m
+[consistency] charge_C       = 1.602177e-19 C  (charge_e=1.0)
+[refine] early stop (tiny_improvement) after 2/8 rounds  f_cur=-2.3215e-33
+[r0 refine] extra pass (h=3.464e-03, 8 rounds): already at local minimum (-2.3215e-33); r0 unchanged
+[consistency] Psi (secular input) : type=Function  name='Psi_rf'  element=FiniteElement
+[consistency] vrf            = 190.0 V
+[consistency] coord_unit     = 1.0000e-03 m/mesh_unit
+[consistency] m_kg           = 2.839522e-25 kg
+[consistency] h (caller)     = 5.1966e-02 mesh units
+[consistency] h_hessian      = 3.4644e-02 mesh units  (min(caller, 2×h_mesh=3.464e-02))
+[consistency] ray_length     = 2.2142e+00 mesh units
+[hessian] h_used=3.464e-02 mesh units
+[hessian] Hessian matrix (J/mesh_unit²):
+  [ 0.  0. -0.]
+  [0. 0. 0.]
+  [-0.  0.  0.]
+[hessian] eigenvalues (J/mesh_unit²): ['2.5795e-30', '1.4217e-27', '2.1096e-27']
+[hessian] frequencies (MHz): ['0.0911', '2.1397', '2.6064']
+[gradient] ∇Ψ at r0 (J/mesh_unit): [ 0. -0. -0.]
+[gradient] |∇Ψ|=1.918e-29  |H|_F=2.544e-27  rel=|∇Ψ|/(|H|·h)=2.177e-01  (< 0.1 → near stationary)
+[hessian] acceptance thresholds: eigenvalue |λ_neg|/max(λ_pos) < 1e-03  AND  grad_rel < 0.50  (both required for borderline_numeric)
+[hessian] classification: valid local minimum ✓
+[consistency] Psi_clipped (depth input): type=Function  name='Psi_rf'  same_space=True
+[consistency] Psi_depth (DG, for depth): type=Function  name='Psi_rf_dg_clipped'  ndofs=20886310
+[depth] z-axis: +z=2.0271 eV (interior=True)  -z=28.6201 eV (interior=True)  → depth_z=2.0271420952319272 eV  *** paper-comparable ***
+[depth] y-axis: +y=5.3114 eV (interior=True)  -y=5.3303 eV (interior=True)  → depth_y=5.311436372829526 eV
+[depth] transport axis = [1.0, -0.001, 0.003] (source: eigvec)
+[depth] ── Transport barrier summary ──
+  eigvec-scan : 0.064815 eV  interior=True
+  x-scan      : 0.065982 eV  interior=True
+[sweep] h_used=3.464e-02  all_freq_hz=['9.1143e+04', '2.1397e+06', '2.6064e+06']
+[sweep result] r0.z=81.91 µm  hessian=valid  grad_rel=2.177e-01
+[sweep | local secular MHz]       strong_freq=[2.140, 2.606]
+[sweep | local confinement eV]    radial_depth_core=0.6271347525768232
+[sweep | paper-comparison eV]     depth_z=2.0271420952319272  depth_y=5.311436372829526
+[sweep | transport barriers eV]   xscan=0.06598192973741288  eigvec=0.06481492120234202
+[timings]
+  mesh_load_s         : 16.91 s
+  laplace_solve_s     : 22.86 s
+  r0_search_s         : 104.30 s
+  refinement_s        : 39.83 s
+  hessian_grad_s      : 71.20 s
+  depth_scan_s        : 170.46 s
+  total_s             : 428.46 s
+[sweep] wrote runs/base_paper_test/detailed_linear/base_paper_linear_sweep.json

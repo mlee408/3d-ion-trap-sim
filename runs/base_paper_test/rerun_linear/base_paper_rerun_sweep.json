@@ -1,0 +1,87 @@
+{
+  "mesh": "runs/base_paper_test/mesh.msh",
+  "prefix": "base_paper_rerun",
+  "r0_x_m": 0.00029346851316566503,
+  "r0_y_m": -2.625651440026686e-07,
+  "r0_z_m": 8.190668021259319e-05,
+  "freq1_hz": 91142.94130175895,
+  "freq2_hz": 2139728.328723508,
+  "freq3_hz": 2606431.7077532248,
+  "strong_freq_min_hz": 2139728.328723508,
+  "strong_freq_max_hz": 2606431.7077532248,
+  "depth_z_eV": 2.0271420952319272,
+  "depth_z_plus_eV": 2.0271420952319272,
+  "depth_z_minus_eV": 28.620086527516133,
+  "depth_z_interior": true,
+  "depth_y_eV": 5.311436372829526,
+  "depth_y_plus_eV": 5.311436372829526,
+  "depth_y_minus_eV": 5.3303167355008725,
+  "depth_y_interior": true,
+  "radial_depth_core_eV": 0.6271347525768232,
+  "transport_barrier_xscan_eV": 0.06598192973741288,
+  "transport_barrier_eigvec_eV": 0.06481492120234202,
+  "h_used": 0.034644285985616315,
+  "physical_min_ok": true,
+  "strong_modes_ok": true,
+  "hessian_status": "valid",
+  "grad_rel_at_r0": 0.21766368621272475,
+  "success": true,
+  "notes": null,
+  "fast_metrics": false,
+  "depth_nrays_used": 48,
+  "refine_rounds_requested": 8,
+  "refine_rounds_used": 8,
+  "skipped_metrics": [],
+  "timings_s": {
+    "mesh_load_s": 66.441,
+    "laplace_solve_s": 81.013,
+    "r0_search_s": 361.047,
+    "refinement_s": 136.535,
+    "hessian_grad_s": 294.541,
+    "depth_scan_s": 830.858,
+    "total_s": 1781.069
+  },
+  "_metric_categories": {
+    "local_secular_hz": [
+      "freq1_hz",
+      "freq2_hz",
+      "freq3_hz"
+    ],
+    "strong_secular_hz": [
+      "strong_freq_min_hz",
+      "strong_freq_max_hz"
+    ],
+    "local_confinement_eV": [
+      "radial_depth_core_eV"
+    ],
+    "paper_comparison_eV": [
+      "depth_z_eV",
+      "depth_y_eV"
+    ],
+    "transport_barriers_eV": [
+      "transport_barrier_xscan_eV",
+      "transport_barrier_eigvec_eV"
+    ]
+  },
+  "rf_freq_Hz": 44300000.0,
+  "vrf_V": 190.0,
+  "mass_amu": 171.0,
+  "charge_e": 1.0,
+  "degree": 2,
+  "coord_unit_m_per_mesh": 0.001,
+  "r0_search_bounds_mesh": {
+    "x": [
+      0.12,
+      0.48
+    ],
+    "y": [
+      -0.18,
+      0.18
+    ],
+    "z": [
+      0.02,
+      0.15
+    ]
+  },
+  "phi_rf_checkpoint": "base_paper_rerun_phi_rf_dofs.npy"
+}
