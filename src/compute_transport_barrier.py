@@ -153,7 +153,10 @@ def _resolve_phi_rf(
     mesh_str = report.get("mesh", "")
     mesh_path = Path(mesh_str) if mesh_str else case_dir / "mesh.msh"
     if not mesh_path.is_absolute():
-        mesh_path = (case_dir / mesh_path).resolve()
+        # mesh_str is typically project-root-relative (e.g. "runs/.../mesh.msh");
+        # try CWD first, fall back to case_dir for older relative layouts.
+        cwd_resolved = (Path.cwd() / mesh_path).resolve()
+        mesh_path = cwd_resolved if cwd_resolved.exists() else (case_dir / mesh_path).resolve()
 
     # Check for checkpoint
     prefix = report.get("prefix", "")
@@ -522,6 +525,310 @@ def _scan_transport_barrier(
     return result
 
 
+# ── String-method CTC path tracer ────────────────────────────────────────────
+
+def _ctc_string_method(
+    Psi,
+    report: Dict[str, Any],
+    *,
+    junction_pitch: float = 600e-6,
+    n_nodes: int = 40,
+    n_iter: int = 200,
+    h_step_factor: float = 0.3,
+    comm=None,
+    csv_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """String-method minimum-energy path from r0 to the nearest junction center.
+
+    Instead of scanning along a fixed y=0, z=r0_z line (which overestimates the
+    barrier), this relaxes a string of nodes so each interior node slides
+    downhill in the transverse (y, z) plane while x stays fixed.  The result is
+    the true lowest-energy corridor through the junction.
+
+    Returns a dict of result keys to merge into the JSON report.
+    """
+    import metrics
+
+    domain     = Psi.function_space.mesh
+    coord_unit = float(report.get("coord_unit_m_per_mesh", 1e-3))
+    vrf        = float(report.get("vrf_V", 1.0))
+    r0_x_m     = float(report["r0_x_m"])
+    r0_y_m     = float(report["r0_y_m"])
+    r0_z_m     = float(report["r0_z_m"])
+
+    # r0 in mesh units
+    r0 = np.array([r0_x_m, r0_y_m, r0_z_m]) / coord_unit
+
+    phys_scale = (vrf / coord_unit) ** 2
+    to_eV      = phys_scale / _E_CHARGE
+
+    h_mesh = metrics._estimate_cell_h(domain)
+    h_step = h_step_factor * h_mesh       # gradient-descent step size
+    h_fd   = h_mesh * 0.25               # finite-difference probe offset
+
+    # ── Locate junction ──────────────────────────────────────────────────────
+    pitch_mesh  = junction_pitch / coord_unit
+    near_junc   = round(r0[0] / pitch_mesh) * pitch_mesh
+    if r0[0] >= near_junc:
+        far_junc = near_junc + pitch_mesh
+    else:
+        far_junc = near_junc - pitch_mesh
+    junc_x_mesh = far_junc
+
+    # ── Pre-locate Ψ minimum at the junction (y, z coordinate descent) ───────
+    # The linear-region r0 transverse coordinates (y, z) are generally NOT the
+    # equilibrium position at the junction.  Pinning the far endpoint there
+    # stretches the string to a non-minimum and overestimates the barrier.
+    junc_pt = np.array([junc_x_mesh, r0[1], r0[2]], dtype=np.float64)
+    _v0_junc = float(metrics.eval_function_at_points(Psi, junc_pt[None], comm=comm)[0])
+    junc_v_val = _v0_junc if np.isfinite(_v0_junc) else 1e30
+    for _h_scale in (4.0, 2.0, 1.0, 0.5, 0.25):
+        _h = h_mesh * _h_scale
+        for _ in range(4):
+            _probes = np.array([
+                [junc_x_mesh, junc_pt[1] + _h, junc_pt[2]],
+                [junc_x_mesh, junc_pt[1] - _h, junc_pt[2]],
+                [junc_x_mesh, junc_pt[1],       junc_pt[2] + _h],
+                [junc_x_mesh, junc_pt[1],       junc_pt[2] - _h],
+            ], dtype=np.float64)
+            _pvals = metrics.eval_function_at_points(Psi, _probes, comm=comm)
+            _best = int(np.nanargmin(_pvals)) if np.any(np.isfinite(_pvals)) else -1
+            if _best >= 0 and np.isfinite(_pvals[_best]) and _pvals[_best] < junc_v_val:
+                junc_v_val = float(_pvals[_best])
+                junc_pt = _probes[_best].copy()
+            else:
+                break  # no improvement at this scale
+
+    # ── 1. INITIALIZE string ─────────────────────────────────────────────────
+    nodes = np.zeros((n_nodes, 3), dtype=np.float64)
+    nodes[:, 0] = np.linspace(r0[0], junc_x_mesh, n_nodes)
+    nodes[:, 1] = r0[1]   # start at y0
+    nodes[:, 2] = r0[2]   # start at z0
+    nodes[-1] = junc_pt.copy()   # far endpoint at junction Ψ minimum
+
+    # Psi at r0 baseline
+    psi0_raw = float(metrics.eval_function_at_points(
+        Psi, r0[None].astype(np.float64), comm=comm
+    )[0])
+    if not np.isfinite(psi0_raw):
+        raise ValueError(f"Psi is NaN at r0 (mesh units {r0.tolist()}). r0 may be outside mesh.")
+
+    print(f"[ctc] string method: {n_nodes} nodes, up to {n_iter} iterations", flush=True)
+    print(f"[ctc] r0={r0}  junction_x={junc_x_mesh:.4f}  h_step={h_step:.5f}  h_fd={h_fd:.5f}", flush=True)
+    print(f"[ctc] psi(r0)={psi0_raw:.4e} J  ({psi0_raw*to_eV*1e3:.4f} meV)", flush=True)
+    print(f"[ctc] junction min: y={junc_pt[1]:.5f} z={junc_pt[2]:.5f}  "
+          f"psi={junc_v_val:.4e} J  ({junc_v_val*to_eV*1e3:.4f} meV)", flush=True)
+
+    # z floor: 1% above the mesh floor, but never above half the ion height.
+    # The second guard prevents the clamp from cutting off the transport path
+    # in surface traps where r0_z is a small fraction of the mesh z-extent.
+    _coords = domain.geometry.x
+    _z_floor = float(_coords[:, 2].min()) + 0.01 * (
+        float(_coords[:, 2].max()) - float(_coords[:, 2].min())
+    )
+    z_clamp = min(_z_floor, r0[2] * 0.5)
+
+    # ── 2. ITERATE ───────────────────────────────────────────────────────────
+    converged = False
+    actual_iter = 0
+    # Nodes to relax: indices 1..n_nodes-1 (interior + far endpoint).
+    # The start node (index 0) is permanently fixed at r0.
+    # The far endpoint's y, z are allowed to slide; its x is re-pinned after.
+    n_relax = n_nodes - 1
+    max_step = h_mesh * 0.5   # per-iteration displacement cap (prevents overshoot)
+    prev_barrier_raw: Optional[float] = None
+    barrier_stable_count = 0
+
+    for it in range(n_iter):
+        actual_iter = it + 1
+
+        # ── 2a. SLIDE: gradient descent for interior nodes + far endpoint ────
+        # Build 4 * n_relax probe points (+y, -y, +z, -z) in a single batch.
+        relax = nodes[1:].copy()   # shape (n_relax, 3)
+        probes = np.empty((4 * n_relax, 3), dtype=np.float64)
+        probes[0::4] = relax.copy(); probes[0::4, 1] += h_fd  # +y
+        probes[1::4] = relax.copy(); probes[1::4, 1] -= h_fd  # -y
+        probes[2::4] = relax.copy(); probes[2::4, 2] += h_fd  # +z
+        probes[3::4] = relax.copy(); probes[3::4, 2] -= h_fd  # -z
+
+        psi_probes = metrics.eval_function_at_points(Psi, probes, comm=comm)
+
+        max_disp = 0.0
+        for j in range(n_relax):
+            py_plus  = psi_probes[4 * j]
+            py_minus = psi_probes[4 * j + 1]
+            pz_plus  = psi_probes[4 * j + 2]
+            pz_minus = psi_probes[4 * j + 3]
+
+            if not (np.isfinite(py_plus) and np.isfinite(py_minus)
+                    and np.isfinite(pz_plus) and np.isfinite(pz_minus)):
+                continue
+
+            dpsi_dy = (py_plus - py_minus) / (2.0 * h_fd)
+            dpsi_dz = (pz_plus - pz_minus) / (2.0 * h_fd)
+
+            dy = h_step * dpsi_dy
+            dz = h_step * dpsi_dz
+            disp = np.sqrt(dy * dy + dz * dz)
+            # Cap displacement to prevent overshooting in deep narrow valleys
+            if disp > max_step:
+                scale = max_step / disp
+                dy *= scale
+                dz *= scale
+                disp = max_step
+            if disp > max_disp:
+                max_disp = disp
+
+            nodes[1 + j, 1] -= dy
+            nodes[1 + j, 2] -= dz
+            if nodes[1 + j, 2] < z_clamp:
+                nodes[1 + j, 2] = z_clamp
+
+        # Re-pin far endpoint x (y, z allowed to move freely)
+        nodes[-1, 0] = junc_x_mesh
+
+        # ── Out-of-mesh guard ────────────────────────────────────────────────
+        # Evaluate all relaxed nodes in one batch; reset NaN nodes to safe positions.
+        guard_psi = metrics.eval_function_at_points(
+            Psi, nodes[1:].astype(np.float64), comm=comm
+        )
+        for j in range(n_nodes - 2):   # interior nodes
+            if not np.isfinite(guard_psi[j]):
+                nodes[1 + j] = 0.5 * (nodes[j] + nodes[2 + j])
+        # Far endpoint: reset to pre-located junction minimum if out of mesh
+        if not np.isfinite(guard_psi[-1]):
+            nodes[-1] = junc_pt.copy()
+            nodes[-1, 0] = junc_x_mesh
+
+        # ── 2b. REPARAMETRIZE: redistribute nodes by arc length ──────────────
+        # Arc-length reparametrization clusters nodes near the saddle where the
+        # path bends in y/z, giving better barrier resolution than uniform-x spacing.
+        diffs = np.diff(nodes, axis=0)              # (n_nodes-1, 3)
+        seg_lengths = np.linalg.norm(diffs, axis=1)  # (n_nodes-1,)
+        cum_length = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+        total_length = cum_length[-1]
+
+        if total_length > 1e-30:
+            target_s = np.linspace(0.0, total_length, n_nodes)
+            new_nodes = nodes.copy()
+            for _coord in range(3):
+                new_nodes[1:-1, _coord] = np.interp(
+                    target_s[1:-1], cum_length, nodes[:, _coord]
+                )
+            nodes = new_nodes
+
+        # Enforce endpoint constraints: start fixed at r0, far x pinned
+        nodes[0] = r0.copy()
+        nodes[-1, 0] = junc_x_mesh   # y, z remain where gradient descent left them
+
+        # ── 2c. CONVERGENCE CHECK ────────────────────────────────────────────
+        if (it + 1) % 5 == 0:
+            psi_check = metrics.eval_function_at_points(
+                Psi, nodes.astype(np.float64), comm=comm
+            )
+            current_barrier_raw = float(np.nanmax(psi_check)) - psi0_raw
+            if prev_barrier_raw is not None:
+                rel_change = abs(current_barrier_raw - prev_barrier_raw) / max(
+                    abs(prev_barrier_raw), 1e-40
+                )
+                if rel_change < 1e-4 and max_disp < 1e-4 * h_mesh:
+                    barrier_stable_count += 1
+                else:
+                    barrier_stable_count = 0
+                if barrier_stable_count >= 3:
+                    converged = True
+                    print(
+                        f"[ctc]   iter {it+1:3d}/{n_iter}  barrier="
+                        f"{current_barrier_raw*to_eV*1e3:.4f} meV  converged (barrier stable)",
+                        flush=True,
+                    )
+                    break
+            prev_barrier_raw = current_barrier_raw
+            print(
+                f"[ctc]   iter {it+1:3d}/{n_iter}  max_disp={max_disp:.3e}  "
+                f"barrier={current_barrier_raw*to_eV*1e3:.4f} meV  stable={barrier_stable_count}",
+                flush=True,
+            )
+
+        if max_disp < 1e-5 * h_mesh:
+            converged = True
+            print(f"[ctc] converged at iteration {it+1} (displacement threshold)", flush=True)
+            break
+
+    if not converged:
+        print(f"[ctc] did not converge in {n_iter} iterations "
+              f"(max_disp={max_disp:.3e}, threshold={1e-5*h_mesh:.3e})", flush=True)
+
+    # ── 3. EVALUATE Psi at all final node positions ──────────────────────────
+    psi_path = metrics.eval_function_at_points(
+        Psi, nodes.astype(np.float64), comm=comm
+    )
+
+    # Replace any NaN with neighbors' average for robustness
+    for j in range(1, n_nodes - 1):
+        if not np.isfinite(psi_path[j]):
+            left  = psi_path[j - 1] if np.isfinite(psi_path[j - 1]) else 0.0
+            right = psi_path[j + 1] if np.isfinite(psi_path[j + 1]) else 0.0
+            psi_path[j] = 0.5 * (left + right)
+
+    # ── 4. BARRIER ───────────────────────────────────────────────────────────
+    psi_max = float(np.nanmax(psi_path))
+    peak_idx = int(np.nanargmax(psi_path))
+    barrier_raw = psi_max - psi0_raw
+    barrier_eV  = barrier_raw * to_eV
+    barrier_eV_clipped = max(barrier_eV, 0.0)
+
+    peak_x_m = float(nodes[peak_idx, 0]) * coord_unit
+    peak_y_m = float(nodes[peak_idx, 1]) * coord_unit
+    peak_z_m = float(nodes[peak_idx, 2]) * coord_unit
+
+    print(f"[ctc] ── string result ─────────────────────────────────────────", flush=True)
+    print(f"[ctc]   barrier = {barrier_eV*1e3:.4f} meV  "
+          f"(clipped={barrier_eV_clipped*1e3:.4f} meV)", flush=True)
+    print(f"[ctc]   peak at x={peak_x_m*1e6:.1f} µm  y={peak_y_m*1e6:.1f} µm  "
+          f"z={peak_z_m*1e6:.1f} µm", flush=True)
+    print(f"[ctc]   converged={converged}  iterations={actual_iter}", flush=True)
+
+    # ── 5. CSV sidecar ───────────────────────────────────────────────────────
+    if csv_out is not None:
+        _csv_fields = ["node", "x_m", "y_m", "z_m",
+                       "x_mesh", "y_mesh", "z_mesh",
+                       "psi_J", "psi_eV", "psi_meV"]
+        try:
+            with csv_out.open("w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=_csv_fields)
+                w.writeheader()
+                for j in range(n_nodes):
+                    pj = psi_path[j] if np.isfinite(psi_path[j]) else float("nan")
+                    w.writerow({
+                        "node": j,
+                        "x_m": nodes[j, 0] * coord_unit,
+                        "y_m": nodes[j, 1] * coord_unit,
+                        "z_m": nodes[j, 2] * coord_unit,
+                        "x_mesh": nodes[j, 0],
+                        "y_mesh": nodes[j, 1],
+                        "z_mesh": nodes[j, 2],
+                        "psi_J": pj if np.isfinite(pj) else float("nan"),
+                        "psi_eV": pj * to_eV if np.isfinite(pj) else float("nan"),
+                        "psi_meV": pj * to_eV * 1e3 if np.isfinite(pj) else float("nan"),
+                    })
+            print(f"[ctc] path CSV → {csv_out}", flush=True)
+        except OSError as exc:
+            print(f"[ctc] WARNING: could not write path CSV: {exc}", flush=True)
+
+    return {
+        "transport_barrier_ctc_eV":       round(barrier_eV_clipped, 8),
+        "transport_barrier_ctc_meV_raw":  round(barrier_eV * 1e3, 6),
+        "transport_ctc_peak_x_m":         round(peak_x_m, 10),
+        "transport_ctc_peak_y_m":         round(peak_y_m, 10),
+        "transport_ctc_peak_z_m":         round(peak_z_m, 10),
+        "transport_ctc_n_nodes":          n_nodes,
+        "transport_ctc_n_iter":           actual_iter,
+        "transport_ctc_converged":        converged,
+        "transport_ctc_junction_x_m":     round(float(junc_x_mesh) * coord_unit, 10),
+    }
+
+
 # ── Single-case entry point ───────────────────────────────────────────────────
 
 def process_case(
@@ -534,6 +841,8 @@ def process_case(
     overwrite: bool,
     dry_run: bool,
     output_mode: str,
+    transport_mode: str = "xscan",
+    n_nodes: int = 40,
     rf_tags: Optional[List[int]] = None,
     ground_tags: Optional[List[int]] = None,
     outer_tags: Optional[List[int]] = None,
@@ -567,14 +876,25 @@ def process_case(
         return _skip("report.success == False")
 
     # Already computed and not overwriting?
-    existing_val = report.get("transport_barrier_xscan_eV")
+    if transport_mode == "string":
+        _skip_key = "transport_barrier_ctc_eV"
+    elif transport_mode == "both":
+        _skip_key = "transport_barrier_ctc_eV"  # require both; ctc is the new one
+    else:
+        _skip_key = "transport_barrier_xscan_eV"
+    existing_val = report.get(_skip_key)
     if existing_val is not None and not overwrite:
+        # Use best available barrier for the skip summary
+        best_barrier = report.get("transport_barrier_ctc_eV",
+                                  report.get("transport_barrier_xscan_eV"))
         return {
             "status": "skipped", "case_dir": str(case_dir),
             "message": "already present (use --overwrite to re-run)",
-            "barrier_eV": float(existing_val),
-            "peak_x_um": _um_or_none(report.get("transport_xscan_peak_x_m")),
-            "junction_x_um": _um_or_none(report.get("transport_xscan_nearest_junction_x_m")),
+            "barrier_eV": float(best_barrier) if best_barrier is not None else None,
+            "peak_x_um": _um_or_none(report.get("transport_xscan_peak_x_m",
+                                                  report.get("transport_ctc_peak_x_m"))),
+            "junction_x_um": _um_or_none(report.get("transport_xscan_nearest_junction_x_m",
+                                                      report.get("transport_ctc_junction_x_m"))),
             "used_checkpoint": None,
         }
 
@@ -609,15 +929,42 @@ def process_case(
             report_path.stem + "_transport_scan.csv"
         ) if report_path is not None else None
 
-        transport = _scan_transport_barrier(
-            Psi, report,
-            junction_pitch=junction_pitch,
-            n_steps=n_steps,
-            scan_both_axes=scan_both_axes,
-            optim_method=optim_method,
-            comm=comm,
-            csv_out=csv_sidecar,
-        )
+        transport: Dict[str, Any] = {}
+
+        if transport_mode in ("xscan", "both"):
+            transport = _scan_transport_barrier(
+                Psi, report,
+                junction_pitch=junction_pitch,
+                n_steps=n_steps,
+                scan_both_axes=scan_both_axes,
+                optim_method=optim_method,
+                comm=comm,
+                csv_out=csv_sidecar,
+            )
+
+        if transport_mode in ("string", "both"):
+            ctc_csv_sidecar = report_path.with_name(
+                report_path.stem + "_ctc_path.csv"
+            ) if report_path is not None else None
+            ctc = _ctc_string_method(
+                Psi, report,
+                junction_pitch=junction_pitch,
+                n_nodes=n_nodes,
+                comm=comm,
+                csv_out=ctc_csv_sidecar,
+            )
+            transport.update(ctc)
+
+        if transport_mode == "both":
+            xscan_eV = transport.get("transport_barrier_xscan_eV") or 0.0
+            ctc_eV   = transport.get("transport_barrier_ctc_eV")   or 0.0
+            if ctc_eV > xscan_eV * 1.1:
+                print(
+                    f"[ctb] WARNING: CTC barrier ({ctc_eV*1e3:.2f} meV) > xscan barrier "
+                    f"({xscan_eV*1e3:.2f} meV). The string method may not have converged "
+                    f"or the endpoint is pinned incorrectly.",
+                    flush=True,
+                )
     except Exception as exc:
         return _error(f"{type(exc).__name__}: {exc}")
 
@@ -638,9 +985,13 @@ def process_case(
         sidecar_path = case_dir / sidecar
         sidecar_path.write_text(json.dumps(transport, indent=2, sort_keys=True, default=str))
 
-    barrier_eV = transport["transport_barrier_xscan_eV"]
-    peak_x_m   = transport.get("transport_xscan_peak_x_m")
-    junc_x_m   = transport.get("transport_xscan_nearest_junction_x_m")
+    # Pick the primary barrier value: prefer ctc if available, else xscan
+    barrier_eV = transport.get("transport_barrier_ctc_eV",
+                               transport.get("transport_barrier_xscan_eV", 0.0))
+    peak_x_m   = transport.get("transport_xscan_peak_x_m",
+                               transport.get("transport_ctc_peak_x_m"))
+    junc_x_m   = transport.get("transport_xscan_nearest_junction_x_m",
+                               transport.get("transport_ctc_junction_x_m"))
     return {
         "status": "ok",
         "case_dir": str(case_dir),
@@ -705,6 +1056,12 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--output-mode", choices=["patch", "sidecar"], default="patch",
                     help="'patch': add fields to existing JSON in-place. "
                          "'sidecar': write a separate *_transport.json file.")
+    ap.add_argument("--transport-mode",
+                    choices=["xscan", "string", "both"], default="xscan",
+                    help="xscan: existing x-axis scan (default). string: string-method CTC path. "
+                         "both: run both and report both barriers.")
+    ap.add_argument("--n-nodes", type=int, default=40, dest="n_nodes",
+                    help="Number of string nodes for CTC path (string and both modes only).")
 
     # Electrode tags (optional — auto-detected from automation_config.json otherwise)
     ap.add_argument("--rf-tags", type=int, nargs="+", default=None,
@@ -739,6 +1096,8 @@ def main() -> None:
         overwrite      = args.overwrite,
         dry_run        = args.dry_run,
         output_mode    = args.output_mode,
+        transport_mode = args.transport_mode,
+        n_nodes        = args.n_nodes,
         rf_tags        = args.rf_tags,
         ground_tags    = args.ground_tags,
         outer_tags     = args.outer_tags,

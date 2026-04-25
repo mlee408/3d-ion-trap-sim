@@ -1,0 +1,11 @@
+{
+  "transport_barrier_ctc_eV": 0.01168788,
+  "transport_barrier_ctc_meV_raw": 11.687884,
+  "transport_ctc_converged": true,
+  "transport_ctc_junction_x_m": 0.0006,
+  "transport_ctc_n_iter": 1,
+  "transport_ctc_n_nodes": 40,
+  "transport_ctc_peak_x_m": 0.0005186242,
+  "transport_ctc_peak_y_m": 3.544e-06,
+  "transport_ctc_peak_z_m": 0.0001558829
+}

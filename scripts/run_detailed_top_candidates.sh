@@ -32,11 +32,11 @@ COMMON=(
 
 # ── Top candidates (one per sweep) ──────────────────────────────────────────
 CASES="
-n3_case0035 runs/sweeps/n3_thickness_height_sweep_yb2025/case_0035
-n4_case0023 runs/sweeps/n4_thickness_height_sweep_yb2025/case_0023
+n4_case0035 runs/sweeps/n4_thickness_height_sweep_yb2025/case_0035
 n4_case0024 runs/sweeps/n4_thickness_height_sweep_yb2025/case_0024
-n4f_case0029 runs/sweeps/n4_thickness_height_focused_yb2025/case_0029
-n4r_case0001 runs/sweeps/n4_thickness_height_refined_yb2025/case_0001
+n4_case0014 runs/sweeps/n4_thickness_height_sweep_yb2025/case_0014
+n4_case0007 runs/sweeps/n4_thickness_height_sweep_yb2025/case_0007
+n4_case0020 runs/sweeps/n4_thickness_height_sweep_yb2025/case_0020
 "
 
 # ── Run function ─────────────────────────────────────────────────────────────

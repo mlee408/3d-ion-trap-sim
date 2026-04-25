@@ -1,0 +1,14 @@
+
+[ctb] computing pseudopotential (DG — no inter-element smoothing) ...
+[ctb] pseudopotential ready
+[ctc] string method: 40 nodes, up to 80 iterations
+[ctc] r0=[3.07769428e-01 7.17209272e-05 8.20950814e-02]  junction_x=0.0000  h_step=0.00510  h_fd=0.00425
+[ctc] psi(r0)=1.0812e-34 J  (0.0244 meV)
+[ctc]   iter   1/80  max_disp=8.368e-32  (threshold=1.699e-07)
+[ctc] converged at iteration 1
+[ctc] ── string result ─────────────────────────────────────────
+[ctc]   barrier = 66.2694 meV  (clipped=66.2694 meV)
+[ctc]   peak at x=7.9 µm  y=0.1 µm  z=82.1 µm
+[ctc]   converged=True  iterations=1
+[ctc] path CSV → /Users/michaelee408/Documents/trap_sim/runs/paper_baseline_ctc/case_0000/auto_case_0000_sweep_ctc_path.csv
+[case_0000] ok        barrier=66.27 meV  elapsed 31.5s (checkpoint) [ckpt]
