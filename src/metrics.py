@@ -85,7 +85,7 @@ def compute_rf_pseudopotential(
         # element's interpolation points.  No global linear system, no
         # inter-element averaging — peaks near electrodes are preserved.
         V_dg = fem.functionspace(domain, ("DG", degree))
-        expr = fem.Expression(coeff * Emag2_expr, V_dg.element.interpolation_points())
+        expr = fem.Expression(coeff * Emag2_expr, V_dg.element.interpolation_points)
         Psi = fem.Function(V_dg)
         Psi.interpolate(expr)
     else:

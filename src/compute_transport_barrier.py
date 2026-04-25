@@ -153,7 +153,7 @@ def _resolve_phi_rf(
     mesh_str = report.get("mesh", "")
     mesh_path = Path(mesh_str) if mesh_str else case_dir / "mesh.msh"
     if not mesh_path.is_absolute():
-        mesh_path = (case_dir / mesh_path).resolve()
+        mesh_path = (case_dir / mesh_path.name).resolve()
 
     # Check for checkpoint
     prefix = report.get("prefix", "")
