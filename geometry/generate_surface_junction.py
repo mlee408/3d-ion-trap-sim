@@ -39,11 +39,13 @@ DEFAULTS = dict(
     electrode_gap_um=10.0,
     o1_x_um=5.0,
     o1_y_um=23.07,
+    o1_r_um=0.0,                  # curvature radius at o1
     o2_x_um=23.07,
     o2_y_um=5.0,
+    o2_r_um=0.0,                  # curvature radius at o2
     o3_x_um=95.27,                # taper start along branch axis
     o3_y_um=60.0,                 # taper start perpendicular (= rf half-width)
-    taper_rounding_um=0.0,
+    o3_r_um=0.0,                  # curvature radius at o3
     dc_min_width_um=20.0,
     dc_segment_length_um=40.0,
     dc_segment_gap_um=10.0,
@@ -56,6 +58,61 @@ DEFAULTS = dict(
 # RF polygon builder — single connected body with C4 symmetry
 # ---------------------------------------------------------------------------
 
+def _arc_round(prev, corner, nxt, radius, n_pts=16):
+    """Replace a sharp corner with a circular arc of given radius.
+
+    Returns a list of points along the arc from the tangent point on
+    prev→corner to the tangent point on corner→nxt.  If radius is 0
+    or the geometry is degenerate, returns [corner].
+    """
+    if radius <= 0:
+        return [corner]
+    px, py = prev
+    cx, cy = corner
+    nx, ny = nxt
+    d1x, d1y = px - cx, py - cy
+    d2x, d2y = nx - cx, ny - cy
+    len1 = math.hypot(d1x, d1y)
+    len2 = math.hypot(d2x, d2y)
+    if len1 < 1e-6 or len2 < 1e-6:
+        return [corner]
+    u1x, u1y = d1x / len1, d1y / len1
+    u2x, u2y = d2x / len2, d2y / len2
+    dot = u1x * u2x + u1y * u2y
+    dot = max(-1.0, min(1.0, dot))
+    half_angle = math.acos(dot) / 2.0
+    if half_angle < 1e-6:
+        return [corner]
+    tan_len = min(radius / math.tan(half_angle), len1 * 0.45, len2 * 0.45)
+    t1 = (cx + u1x * tan_len, cy + u1y * tan_len)
+    t2 = (cx + u2x * tan_len, cy + u2y * tan_len)
+    actual_r = tan_len * math.tan(half_angle)
+    bis_x, bis_y = u1x + u2x, u1y + u2y
+    bis_len = math.hypot(bis_x, bis_y)
+    if bis_len < 1e-6:
+        return [corner]
+    bis_x, bis_y = bis_x / bis_len, bis_y / bis_len
+    center_dist = actual_r / math.sin(half_angle)
+    arc_cx = cx + bis_x * center_dist
+    arc_cy = cy + bis_y * center_dist
+    a_start = math.atan2(t1[1] - arc_cy, t1[0] - arc_cx)
+    a_end = math.atan2(t2[1] - arc_cy, t2[0] - arc_cx)
+    cross = (t1[0] - arc_cx) * (t2[1] - arc_cy) - (t1[1] - arc_cy) * (t2[0] - arc_cx)
+    if cross < 0:
+        if a_end > a_start:
+            a_end -= 2 * math.pi
+    else:
+        if a_end < a_start:
+            a_end += 2 * math.pi
+    pts = []
+    for i in range(n_pts + 1):
+        t = i / n_pts
+        a = a_start + t * (a_end - a_start)
+        pts.append((arc_cx + actual_r * math.cos(a),
+                     arc_cy + actual_r * math.sin(a)))
+    return pts
+
+
 def _build_rf_junction_quadrant(p: dict) -> list[tuple[float, float]]:
     """Return taper vertices for Q1 (+x, +y quadrant).
 
@@ -65,31 +122,40 @@ def _build_rf_junction_quadrant(p: dict) -> list[tuple[float, float]]:
 
     Coordinate convention: center = (0,0), +x right, +y up.
     """
-    o1x, o1y = p["o1_x_um"], p["o1_y_um"]
-    o2x, o2y = p["o2_x_um"], p["o2_y_um"]
-    o3x, o3y = p["o3_x_um"], p["o3_y_um"]
+    o1 = (p["o1_x_um"], p["o1_y_um"])
+    o2 = (p["o2_x_um"], p["o2_y_um"])
+    o3 = (p["o3_x_um"], p["o3_y_um"])
+    o3m = (o3[1], o3[0])  # mirror of o3 on +y branch
+    r1, r2, r3 = p["o1_r_um"], p["o2_r_um"], p["o3_r_um"]
 
-    # Inner-edge taper path from +x branch to +y branch (Q1):
-    #   o3 → o2 → o1 → o3_mirror
-    return [
-        (o3x, o3y),    # taper start on +x branch inner edge
-        (o2x, o2y),
-        (o1x, o1y),
-        (o3y, o3x),    # taper end on +y branch inner edge (swapped)
-    ]
+    # Taper path: o3 → o2 → o1 → o3_mirror
+    # The point before o3 on the full polygon is (C, hw) = straight branch edge
+    # The point after o3m is (hw, C) = straight branch edge
+    # We only round o2 and o1 here; o3 rounding needs prev/next from the
+    # full polygon, so it's applied in build_rf_polygon.
+    pts = []
+    pts.append(o3)
+    pts.extend(_arc_round(o3, o2, o1, r2))
+    pts.extend(_arc_round(o2, o1, o3m, r1))
+    pts.append(o3m)
+    return pts
 
 
 def build_rf_polygon(p: dict) -> SPoly:
     """Build the unified RF cross polygon as a single connected body.
 
-    The RF cross has 120 µm wide branches extending ±300 µm from center,
-    connected by an intricate taper at the junction.  The outer RF ring
-    (unit cell boundary) is returned separately by build_rf_ring().
+    The RF cross has branches extending ±300 µm from center, connected by
+    a taper at the junction defined by control points o1, o2, o3.
     """
-    hw = p["o3_y_um"]  # RF half-width = o3's perpendicular component
+    hw = p["o3_y_um"]
     C = CELL_HALF
+    r3 = p["o3_r_um"]
+    o2 = (p["o2_x_um"], p["o2_y_um"])
+    o1 = (p["o1_x_um"], p["o1_y_um"])
+    o3 = (p["o3_x_um"], p["o3_y_um"])
+    o3m = (o3[1], o3[0])
 
-    q1 = _build_rf_junction_quadrant(p)
+    q1_inner = _build_rf_junction_quadrant(p)
 
     def rot90(pts):
         return [(-y, x) for x, y in pts]
@@ -98,31 +164,34 @@ def build_rf_polygon(p: dict) -> SPoly:
     def rot270(pts):
         return [(y, -x) for x, y in pts]
 
-    q2 = rot90(q1)
-    q3 = rot180(q1)
-    q4 = rot270(q1)
+    def _build_branch_with_o3_rounding(branch_start, q_pts, branch_end):
+        """Insert o3 arc rounding at the two branch-taper transitions."""
+        pts = []
+        pts.append(branch_start)
+        first_taper = q_pts[0]
+        second_after = q_pts[1] if len(q_pts) > 1 else branch_end
+        pts.extend(_arc_round(branch_start, first_taper, second_after, r3))
+        pts.extend(q_pts[1:-1])
+        last_taper = q_pts[-1]
+        second_before = q_pts[-2] if len(q_pts) > 1 else branch_start
+        pts.extend(_arc_round(second_before, last_taper, branch_end, r3))
+        pts.append(branch_end)
+        return pts
+
+    q1 = _build_branch_with_o3_rounding((C, hw), q1_inner, (hw, C))
+    q2 = _build_branch_with_o3_rounding((-hw, C), rot90(q1_inner), (-C, hw))
+    q3 = _build_branch_with_o3_rounding((-C, -hw), rot180(q1_inner), (-hw, -C))
+    q4 = _build_branch_with_o3_rounding((hw, -C), rot270(q1_inner), (C, -hw))
 
     cross_pts = []
-    cross_pts.append((-C, -hw))
     cross_pts.extend(q3)
-    cross_pts.append((-hw, -C))
-    cross_pts.append((hw, -C))
     cross_pts.extend(q4)
-    cross_pts.append((C, -hw))
-    cross_pts.append((C, hw))
     cross_pts.extend(q1)
-    cross_pts.append((hw, C))
-    cross_pts.append((-hw, C))
     cross_pts.extend(q2)
-    cross_pts.append((-C, hw))
 
     cross = SPoly(cross_pts)
     if not cross.is_valid:
         cross = cross.buffer(0)
-
-    r = p["taper_rounding_um"]
-    if r > 0:
-        cross = cross.buffer(r, resolution=64).buffer(-r, resolution=64)
 
     return cross
 
@@ -610,10 +679,9 @@ def generate(p: dict) -> dict:
     print(f"Surface junction generator")
     print(f"{'='*60}")
     print(f"  Electrode gap: {p['electrode_gap_um']} µm")
-    print(f"  O1: ({p['o1_x_um']}, {p['o1_y_um']})")
-    print(f"  O2: ({p['o2_x_um']}, {p['o2_y_um']})")
-    print(f"  O3: ({p['o3_x_um']}, {p['o3_y_um']})  [RF half-width={p['o3_y_um']}, taper start={p['o3_x_um']}]")
-    print(f"  Taper rounding: {p['taper_rounding_um']} µm")
+    print(f"  O1: ({p['o1_x_um']}, {p['o1_y_um']})  r={p['o1_r_um']}")
+    print(f"  O2: ({p['o2_x_um']}, {p['o2_y_um']})  r={p['o2_r_um']}")
+    print(f"  O3: ({p['o3_x_um']}, {p['o3_y_um']})  r={p['o3_r_um']}  [RF half-width={p['o3_y_um']}, taper start={p['o3_x_um']}]")
 
     # Build RF cross (upper layer only — no ring)
     rf_poly = build_rf_polygon(p)
@@ -678,13 +746,15 @@ def main() -> None:
     ap.add_argument("--electrode-gap-um", type=float, default=DEFAULTS["electrode_gap_um"])
     ap.add_argument("--o1-x-um", type=float, default=DEFAULTS["o1_x_um"])
     ap.add_argument("--o1-y-um", type=float, default=DEFAULTS["o1_y_um"])
+    ap.add_argument("--o1-r-um", type=float, default=DEFAULTS["o1_r_um"])
     ap.add_argument("--o2-x-um", type=float, default=DEFAULTS["o2_x_um"])
     ap.add_argument("--o2-y-um", type=float, default=DEFAULTS["o2_y_um"])
+    ap.add_argument("--o2-r-um", type=float, default=DEFAULTS["o2_r_um"])
     ap.add_argument("--o3-x-um", type=float, default=DEFAULTS["o3_x_um"],
-                    help="Taper start along branch axis (was junction-extent)")
+                    help="Taper start along branch axis")
     ap.add_argument("--o3-y-um", type=float, default=DEFAULTS["o3_y_um"],
-                    help="RF half-width (was rf-width/2)")
-    ap.add_argument("--taper-rounding-um", type=float, default=DEFAULTS["taper_rounding_um"])
+                    help="RF half-width")
+    ap.add_argument("--o3-r-um", type=float, default=DEFAULTS["o3_r_um"])
     ap.add_argument("--dc-min-width-um", type=float, default=DEFAULTS["dc_min_width_um"])
     ap.add_argument("--dc-segment-length-um", type=float, default=DEFAULTS["dc_segment_length_um"])
     ap.add_argument("--dc-segment-gap-um", type=float, default=DEFAULTS["dc_segment_gap_um"])
@@ -703,11 +773,13 @@ def main() -> None:
         "electrode_gap_um": args.electrode_gap_um,
         "o1_x_um": args.o1_x_um,
         "o1_y_um": args.o1_y_um,
+        "o1_r_um": args.o1_r_um,
         "o2_x_um": args.o2_x_um,
         "o2_y_um": args.o2_y_um,
+        "o2_r_um": args.o2_r_um,
         "o3_x_um": args.o3_x_um,
         "o3_y_um": args.o3_y_um,
-        "taper_rounding_um": args.taper_rounding_um,
+        "o3_r_um": args.o3_r_um,
         "dc_min_width_um": args.dc_min_width_um,
         "dc_segment_length_um": args.dc_segment_length_um,
         "dc_segment_gap_um": args.dc_segment_gap_um,
