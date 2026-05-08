@@ -40,8 +40,8 @@ Rectangular pads covering two zones:
 
 Ground geometry
 ---------------
-Outer square ring frame from cell_half to (cell_half + frame_width) with
-rectangular slots cut where the four RF arms exit the cell.
+Solid square ring frame from cell_half to (cell_half + frame_width).
+No arm exit slots — the RF arms are co-planar and need no physical clearance.
 
 Usage
 -----
@@ -231,14 +231,85 @@ def _rf_polygon_verts(p: dict) -> list[tuple[float, float]]:
 
 
 def build_rf(p: dict) -> cq.Workplane:
-    """Build the RF cross electrode solid."""
-    _validate(p)
-    verts_mm = [(mm(x), mm(y)) for x, y in _rf_polygon_verts(p)]
-    t = mm(p['thickness'])
+    """
+    Build the RF cross electrode solid as a boolean union of simple primitives.
 
-    rf = (
+    Components:
+      1. Central square: 2*d_tip × 2*d_tip
+      2. Four rectangular arm bodies: w_rf × (cell_half − taper_end) each
+      3. Four trapezoidal taper pieces connecting the square to the arm bodies
+    """
+    _validate(p)
+    t   = mm(p['thickness'])
+    C   = p['cell_half']
+    w   = p['w_rf'] / 2
+    g   = p['gap'] / 2
+    d   = p['d_tip']
+    te  = _taper_end(p)
+
+    def _box(x0, y0, x1, y1) -> cq.Workplane:
+        return _box_solid(x0, y0, x1, y1, p['thickness'])
+
+    def _trap_verts(x0_bot, x1_bot, x0_top, x1_top, y_bot, y_top):
+        """4-vertex trapezoid (CCW) in XY [µm], returned as mm tuples."""
+        return [
+            (mm(x0_bot), mm(y_bot)),
+            (mm(x1_bot), mm(y_bot)),
+            (mm(x1_top), mm(y_top)),
+            (mm(x0_top), mm(y_top)),
+        ]
+
+    def _taper_solid(x0_far, x1_far, x0_near, x1_near, y_far, y_near):
+        """Extrude a trapezoidal taper piece."""
+        verts = _trap_verts(x0_far, x1_far, x0_near, x1_near, y_far, y_near)
+        return (
+            cq.Workplane("XY", origin=(0, 0, -t))
+            .polyline(verts)
+            .close()
+            .extrude(t)
+        )
+
+    # 1. Central square
+    rf = _box(-d, -d, d, d)
+
+    # 2. Four rectangular arm bodies (start at taper_end, go to cell_half)
+    #    −y arm
+    rf = rf.union(_box(-w, -C, w, -te))
+    #    +y arm
+    rf = rf.union(_box(-w, te, w, C))
+    #    −x arm
+    rf = rf.union(_box(-C, -w, -te, w))
+    #    +x arm
+    rf = rf.union(_box(te, -w, C, w))
+
+    # 3. Four taper pieces (trapezoids)
+    #    −y arm taper: bottom edge at y=−te (full arm width), top edge at y=−d (neck)
+    rf = rf.union(_taper_solid(-w, w, -g, g, -te, -d))
+    #    +y arm taper
+    rf = rf.union(_taper_solid(-g, g, -w, w, d, te))
+    #    −x arm taper: left edge at x=−te (full width), right edge at x=−d (neck)
+    #    axis is x, so "x_far < x_near"; use a rotated trapezoid via explicit verts
+    #    We use the same helper with x/y swapped by building verts manually.
+    rf = rf.union(
         cq.Workplane("XY", origin=(0, 0, -t))
-        .polyline(verts_mm)
+        .polyline([
+            (mm(-te), mm(-w)),
+            (mm(-te), mm( w)),
+            (mm(-d),  mm( g)),
+            (mm(-d),  mm(-g)),
+        ])
+        .close()
+        .extrude(t)
+    )
+    #    +x arm taper
+    rf = rf.union(
+        cq.Workplane("XY", origin=(0, 0, -t))
+        .polyline([
+            (mm(te), mm( w)),
+            (mm(te), mm(-w)),
+            (mm(d),  mm(-g)),
+            (mm(d),  mm( g)),
+        ])
         .close()
         .extrude(t)
     )
@@ -368,14 +439,15 @@ def _dc_quadrant_boxes(p: dict) -> list[tuple[float, float, float, float]]:
     return boxes
 
 
-def _dc_linear_flank_boxes(p: dict) -> list[tuple[float, float, float, float]]:
+def _dc_all_flank_boxes(p: dict) -> list[tuple[float, float, float, float]]:
     """
-    DC pad bounding boxes for the RIGHT flank of the –y arm in the LINEAR section
-    (the region outside the quadrant corner, beside the arm straight section).
+    DC pad bounding boxes for all 8 arm flank series in the linear section.
 
-    Pads at:  x ∈ [w+gap, w+gap+dc_flank_width],  y ∈ [–C, –dc_out–gap]
+    Each arm (±x, ±y) has two flanks running parallel to the arm axis.
+    Pads in the linear zone are outside the quadrant corner zone (|axis| > dc_out+sg).
 
-    Four-fold rotation (and separate left-flank mirror) covers all 8 flank zones.
+    Returns a flat list of (x0, y0, x1, y1) boxes [µm] for all 8 series.
+    No rotation is used — each series is generated at its correct absolute position.
     """
     C   = p['cell_half']
     w   = p['w_rf'] / 2
@@ -386,33 +458,96 @@ def _dc_linear_flank_boxes(p: dict) -> list[tuple[float, float, float, float]]:
     sg  = p['dc_seg_gap']
     n   = p['n_dc_flank']
 
-    dc_in  = w + gap            # right edge inner boundary  = 70 µm
-    dc_out = dc_in + cs         # right edge of quadrant corner pad  = 130 µm
+    dc_out = w + gap + cs   # = 130 µm baseline (outer edge of quadrant corner pads)
 
-    # Flank starts just below the quadrant corner pad bottom edge (which is at –dc_out)
-    # The quadrant corner pad is at y ∈ [dc_in, dc_out].
-    # After 270° rotation for the bottom-right quadrant the corner pad will be at
-    # y ∈ [–dc_out, –dc_in].  The flank pads must start below –dc_out–gap.
-    y_top = -(dc_out + sg)       # uppermost flank pad top edge (closest to junction)
-    y_bot = -C                   # cell outer boundary
+    # The arm-direction quadrant segments already occupy [dc_out+sg, dc_out+sg + n_junc*(sl+sg)]
+    # along each arm.  Flank pads must start after the last quadrant segment ends.
+    n_junc = p['n_dc_junction']
+    sl_junc = p['dc_seg_len']
+    flank_axis_start = dc_out + sg + n_junc * (sl_junc + sg)  # = 275 µm baseline
 
-    available = abs(y_bot - y_top)
-    seg_len = fl
-    total = n * seg_len + (n - 1) * sg
-    if total > available:
-        seg_len = max(gap, (available - (n - 1) * sg) / n)
+    def _pads_y(y_start: float, y_end: float, x0: float, x1: float
+                ) -> list[tuple[float, float, float, float]]:
+        """
+        Generate n pads along the y-axis (axis=y, transverse x ∈ [x0, x1]).
+        y_start is the edge closest to the quadrant corner; y_end is the far limit.
+        sgn = sign(y_end - y_start).
+        """
+        sgn = 1 if y_end > y_start else -1
+        available = abs(y_end - y_start)
+        seg_len = fl
+        if n * seg_len + (n - 1) * sg > available:
+            seg_len = max(sg, (available - (n - 1) * sg) / n)
+        result = []
+        y = y_start
+        for _ in range(n):
+            y_far = y + sgn * seg_len
+            if sgn > 0 and y_far > y_end:
+                y_far = y_end
+            elif sgn < 0 and y_far < y_end:
+                y_far = y_end
+            ya, yb = (y, y_far) if sgn > 0 else (y_far, y)
+            if yb <= ya:
+                break
+            result.append((x0, ya, x1, yb))
+            y = y_far + sgn * sg
+            if (sgn > 0 and y >= y_end) or (sgn < 0 and y <= y_end):
+                break
+        return result
+
+    def _pads_x(x_start: float, x_end: float, y0: float, y1: float
+                ) -> list[tuple[float, float, float, float]]:
+        """
+        Generate n pads along the x-axis (axis=x, transverse y ∈ [y0, y1]).
+        x_start is the edge closest to the quadrant corner; x_end is the far limit.
+        """
+        sgn = 1 if x_end > x_start else -1
+        available = abs(x_end - x_start)
+        seg_len = fl
+        if n * seg_len + (n - 1) * sg > available:
+            seg_len = max(sg, (available - (n - 1) * sg) / n)
+        result = []
+        x = x_start
+        for _ in range(n):
+            x_far = x + sgn * seg_len
+            if sgn > 0 and x_far > x_end:
+                x_far = x_end
+            elif sgn < 0 and x_far < x_end:
+                x_far = x_end
+            xa, xb = (x, x_far) if sgn > 0 else (x_far, x)
+            if xb <= xa:
+                break
+            result.append((xa, y0, xb, y1))
+            x = x_far + sgn * sg
+            if (sgn > 0 and x >= x_end) or (sgn < 0 and x <= x_end):
+                break
+        return result
 
     boxes: list[tuple[float, float, float, float]] = []
-    y = y_top
-    for _ in range(n):
-        y1 = y
-        y0 = y - seg_len
-        if y0 < y_bot:
-            y0 = y_bot
-        if y1 <= y0:
-            break
-        boxes.append((dc_in, y0, dc_in + fw, y1))
-        y = y0 - sg
+
+    # ── −y arm flanks  (axis = −y, starting beyond quadrant segments at −flank_axis_start) ─
+    # right flank:  x ∈ [w+gap, w+gap+fw]
+    boxes.extend(_pads_y(-flank_axis_start, -C, w + gap, w + gap + fw))
+    # left flank:   x ∈ [−(w+gap+fw), −(w+gap)]
+    boxes.extend(_pads_y(-flank_axis_start, -C, -(w + gap + fw), -(w + gap)))
+
+    # ── +y arm flanks  (axis = +y, starting beyond quadrant segments at +flank_axis_start) ─
+    # right flank:  x ∈ [w+gap, w+gap+fw]
+    boxes.extend(_pads_y(flank_axis_start, C, w + gap, w + gap + fw))
+    # left flank:   x ∈ [−(w+gap+fw), −(w+gap)]
+    boxes.extend(_pads_y(flank_axis_start, C, -(w + gap + fw), -(w + gap)))
+
+    # ── +x arm flanks  (axis = +x, starting beyond quadrant segments at +flank_axis_start) ─
+    # top flank:    y ∈ [w+gap, w+gap+fw]
+    boxes.extend(_pads_x(flank_axis_start, C, w + gap, w + gap + fw))
+    # bottom flank: y ∈ [−(w+gap+fw), −(w+gap)]
+    boxes.extend(_pads_x(flank_axis_start, C, -(w + gap + fw), -(w + gap)))
+
+    # ── −x arm flanks  (axis = −x, starting beyond quadrant segments at −flank_axis_start) ─
+    # top flank:    y ∈ [w+gap, w+gap+fw]
+    boxes.extend(_pads_x(-flank_axis_start, -C, w + gap, w + gap + fw))
+    # bottom flank: y ∈ [−(w+gap+fw), −(w+gap)]
+    boxes.extend(_pads_x(-flank_axis_start, -C, -(w + gap + fw), -(w + gap)))
 
     return boxes
 
@@ -423,26 +558,22 @@ def build_dc(p: dict) -> list[cq.Workplane]:
 
     Layout:
       • Quadrant corner zone  – generated for Q1 (x>0, y>0), rotated ×4
-      • Linear flank zone     – right flank of –y arm, rotated ×4;
-                                left flank of –y arm, rotated ×4
+      • Linear flank zone     – generated explicitly for all 8 arm flanks
+                                (no rotation, avoiding overlap at quadrant boundaries)
     """
     _validate(p)
     t   = p['thickness']
     pads: list[cq.Workplane] = []
 
+    # Quadrant corner zone: 4-fold rotation is correct here
     q_boxes = _dc_quadrant_boxes(p)
-    f_right = _dc_linear_flank_boxes(p)
-
-    # Left flank = right flank mirrored: x → –x  (i.e. negate x coords)
-    f_left = [(-x1, y0, -x0, y1) for (x0, y0, x1, y1) in f_right]
-
     for angle in (0.0, 90.0, 180.0, 270.0):
         for x0, y0, x1, y1 in _rotate_boxes(q_boxes, angle):
             pads.append(_box_solid(x0, y0, x1, y1, t))
-        for x0, y0, x1, y1 in _rotate_boxes(f_right, angle):
-            pads.append(_box_solid(x0, y0, x1, y1, t))
-        for x0, y0, x1, y1 in _rotate_boxes(f_left, angle):
-            pads.append(_box_solid(x0, y0, x1, y1, t))
+
+    # Linear flank zone: explicit 8-series (no rotation)
+    for x0, y0, x1, y1 in _dc_all_flank_boxes(p):
+        pads.append(_box_solid(x0, y0, x1, y1, t))
 
     return pads
 
@@ -452,19 +583,17 @@ def build_dc(p: dict) -> list[cq.Workplane]:
 # ─────────────────────────────────────────────────────────────────────────────
 def build_ground(p: dict) -> cq.Workplane:
     """
-    Ground frame: square ring from cell_half to (cell_half + frame_width).
+    Ground frame: solid square ring from cell_half to (cell_half + frame_width).
 
-    Rectangular slots are cut on all four sides where the RF arms exit the cell:
-        slot half-width = w_rf/2 + gap
+    Outer boundary: ±(cell_half + frame_width)
+    Inner boundary: ±cell_half
+    No arm exit slots — the ground frame is a simple connected ring.
     """
     C   = p['cell_half']
     fw  = p['frame_width']
-    w   = p['w_rf'] / 2
-    gap = p['gap']
     t   = mm(p['thickness'])
 
-    outer      = C + fw
-    slot_half  = w + gap     # arm exit slot half-width (with gap clearance)
+    outer = C + fw
 
     # Full outer square
     frame = (
@@ -478,23 +607,6 @@ def build_ground(p: dict) -> cq.Workplane:
         .box(mm(2 * C), mm(2 * C), t, centered=(True, True, False))
     )
     frame = frame.cut(inner_cut)
-
-    # Arm exit slots (4 sides)
-    slot_depth = mm(2 * fw)
-    slot_width = mm(2 * slot_half)
-    for cx_um, cy_um, horiz in (
-        (0.0,    C + fw / 2,  True),   # +y arm
-        (0.0,  -(C + fw / 2), True),   # –y arm
-        (C + fw / 2,   0.0,   False),  # +x arm
-        (-(C + fw / 2), 0.0,  False),  # –x arm
-    ):
-        sw = slot_width if horiz else slot_depth
-        sl = slot_depth if horiz else slot_width
-        slot = (
-            cq.Workplane("XY", origin=(mm(cx_um), mm(cy_um), -t))
-            .box(sw, sl, t, centered=(True, True, False))
-        )
-        frame = frame.cut(slot)
 
     return frame
 
