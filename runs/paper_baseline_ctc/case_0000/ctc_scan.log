@@ -1,0 +1,31 @@
+===== case_0000 =====
+  case dir: /Users/michaelee408/Documents/trap_sim/runs/paper_baseline_ctc/case_0000
+  report: /Users/michaelee408/Documents/trap_sim/runs/paper_baseline_ctc/case_0000/auto_case_0000_sweep.json
+Sat Apr 25 01:16:39 PDT 2026
+[ctb] No DC voltages — computing RF-only barrier  (use --dc-voltages to add DC compensation)
+
+[ctb] computing pseudopotential (DG — no inter-element smoothing) ...
+[ctb] pseudopotential ready
+[paper-ctc] scanning 120 x-points  x=[290.8, 600.0] µm  n_z=300  z=[10.0, 200.0] µm  h_fd=2.0 µm  C_target=auto (from r0)
+[paper-ctc] auto C_target = 6.6726e+08 eV/m² (C at z_min at r0, x=290.8 µm)
+[paper-ctc]   x step 1/120  x=290.8 µm
+[paper-ctc]   x step 10/120  x=314.1 µm
+[paper-ctc]   x step 20/120  x=340.1 µm
+[paper-ctc]   x step 30/120  x=366.1 µm
+[paper-ctc]   x step 40/120  x=392.1 µm
+[paper-ctc]   x step 50/120  x=418.1 µm
+[paper-ctc]   x step 60/120  x=444.1 µm
+[paper-ctc]   x step 70/120  x=470.1 µm
+[paper-ctc]   x step 80/120  x=496.1 µm
+[paper-ctc]   x step 90/120  x=522.0 µm
+[paper-ctc]   x step 100/120  x=548.0 µm
+[paper-ctc]   x step 110/120  x=574.0 µm
+[paper-ctc]   x step 120/120  x=600.0 µm
+[paper-ctc] CTC barrier = 74.8204 meV  no_crossing=0/120
+[paper-ctc] path overlap: max|dz|=31.43 µm  rms_dz=9.64 µm
+[paper-ctc] min-path CSV → /Users/michaelee408/Documents/trap_sim/runs/paper_baseline_ctc/case_0000/auto_case_0000_sweep_min_path.csv
+[paper-ctc] ctc-path CSV → /Users/michaelee408/Documents/trap_sim/runs/paper_baseline_ctc/case_0000/auto_case_0000_sweep_ctc_path.csv
+[paper-ctc] diagnostic plot → /Users/michaelee408/Documents/trap_sim/runs/paper_baseline_ctc/case_0000/auto_case_0000_sweep_paper_ctc_diag.png
+[case_0000] ok        barrier=74.82 meV  elapsed 374.0s (checkpoint) [ckpt]
+[case_0000] exit 0 (ok)
+

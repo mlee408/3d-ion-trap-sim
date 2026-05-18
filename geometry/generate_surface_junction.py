@@ -37,12 +37,12 @@ THICKNESS_UM = 10.0
 DEFAULTS = dict(
     cell_size_um=600.0,
     electrode_gap_um=10.0,
-    o1_x_um=5.0,
-    o1_y_um=23.07,
-    o1_r_um=0.0,                  # curvature radius at o1
-    o2_x_um=23.07,
-    o2_y_um=5.0,
-    o2_r_um=0.0,                  # curvature radius at o2
+    o1_x_um=5.0,                  # neck start (near center)
+    o1_y_um=5.0,                  # neck half-width
+    o1_r_um=0.0,
+    o2_x_um=23.07,               # neck end (taper begins)
+    o2_y_um=5.0,                  # same y as o1
+    o2_r_um=0.0,
     o3_x_um=95.27,                # taper start along branch axis
     o3_y_um=60.0,                 # taper start perpendicular (= rf half-width)
     o3_r_um=0.0,                  # curvature radius at o3
@@ -116,27 +116,32 @@ def _arc_round(prev, corner, nxt, radius, n_pts=16):
 def _build_rf_junction_quadrant(p: dict) -> list[tuple[float, float]]:
     """Return taper vertices for Q1 (+x, +y quadrant).
 
-    Goes from the +x branch inner edge, through the taper, to the +y branch
-    inner edge.  The full RF polygon is assembled by reflecting this across
-    all four quadrants.
+    Path: o3 → o2 → o1 → o1_mirror → o2_mirror → o3_mirror
+    where mirror swaps (x,y)→(y,x).
 
-    Coordinate convention: center = (0,0), +x right, +y up.
+    o1: start of neck (near center), o2: end of neck (taper begins),
+    o3: taper ends at straight branch.  Neck runs at constant y = o1_y = o2_y.
     """
     o1 = (p["o1_x_um"], p["o1_y_um"])
     o2 = (p["o2_x_um"], p["o2_y_um"])
     o3 = (p["o3_x_um"], p["o3_y_um"])
-    o3m = (o3[1], o3[0])  # mirror of o3 on +y branch
+    o1m = (o1[1], o1[0])
+    o2m = (o2[1], o2[0])
+    o3m = (o3[1], o3[0])
     r1, r2, r3 = p["o1_r_um"], p["o2_r_um"], p["o3_r_um"]
 
-    # Taper path: o3 → o2 → o1 → o3_mirror
-    # The point before o3 on the full polygon is (C, hw) = straight branch edge
-    # The point after o3m is (hw, C) = straight branch edge
-    # We only round o2 and o1 here; o3 rounding needs prev/next from the
-    # full polygon, so it's applied in build_rf_polygon.
     pts = []
     pts.append(o3)
-    pts.extend(_arc_round(o3, o2, o1, r2))
-    pts.extend(_arc_round(o2, o1, o3m, r1))
+    if abs(o1[0] - o1[1]) < 0.01:
+        # o1 sits on the diagonal — o1 and o1_mirror collapse to one point
+        pts.extend(_arc_round(o3, o2, o1, r2))
+        pts.extend(_arc_round(o2, o1, o2m, r1))
+        pts.extend(_arc_round(o1, o2m, o3m, r2))
+    else:
+        pts.extend(_arc_round(o3, o2, o1, r2))
+        pts.extend(_arc_round(o2, o1, o1m, r1))
+        pts.extend(_arc_round(o1, o1m, o2m, r1))
+        pts.extend(_arc_round(o1m, o2m, o3m, r2))
     pts.append(o3m)
     return pts
 
@@ -667,6 +672,15 @@ def write_step(rf_poly: SPoly,
         gnd_shapes = [extrude(v) for v in gnd_polys]
         write(make_compound(gnd_shapes), out_dir / "ground.step")
         print(f"  Wrote {out_dir / 'ground.step'}")
+
+    # Combined
+    all_shapes = [rf_shape]
+    if dc_polys:
+        all_shapes.extend(dc_shapes)
+    if gnd_polys:
+        all_shapes.extend(gnd_shapes)
+    write(make_compound(all_shapes), out_dir / "combined.step")
+    print(f"  Wrote {out_dir / 'combined.step'}")
 
 
 # ---------------------------------------------------------------------------

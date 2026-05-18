@@ -1,0 +1,2 @@
+case_id,ctc_barrier_eV,ctc_barrier_meV,min_barrier_eV,min_barrier_meV,ctc_target_eV_m2,max_dz_um,rms_dz_um,no_crossing,score
+case_0000,0.07482037,74.82037,0.01208044,12.08044,667257695.9001896,31.4274,9.6368,0,

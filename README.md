@@ -8,8 +8,7 @@ FEM ion-trap simulator (FEniCSx / Gmsh).
 |---|---|
 | Solver & physics code | `src/` |
 | Geometry-generation scripts | `geometry/` |
-| Baseline CAD (hand-made STEP) | `cad/base/` |
-| Generated CAD (parametric BREP/STEP) | `cad/generated/` |
+| Generated CAD (STEP from surface junction generator) | `cad/generated/` |
 | Baseline meshes | `meshes/base/` |
 | Generated meshes (parametric sweep) | `meshes/generated/` |
 | Simulation run outputs | `runs/` |
@@ -23,10 +22,11 @@ FEM ion-trap simulator (FEniCSx / Gmsh).
 trap_sim/
 ├─ src/                 # laplace.py, metrics.py, mesh_io.py, run_case.py,
 │                       # run_sweep_metrics.py, automate.py
-├─ geometry/            # rf_cell_gen.py, assemble_mesh.py, split_rf.py, …
+├─ geometry/            # generate_surface_junction.py, make_rf_step.py,
+│                       # rf_cell_gen.py, assemble_mesh.py, split_rf.py
 ├─ cad/
-│  ├─ base/             # rf.step, dc.step, ground.step, rf_surface.step, …
-│  ├─ generated/        # rfcell_h290_t100_n2.brep, …
+│  ├─ base/             # rf.step (hand-made baseline)
+│  ├─ generated/        # parametric STEP from surface junction generator
 │  └─ archive/
 ├─ meshes/
 │  ├─ base/             # trap_2j.msh, trap_vacuum_fine.msh, …
@@ -42,7 +42,7 @@ trap_sim/
 ├─ refs/
 │  ├─ papers/
 │  └─ notes/
-├─ scripts/             # make_mesh.py, make_mesh_parametric.py
+├─ scripts/             # make_mesh.py, make_mesh_parametric.py, plot_field_slices.py
 └─ tmp/                 # scratch — not tracked
 ```
 
@@ -53,11 +53,14 @@ trap_sim/
 python scripts/make_mesh.py --out meshes/generated/trap.msh
 ```
 
-**Generate parametric RF-cell mesh**
+**Generate surface junction electrodes**
 ```bash
-python scripts/make_mesh_parametric.py \
-    --window-n 2 --rf-height 290 --rf-thickness 1.0 \
-    --out meshes/generated/rfcell_h290_t100_n2.msh
+python geometry/make_rf_step.py --out-dir cad/generated/surface_junction
+```
+
+**Generate with 3D RF beams**
+```bash
+python geometry/make_rf_step.py --with-3d-rf --rf-height 267 --out-dir cad/generated/combined
 ```
 
 **Run a single case**
