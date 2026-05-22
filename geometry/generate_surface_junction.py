@@ -31,6 +31,11 @@ from shapely.validation import explain_validity
 CELL_HALF = 300.0          # half of 600 µm unit cell
 THICKNESS_UM = 10.0
 
+# Lower layer (constant geometry — structural base plane)
+LOWER_THICKNESS_UM = 10.0          # z = [-20, -10] µm
+RF_RING_OUTER_UM   = 328.0         # 3D lattice beam half-extent (656/2)
+GND_PLANE_HALF_UM  = 272.0         # support_half − beam_half (300 − 28)
+
 # ---------------------------------------------------------------------------
 # Default baseline values (extracted from SVG)
 # ---------------------------------------------------------------------------
@@ -614,6 +619,7 @@ def write_step(rf_poly: SPoly,
         from OCP.BRepBuilderAPI import (
             BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace)
         from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut
         from OCP.TopoDS import TopoDS_Compound
         from OCP.BRep import BRep_Builder
         from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
@@ -622,8 +628,25 @@ def write_step(rf_poly: SPoly,
         print("  OCP (cadquery) not available — skipping STEP export")
         return
 
+    gap_um = p["electrode_gap_um"] if p else 10.0
+
     def mm(x):
         return x * 1e-3
+
+    def make_box(x0, y0, z0, x1, y1, z1):
+        """Create a solid box from two corner points (µm)."""
+        verts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        n = len(verts)
+        wb = BRepBuilderAPI_MakeWire()
+        for i in range(n):
+            ax, ay = verts[i]
+            bx, by = verts[(i + 1) % n]
+            edge = BRepBuilderAPI_MakeEdge(
+                gp_Pnt(mm(ax), mm(ay), mm(z0)),
+                gp_Pnt(mm(bx), mm(by), mm(z0))).Edge()
+            wb.Add(edge)
+        face = BRepBuilderAPI_MakeFace(wb.Wire(), True).Face()
+        return BRepPrimAPI_MakePrism(face, gp_Vec(0, 0, mm(z1 - z0))).Shape()
 
     def extrude(verts, thickness_um=THICKNESS_UM):
         n = len(verts)
@@ -653,32 +676,49 @@ def write_step(rf_poly: SPoly,
         if w.Write(str(path)) != 1:
             raise RuntimeError(f"STEP write failed: {path}")
 
-    # RF — uniform extrusion
+    # --- Lower layer constants ---
+    lower_z_bot = -(THICKNESS_UM + LOWER_THICKNESS_UM)   # -20 µm
+    lower_z_top = -THICKNESS_UM                           # -10 µm
+    ro = RF_RING_OUTER_UM                                 # 328 µm
+    ri = GND_PLANE_HALF_UM + gap_um                       # 282 µm
+    gh = GND_PLANE_HALF_UM                                # 272 µm
+
+    # RF lower ring: outer box minus inner cutout
+    rf_ring_outer = make_box(-ro, -ro, lower_z_bot, ro, ro, lower_z_top)
+    rf_ring_cutout = make_box(-ri, -ri, lower_z_bot, ri, ri, lower_z_top)
+    rf_lower_ring = BRepAlgoAPI_Cut(rf_ring_outer, rf_ring_cutout).Shape()
+
+    # Ground lower plane
+    gnd_lower_plane = make_box(-gh, -gh, lower_z_bot, gh, gh, lower_z_top)
+
+    # RF — upper cross fused with lower ring
     rf_coords = list(rf_poly.exterior.coords)
     if rf_coords[-1] == rf_coords[0]:
         rf_coords = rf_coords[:-1]
-    rf_shape = extrude(rf_coords)
+    rf_upper = extrude(rf_coords)
+    rf_shape = BRepAlgoAPI_Fuse(rf_upper, rf_lower_ring).Shape()
     write(rf_shape, out_dir / "rf.step")
     print(f"  Wrote {out_dir / 'rf.step'}")
 
-    # DC
+    # DC — upper layer only
+    dc_shapes = []
     if dc_polys:
         dc_shapes = [extrude(v) for v in dc_polys]
         write(make_compound(dc_shapes), out_dir / "dc.step")
         print(f"  Wrote {out_dir / 'dc.step'}")
 
-    # Ground
+    # Ground — upper pads + lower plane
+    gnd_shapes = []
     if gnd_polys:
         gnd_shapes = [extrude(v) for v in gnd_polys]
-        write(make_compound(gnd_shapes), out_dir / "ground.step")
-        print(f"  Wrote {out_dir / 'ground.step'}")
+    gnd_shapes.append(gnd_lower_plane)
+    write(make_compound(gnd_shapes), out_dir / "ground.step")
+    print(f"  Wrote {out_dir / 'ground.step'}")
 
     # Combined
     all_shapes = [rf_shape]
-    if dc_polys:
-        all_shapes.extend(dc_shapes)
-    if gnd_polys:
-        all_shapes.extend(gnd_shapes)
+    all_shapes.extend(dc_shapes)
+    all_shapes.extend(gnd_shapes)
     write(make_compound(all_shapes), out_dir / "combined.step")
     print(f"  Wrote {out_dir / 'combined.step'}")
 
